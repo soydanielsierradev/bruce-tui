@@ -92,7 +92,14 @@ impl WorkspaceState {
     /// Forward a key event to the embedded process (no-op without a PTY).
     pub fn send_key(&self, key: &KeyEvent) {
         if let Some(pty) = self.pty.as_ref() {
-            if let Some(bytes) = encode_key(key) {
+            // Cursor/nav keys are encoded differently depending on the child's
+            // cursor-key mode (DECCKM): full TUIs like Claude switch it on and
+            // then expect SS3 (ESC O x) instead of CSI (ESC [ x).
+            let app_cursor = pty
+                .lock_parser()
+                .map(|p| p.screen().application_cursor())
+                .unwrap_or(false);
+            if let Some(bytes) = encode_key(key, app_cursor) {
                 pty.send(&bytes);
             }
         }
@@ -632,8 +639,10 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
 /// Encode a key event as the bytes a terminal would send to the child.
 ///
 /// Covers the common cases (text, control chars, Enter/Tab/Esc/Backspace and
-/// the arrow/navigation keys); anything else is dropped.
-fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
+/// the arrow/navigation keys); anything else is dropped. `app_cursor` is the
+/// child's DECCKM state: when on, cursor keys use SS3 (`ESC O x`) instead of
+/// CSI (`ESC [ x`) — the tilde keys (PageUp/Down, Delete) are unaffected.
+fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let bytes = match key.code {
         KeyCode::Char(c) => {
@@ -656,16 +665,25 @@ fn encode_key(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Up => cursor_seq(app_cursor, b'A'),
+        KeyCode::Down => cursor_seq(app_cursor, b'B'),
+        KeyCode::Right => cursor_seq(app_cursor, b'C'),
+        KeyCode::Left => cursor_seq(app_cursor, b'D'),
+        KeyCode::Home => cursor_seq(app_cursor, b'H'),
+        KeyCode::End => cursor_seq(app_cursor, b'F'),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         _ => return None,
     };
     Some(bytes)
+}
+
+/// A cursor/nav key sequence ending in `final_byte`. DECCKM selects the prefix:
+/// `ESC O` in application mode, `ESC [` in normal mode.
+fn cursor_seq(app_cursor: bool, final_byte: u8) -> Vec<u8> {
+    let prefix: &[u8] = if app_cursor { b"\x1bO" } else { b"\x1b[" };
+    let mut seq = prefix.to_vec();
+    seq.push(final_byte);
+    seq
 }
