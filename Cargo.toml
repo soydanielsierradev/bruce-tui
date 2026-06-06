@@ -1,6 +1,6 @@
 [package]
 name = "bruce"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -10,4 +10,8 @@ crossterm = "0.29.0"
 # Local read-only repo access only: drop default ssh/https features to avoid
 # pulling (and building) openssl-sys / libssh2-sys on Windows.
 git2 = { version = "0.20.2", default-features = false }
+portable-pty = "0.9.0"
 ratatui = "0.30.0"
+# Terminal emulator: parse the child's ANSI output into a cell grid we render
+# ourselves (decoupled from any ratatui-version-specific widget crate).
+vt100 = "0.16.2"

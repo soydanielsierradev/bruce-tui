@@ -1,10 +1,15 @@
 //! Global application state and the terminal event loop.
 
+use std::io::Write;
+use std::time::Duration;
+
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::style::Color;
 
+use crate::ui::theme::Theme;
 use crate::ui::welcome::{self, WelcomeEvent, WelcomeState};
-use crate::ui::workspace::{self, WorkspaceState};
+use crate::ui::workspace::{self, Panel, WorkspaceState};
 
 /// Which screen is currently active.
 ///
@@ -22,22 +27,74 @@ enum Screen {
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
     let result = run_loop(&mut terminal);
+    // Hand the terminal back with its own colours restored before leaving the
+    // alternate screen, so the user's normal prompt isn't left recoloured.
+    reset_terminal_colors();
     ratatui::restore();
     result
+}
+
+/// Tell the host terminal to recolour its *default* foreground/background to the
+/// theme via OSC 10/11. Unlike painting cells, this also covers the window
+/// padding around the character grid, so the whole window matches the theme
+/// instead of framing Bruce in the terminal's own background colour.
+fn apply_terminal_colors(theme: Theme) {
+    let pal = theme.palette();
+    let mut out = std::io::stdout();
+    if let Some((r, g, b)) = rgb(pal.bg) {
+        let _ = write!(out, "\x1b]11;#{r:02x}{g:02x}{b:02x}\x07");
+    }
+    if let Some((r, g, b)) = rgb(pal.fg) {
+        let _ = write!(out, "\x1b]10;#{r:02x}{g:02x}{b:02x}\x07");
+    }
+    let _ = out.flush();
+}
+
+/// Restore the terminal's default foreground/background (OSC 110/111).
+fn reset_terminal_colors() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]110\x07\x1b]111\x07");
+    let _ = out.flush();
+}
+
+/// Extract RGB from a palette colour. All built-in themes use `Color::Rgb`, so
+/// non-RGB colours (which OSC can't express as a hex triplet) are simply skipped.
+fn rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
 }
 
 /// Draw / input loop. Returns when the user quits.
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let mut welcome = WelcomeState::new();
     let mut screen = Screen::Welcome;
+    // Last theme pushed to the terminal via OSC, so we only re-emit on change.
+    let mut applied_theme: Option<Theme> = None;
 
     loop {
+        // The active theme lives on whichever screen is showing; the workspace
+        // carries a snapshot of the welcome theme it was opened with.
+        let current_theme = match &screen {
+            Screen::Welcome => welcome.theme,
+            Screen::Workspace(ws) => ws.theme,
+        };
+        if applied_theme != Some(current_theme) {
+            apply_terminal_colors(current_theme);
+            applied_theme = Some(current_theme);
+        }
+
         terminal.draw(|frame| match &screen {
             Screen::Welcome => welcome::render(frame, &welcome),
             Screen::Workspace(ws) => workspace::render(frame, ws),
         })?;
 
-        // `event::read` blocks until the next terminal event.
+        // Poll instead of blocking: the reader thread feeds PTY output into the
+        // emulator, so we must redraw on a timer even when no key is pressed.
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -101,14 +158,38 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             }
             Screen::Workspace(ws) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Esc => transition = Some(Screen::Welcome),
-                    KeyCode::Tab => ws.focus_next(),
-                    KeyCode::BackTab => ws.focus_prev(),
-                    KeyCode::Char('g') if ctrl => ws.toggle_git(),
-                    KeyCode::Char('m') if ctrl => ws.toggle_metrics(),
-                    _ => {}
+                let claude_focused = ws.focus == Panel::Claude && ws.pty.is_some();
+
+                if claude_focused {
+                    if ws.leader_pending {
+                        // Second key of the Ctrl+b chord: a Bruce command.
+                        ws.leader_pending = false;
+                        match key.code {
+                            KeyCode::Char('b') => transition = Some(Screen::Welcome),
+                            KeyCode::Tab => ws.focus_next(),
+                            KeyCode::BackTab => ws.focus_prev(),
+                            KeyCode::Char('g') => ws.toggle_git(),
+                            KeyCode::Char('m') => ws.toggle_metrics(),
+                            KeyCode::Char('q') => break,
+                            _ => {} // unknown command: swallow it
+                        }
+                    } else if ctrl && matches!(key.code, KeyCode::Char('b')) {
+                        ws.leader_pending = true;
+                    } else {
+                        // Everything else is the user typing into Claude.
+                        ws.send_key(&key);
+                    }
+                } else {
+                    // A side pane has focus: navigate Bruce directly.
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                        KeyCode::Esc => transition = Some(Screen::Welcome),
+                        KeyCode::Tab => ws.focus_next(),
+                        KeyCode::BackTab => ws.focus_prev(),
+                        KeyCode::Char('g') if ctrl => ws.toggle_git(),
+                        KeyCode::Char('m') if ctrl => ws.toggle_metrics(),
+                        _ => {}
+                    }
                 }
             }
         }

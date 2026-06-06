@@ -45,5 +45,5 @@ Dark, Dracula, Nord, Light, Amber
 - [x] Paso 2: Welcome screen con ratatui
 - [x] Paso 3: Layout 3 paneles estático
 - [x] Paso 4: Panel Git con git2
-- [ ] Paso 5: PTY con portable-pty
+- [x] Paso 5: PTY con portable-pty
 - [ ] Paso 6: Métricas con file watcher
