@@ -1,11 +1,14 @@
 //! Token-usage metrics read from Claude Code's session transcript.
 //!
 //! Claude writes a JSON-lines transcript per session under
-//! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Each assistant turn
-//! carries a `usage` block; [`parse_transcript`] sums it into [`Metrics`].
+//! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. [`parse_transcript`]
+//! turns it into [`Metrics`]; [`MetricsWatcher`] keeps that live.
 //!
-//! A live refresh (file watcher) lands in [`watch`]; this module's parsing is
-//! pure so it can be unit-reasoned and reused by the watcher thread.
+//! Transcript shape (important for correct counting): **one line per content
+//! block**, not per message. A single assistant turn spans several lines
+//! (thinking, text, tool_use…), each repeating the same `message.id` and the
+//! same `message.usage`. So token usage is summed once per unique id, while
+//! tool-use blocks are counted per line (each is its own block).
 
 use std::collections::HashSet;
 use std::fs;
@@ -17,8 +20,11 @@ use std::time::SystemTime;
 
 use notify::{RecursiveMode, Watcher};
 
-/// Cumulative token usage for one Claude session.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Claude's context-window size, used for the "% ventana" gauge.
+pub const CONTEXT_LIMIT: u64 = 200_000;
+
+/// Cumulative usage + activity for one Claude session.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Metrics {
     /// Fresh (uncached) input tokens summed across assistant turns.
     pub input: u64,
@@ -28,14 +34,78 @@ pub struct Metrics {
     pub cache_write: u64,
     /// Tokens served from the prompt cache (`cache_read_input_tokens`).
     pub cache_read: u64,
-    /// Number of assistant turns counted (unique message ids).
-    pub messages: u64,
+    /// Assistant turns (unique message ids).
+    pub turns: u64,
+    /// Tool-use blocks across the session.
+    pub tool_calls: u64,
+    /// Distinct files touched by Write/Edit/MultiEdit.
+    pub files_edited: u64,
+    /// Approximate lines added by Write/Edit/MultiEdit inputs.
+    pub lines_added: u64,
+    /// Approximate lines removed by Edit/MultiEdit inputs.
+    pub lines_removed: u64,
+    /// Tokens live in the context window now (the last turn's input + cache).
+    pub context: u64,
+    /// Model id of the most recent assistant turn (e.g. `claude-opus-4-8`).
+    pub model: String,
+    /// Epoch-second timestamp of the first and last transcript entries.
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+    /// Per-turn output tokens with their timestamps, for the usage sparkline.
+    pub series: Vec<(i64, u64)>,
 }
 
 impl Metrics {
     /// Every token the session touched, cached or not.
     pub fn total(&self) -> u64 {
         self.input + self.output + self.cache_write + self.cache_read
+    }
+
+    /// Share of input-side tokens served from cache, as a whole percent.
+    pub fn cache_hit_pct(&self) -> u64 {
+        let denom = self.input + self.cache_read + self.cache_write;
+        if denom == 0 {
+            0
+        } else {
+            self.cache_read * 100 / denom
+        }
+    }
+
+    /// Context-window fill as a whole percent (clamped to 100).
+    pub fn context_pct(&self) -> u64 {
+        (self.context * 100 / CONTEXT_LIMIT).min(100)
+    }
+
+    /// Session wall-clock duration in seconds (0 until two timestamps exist).
+    pub fn duration_secs(&self) -> i64 {
+        match (self.first_ts, self.last_ts) {
+            (Some(a), Some(b)) => (b - a).max(0),
+            _ => 0,
+        }
+    }
+
+    /// Estimated USD cost from list prices for the model family. This is an
+    /// approximation: prices are hard-coded and change over time.
+    pub fn cost_usd(&self) -> f64 {
+        let (pin, pout, pcw, pcr) = model_prices(&self.model);
+        (self.input as f64 * pin
+            + self.output as f64 * pout
+            + self.cache_write as f64 * pcw
+            + self.cache_read as f64 * pcr)
+            / 1_000_000.0
+    }
+}
+
+/// List prices in USD per 1M tokens `(input, output, cache_write, cache_read)`,
+/// by model family. Approximate; defaults to Sonnet pricing for unknown models.
+fn model_prices(model: &str) -> (f64, f64, f64, f64) {
+    let m = model.to_lowercase();
+    if m.contains("opus") {
+        (15.0, 75.0, 18.75, 1.5)
+    } else if m.contains("haiku") {
+        (1.0, 5.0, 1.25, 0.1)
+    } else {
+        (3.0, 15.0, 3.75, 0.3)
     }
 }
 
@@ -68,23 +138,31 @@ pub fn newest_transcript(dir: &Path) -> Option<PathBuf> {
     newest.map(|(_, path)| path)
 }
 
-/// Sum the token usage of every assistant turn in a transcript file.
-///
-/// Claude writes several lines per turn (one per content block), each repeating
-/// the same `message.id` and the same `message.usage`. We dedupe by id so each
-/// turn is counted once. Malformed lines are skipped, never fatal.
+/// Parse a transcript into [`Metrics`]. Malformed lines are skipped, never fatal.
 pub fn parse_transcript(path: &Path) -> Metrics {
     let Ok(content) = fs::read_to_string(path) else {
         return Metrics::default();
     };
 
     let mut metrics = Metrics::default();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut files: HashSet<String> = HashSet::new();
 
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+
+        // Every entry carries a timestamp; track the session span.
+        let line_ts = value
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_iso_epoch);
+        if let Some(ts) = line_ts {
+            metrics.first_ts = Some(metrics.first_ts.map_or(ts, |f| f.min(ts)));
+            metrics.last_ts = Some(metrics.last_ts.map_or(ts, |l| l.max(ts)));
+        }
+
         if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
@@ -92,26 +170,116 @@ pub fn parse_transcript(path: &Path) -> Metrics {
             continue;
         };
 
-        // Dedupe by message id: the same turn spans multiple lines.
+        if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
+            metrics.model = model.to_string();
+        }
+
+        // Token usage is repeated on every line of a turn: count once per id.
         if let Some(id) = message.get("id").and_then(|i| i.as_str()) {
-            if !seen.insert(id.to_string()) {
-                continue;
+            if seen_ids.insert(id.to_string()) {
+                if let Some(usage) = message.get("usage") {
+                    let field =
+                        |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                    let input = field("input_tokens");
+                    let output = field("output_tokens");
+                    let cache_write = field("cache_creation_input_tokens");
+                    let cache_read = field("cache_read_input_tokens");
+
+                    metrics.input += input;
+                    metrics.output += output;
+                    metrics.cache_write += cache_write;
+                    metrics.cache_read += cache_read;
+                    metrics.turns += 1;
+                    // The most recent turn defines the live context size.
+                    metrics.context = input + cache_read + cache_write;
+                    metrics
+                        .series
+                        .push((line_ts.unwrap_or(0), output));
+                }
             }
         }
 
-        let Some(usage) = message.get("usage") else {
-            continue;
-        };
-        let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-
-        metrics.input += field("input_tokens");
-        metrics.output += field("output_tokens");
-        metrics.cache_write += field("cache_creation_input_tokens");
-        metrics.cache_read += field("cache_read_input_tokens");
-        metrics.messages += 1;
+        // Tool-use blocks live one-per-line, so count them on every line.
+        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                metrics.tool_calls += 1;
+                count_edit(block, &mut metrics, &mut files);
+            }
+        }
     }
 
+    metrics.files_edited = files.len() as u64;
     metrics
+}
+
+/// Account a Write/Edit/MultiEdit tool call: record the file and approximate
+/// the lines it adds/removes. Other tools are ignored.
+fn count_edit(block: &serde_json::Value, metrics: &mut Metrics, files: &mut HashSet<String>) {
+    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let Some(input) = block.get("input") else {
+        return;
+    };
+    let str_field = |v: &serde_json::Value, key: &str| {
+        v.get(key).and_then(|x| x.as_str()).map(str::to_string)
+    };
+
+    if let Some(path) = str_field(input, "file_path") {
+        files.insert(path);
+    }
+
+    match name {
+        "Write" => {
+            metrics.lines_added += line_count(input.get("content").and_then(|c| c.as_str()));
+        }
+        "Edit" => {
+            metrics.lines_added += line_count(input.get("new_string").and_then(|c| c.as_str()));
+            metrics.lines_removed += line_count(input.get("old_string").and_then(|c| c.as_str()));
+        }
+        "MultiEdit" => {
+            if let Some(edits) = input.get("edits").and_then(|e| e.as_array()) {
+                for edit in edits {
+                    metrics.lines_added +=
+                        line_count(edit.get("new_string").and_then(|c| c.as_str()));
+                    metrics.lines_removed +=
+                        line_count(edit.get("old_string").and_then(|c| c.as_str()));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Number of lines in an optional string (0 if absent or empty).
+fn line_count(text: Option<&str>) -> u64 {
+    match text {
+        Some(t) if !t.is_empty() => t.lines().count() as u64,
+        _ => 0,
+    }
+}
+
+/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS…Z`) to epoch seconds.
+/// Avoids a date-crate dependency; the transcript's format is fixed.
+fn parse_iso_epoch(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| s.get(range)?.parse::<i64>().ok();
+    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// A live view of the active session's metrics, refreshed by a file watcher.
@@ -201,4 +369,87 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transcript matching the real format: one line per content block, the
+    /// turn's id and usage repeated across its lines (here, m1's two lines).
+    const SAMPLE: &str = concat!(
+        r#"{"type":"assistant","timestamp":"2026-06-05T11:00:00.000Z","message":{"id":"m1","model":"claude-opus-4-8","content":[{"type":"thinking","thinking":"x"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":50,"cache_read_input_tokens":5}}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-06-05T11:00:01.000Z","message":{"id":"m1","model":"claude-opus-4-8","content":[{"type":"tool_use","name":"Write","input":{"file_path":"a.rs","content":"l1\nl2\nl3"}}],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":50,"cache_read_input_tokens":5}}}"#,
+        "\n",
+        r#"{"type":"user","timestamp":"2026-06-05T11:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","timestamp":"2026-06-05T11:05:00.000Z","message":{"id":"m2","model":"claude-opus-4-8","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"b.rs","old_string":"x\ny","new_string":"x\ny\nz"}}],"usage":{"input_tokens":200,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":80}}}"#,
+    );
+
+    fn parse_sample() -> Metrics {
+        let mut file = tempfile();
+        file.write_all(SAMPLE.as_bytes()).unwrap();
+        parse_transcript(&file.path)
+    }
+
+    /// Usage is summed once per unique message id even though m1 spans two lines.
+    #[test]
+    fn dedupes_usage_by_id() {
+        let m = parse_sample();
+        assert_eq!(m.turns, 2);
+        assert_eq!(m.input, 300);
+        assert_eq!(m.output, 30);
+        assert_eq!(m.cache_write, 50);
+        assert_eq!(m.cache_read, 85);
+    }
+
+    /// Tool-use blocks are counted per line, and the last turn sets the context.
+    #[test]
+    fn counts_tools_files_and_context() {
+        let m = parse_sample();
+        assert_eq!(m.tool_calls, 2); // Write + Edit
+        assert_eq!(m.files_edited, 2); // a.rs, b.rs
+        assert_eq!(m.lines_added, 6); // Write 3 + Edit new 3
+        assert_eq!(m.lines_removed, 2); // Edit old 2
+        assert_eq!(m.context, 280); // m2: 200 + 80 + 0
+        assert_eq!(m.model, "claude-opus-4-8");
+    }
+
+    /// Duration is the span between first and last timestamps.
+    #[test]
+    fn computes_duration() {
+        assert_eq!(parse_sample().duration_secs(), 300);
+    }
+
+    #[test]
+    fn iso_epoch_is_monotonic() {
+        let a = parse_iso_epoch("2026-06-05T11:00:00.000Z").unwrap();
+        let b = parse_iso_epoch("2026-06-05T11:05:00.000Z").unwrap();
+        assert_eq!(b - a, 300);
+    }
+
+    /// Minimal temp file (avoids a dev-dependency); cleaned up on drop.
+    struct TempFile {
+        path: PathBuf,
+    }
+    impl TempFile {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            fs::write(&self.path, bytes)
+        }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+    fn tempfile() -> TempFile {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        path.push(format!("bruce-metrics-test-{nanos}.jsonl"));
+        TempFile { path }
+    }
 }

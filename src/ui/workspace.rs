@@ -520,27 +520,52 @@ fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bo
     };
     let m = watcher.snapshot();
     let width = inner.width as usize;
-
     let mut lines: Vec<Line> = Vec::new();
-    // Headline total, then the breakdown.
-    lines.push(Line::from(vec![
-        Span::styled(" tokens", Style::default().fg(pal.dim)),
-        Span::raw(" ".repeat(width.saturating_sub(1 + 6 + fmt_count(m.total()).len()))),
-        Span::styled(
-            fmt_count(m.total()),
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "┄".repeat(width),
-        Style::default().fg(pal.dim),
-    )));
+
+    // ── tokens · session ──
+    section_header(&mut lines, pal, "tokens · sesión", width);
+    big_number(&mut lines, &fmt_count(m.total()), pal.accent);
+    lines.push(dim_line(pal, &format!(" {} turnos", m.turns)));
+    lines.push(Line::raw(""));
+
+    // ── active context window ──
+    section_header(&mut lines, pal, "contexto activo", width);
+    big_number(&mut lines, &fmt_count(m.context), pal.modified);
+    let ctx_pct = m.context_pct();
+    bar_line(&mut lines, pal, width, ctx_pct, pal.modified);
+    metric_row_str(&mut lines, pal, width, "% ventana", &format!("{ctx_pct}%"), pal.modified);
+    lines.push(Line::raw(""));
+
+    // ── breakdown ──
+    section_header(&mut lines, pal, "desglose", width);
     metric_row(&mut lines, pal, width, "input", m.input, pal.fg);
     metric_row(&mut lines, pal, width, "output", m.output, pal.added);
-    metric_row(&mut lines, pal, width, "cache write", m.cache_write, pal.renamed);
-    metric_row(&mut lines, pal, width, "cache read", m.cache_read, pal.modified);
+    metric_row_str(&mut lines, pal, width, "cache hits", &format!("{}%", m.cache_hit_pct()), pal.renamed);
+    metric_row(&mut lines, pal, width, "tool calls", m.tool_calls, pal.accent);
     lines.push(Line::raw(""));
-    metric_row(&mut lines, pal, width, "turns", m.messages, pal.dim);
+
+    // ── estimated cost (approximate: hard-coded list prices) ──
+    section_header(&mut lines, pal, "costo · est.", width);
+    big_number(&mut lines, &format!("${:.2}", m.cost_usd()), pal.renamed);
+    lines.push(dim_line(pal, &format!(" {}", model_short(&m.model))));
+    lines.push(Line::raw(""));
+
+    // ── usage sparkline ──
+    section_header(&mut lines, pal, "uso · sesión", width);
+    let series: Vec<u64> = m.series.iter().map(|(_, v)| *v).collect();
+    lines.push(Line::from(Span::styled(
+        format!(" {}", spark(&series, width.saturating_sub(2))),
+        Style::default().fg(pal.accent),
+    )));
+    lines.push(dim_line(pal, " output / turno"));
+    lines.push(Line::raw(""));
+
+    // ── current session ──
+    section_header(&mut lines, pal, "sesión", width);
+    metric_row_str(&mut lines, pal, width, "duración", &fmt_duration(m.duration_secs()), pal.added);
+    metric_row(&mut lines, pal, width, "archivos", m.files_edited, pal.modified);
+    metric_row_str(&mut lines, pal, width, "líneas +", &format!("+{}", m.lines_added), pal.added);
+    metric_row_str(&mut lines, pal, width, "líneas −", &format!("−{}", m.lines_removed), pal.removed);
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(pal.bg)),
@@ -557,6 +582,68 @@ fn metric_row<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, label:
         Span::raw(" ".repeat(pad)),
         Span::styled(value, Style::default().fg(color).add_modifier(Modifier::BOLD)),
     ]));
+}
+
+/// Push a right-aligned "label … value" row where the value is a ready string.
+fn metric_row_str<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, label: &str, value: &str, color: Color) {
+    let pad = width.saturating_sub(1 + label.chars().count() + value.chars().count());
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {label}"), Style::default().fg(pal.dim)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(value.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    ]));
+}
+
+/// Push a prominent (bold, coloured) headline number.
+fn big_number<'a>(lines: &mut Vec<Line<'a>>, text: &str, color: Color) {
+    lines.push(Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )));
+}
+
+/// Push a horizontal fill bar: `filled` blocks coloured, the rest dim.
+fn bar_line<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, pct: u64, color: Color) {
+    let cells = width.saturating_sub(2);
+    let filled = (cells as u64 * pct / 100) as usize;
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("█".repeat(filled), Style::default().fg(color)),
+        Span::styled("░".repeat(cells.saturating_sub(filled)), Style::default().fg(pal.dim)),
+    ]));
+}
+
+/// A unicode block sparkline of the most recent `width` samples.
+fn spark(series: &[u64], width: usize) -> String {
+    if series.is_empty() || width == 0 {
+        return String::new();
+    }
+    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let tail: Vec<u64> = series.iter().rev().take(width).rev().copied().collect();
+    let max = tail.iter().copied().max().unwrap_or(1).max(1);
+    tail.iter()
+        .map(|&v| {
+            let idx = (v.saturating_mul(bars.len() as u64 - 1) / max) as usize;
+            bars[idx.min(bars.len() - 1)]
+        })
+        .collect()
+}
+
+/// Human-friendly elapsed time: `2h 5m`, `5m 12s`, `42s`.
+fn fmt_duration(secs: i64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Drop the `claude-` prefix from a model id for a compact label.
+fn model_short(model: &str) -> String {
+    model.strip_prefix("claude-").unwrap_or(model).to_string()
 }
 
 /// Compact human count: 1234 -> "1.2k", 1500000 -> "1.5M".
