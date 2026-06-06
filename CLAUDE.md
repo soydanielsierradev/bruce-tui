@@ -37,7 +37,7 @@ Campos: id, name, project_path, branch, created_at,
         last_used, tokens_used, scrollback (base64)
 
 ## Temas disponibles
-Dark, Dracula, Nord, Light, Amber
+Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 
 ## Estado actual del proyecto
 <!-- Actualizá esta sección manualmente a medida que avanzás -->

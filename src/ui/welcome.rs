@@ -37,11 +37,12 @@ const LOGO: &str = r#"
 /// what [`WelcomeState::option_selected`] points at.
 const OPTION_LABELS: [&str; 2] = [" + New session", " ✎ Rename session"];
 
-/// Which panel currently has keyboard focus. `Tab` toggles between the two.
+/// Which panel currently has keyboard focus. `Tab` cycles through them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Options,
     Sessions,
+    Themes,
 }
 
 /// Lightweight summary of a saved session, shown as one list row.
@@ -142,20 +143,22 @@ impl WelcomeState {
             focus: Focus::Options,
             option_selected: 0,
             session_selected: 0,
-            theme: Theme::Dark,
+            theme: Theme::Hacker,
             dialog: None,
         }
     }
 
-    /// Toggle focus between the Options and Sessions panels.
+    /// Cycle focus across the Options, Sessions and Themes panels.
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
             Focus::Options => Focus::Sessions,
-            Focus::Sessions => Focus::Options,
+            Focus::Sessions => Focus::Themes,
+            Focus::Themes => Focus::Options,
         };
     }
 
-    /// Move the selection up within the focused panel, wrapping around.
+    /// Move the selection up within the focused panel, wrapping around. In the
+    /// Themes panel this cycles the active theme to the previous one.
     pub fn select_prev(&mut self) {
         match self.focus {
             Focus::Options => {
@@ -168,10 +171,12 @@ impl WelcomeState {
                     self.session_selected = (self.session_selected + n - 1) % n;
                 }
             }
+            Focus::Themes => self.theme = self.theme.prev(),
         }
     }
 
-    /// Move the selection down within the focused panel, wrapping around.
+    /// Move the selection down within the focused panel, wrapping around. In the
+    /// Themes panel this cycles the active theme to the next one.
     pub fn select_next(&mut self) {
         match self.focus {
             Focus::Options => {
@@ -184,7 +189,13 @@ impl WelcomeState {
                     self.session_selected = (self.session_selected + 1) % n;
                 }
             }
+            Focus::Themes => self.theme = self.theme.next(),
         }
+    }
+
+    /// True when the Sessions panel has focus (used to gate Enter→open).
+    pub fn on_session(&self) -> bool {
+        self.focus == Focus::Sessions
     }
 
     /// Focus the Options block on the "New session" row (the `N` shortcut).
@@ -334,23 +345,27 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     // Paint the whole background first.
     frame.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
-    // Vertical sections: top margin, logo, Options block, session list,
-    // theme bar, footer.
+    // Vertical sections: top margin, logo, Options block (full width), a row
+    // shared by Sessions + Themes, and the footer.
     let chunks = Layout::vertical([
         Constraint::Length(2),  // top margin (breathing room above the banner)
         Constraint::Length(10), // logo (9-line Delta Corps Priest 1 banner)
         Constraint::Length(4),  // options block (2 rows + borders)
-        Constraint::Min(5),     // session list
-        Constraint::Length(3),  // theme selector
+        Constraint::Min(5),     // Sessions + Themes row
         Constraint::Length(1),  // footer hints
     ])
     .split(area);
 
+    // Sessions and Themes share the width side by side; Sessions gets more
+    // room for its columns, Themes just needs name + color swatches.
+    let mid = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(chunks[3]);
+
     render_logo(frame, chunks[1], state);
     render_options(frame, chunks[2], state);
-    render_sessions(frame, chunks[3], state);
-    render_theme_bar(frame, chunks[4], state);
-    render_footer(frame, chunks[5], state);
+    render_sessions(frame, mid[0], state);
+    render_themes(frame, mid[1], state);
+    render_footer(frame, chunks[4], state);
 
     // Dialogs are modal overlays drawn on top of everything.
     match &state.dialog {
@@ -377,6 +392,29 @@ fn render_logo(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         .alignment(Alignment::Center)
         .style(Style::default().fg(pal.accent).bg(pal.bg));
     frame.render_widget(logo, area);
+
+    // Project version sitting to the RIGHT of the wordmark, at mid-height, in
+    // the same accent color — a small gap past the banner's right edge.
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let banner_w = width as u16;
+    let left_pad = area.width.saturating_sub(banner_w) / 2;
+    let banner_right = area.x + left_pad + banner_w;
+    let gap = 2; // breathing room from the glyphs
+    let start = banner_right.saturating_add(gap);
+    let area_right = area.x + area.width;
+    if start < area_right {
+        let mid_line = area.y + (lines.len() as u16) / 2;
+        let tag_rect = Rect {
+            x: start,
+            y: mid_line,
+            width: area_right - start,
+            height: 1,
+        };
+        let tag = Paragraph::new(version)
+            .alignment(Alignment::Left)
+            .style(Style::default().fg(pal.accent).bg(pal.bg));
+        frame.render_widget(tag, tag_rect);
+    }
 }
 
 fn render_options(frame: &mut Frame, area: Rect, state: &WelcomeState) {
@@ -441,34 +479,47 @@ fn session_row<'a>(state: &WelcomeState, s: &'a SessionSummary) -> Line<'a> {
     ])
 }
 
-fn render_theme_bar(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+/// Render the Themes panel: one row per theme with its name and a strip of
+/// color swatches previewing that theme's palette. The active theme is marked
+/// with a leading arrow so it stays visible even when the panel is unfocused.
+fn render_themes(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let pal = state.theme.palette();
+    let focused = state.focus == Focus::Themes;
 
-    let mut spans = vec![Span::styled(" Theme: ", Style::default().fg(pal.dim))];
+    let mut active_idx = 0;
+    let mut items: Vec<ListItem> = Vec::new();
     for theme in Theme::ALL {
-        let selected = theme == state.theme;
-        let style = if selected {
-            Style::default()
-                .fg(pal.bg)
-                .bg(pal.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(pal.dim)
-        };
-        spans.push(Span::styled(format!(" {} ", theme.palette().name), style));
-        spans.push(Span::raw(" "));
+        let active = theme == state.theme;
+        if active {
+            // Row index of the active theme within `items` (rows are
+            // interleaved with blank spacers, so this is not the theme index).
+            active_idx = items.len();
+        }
+        let marker = if active { " ▸ " } else { "   " };
+        let mut spans = vec![Span::styled(
+            format!("{}{:<12}", marker, theme.palette().name),
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        )];
+        // Color swatches: each palette color as a solid block, joined into one
+        // continuous bar so the row reads as a single theme strip.
+        for color in theme.swatches() {
+            spans.push(Span::styled("███", Style::default().fg(color)));
+        }
+        items.push(ListItem::new(Line::from(spans)));
+        // Blank spacer so themes don't stack into one solid grid of color.
+        items.push(ListItem::new(Line::raw("")));
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(pal.dim))
-        .style(Style::default().bg(pal.bg));
-
-    let bar = Paragraph::new(Line::from(spans))
+    let block = panel_block(&pal, " Themes ", focused);
+    let list = List::new(items)
         .block(block)
-        .style(Style::default().bg(pal.bg));
-    frame.render_widget(bar, area);
+        .highlight_style(highlight_style(&pal));
+
+    let mut list_state = ListState::default();
+    // Highlight the active theme only while the panel is focused; otherwise the
+    // ▸ marker already shows which one is active.
+    list_state.select(focused.then_some(active_idx));
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
@@ -504,9 +555,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Span::styled("  ↑↓", Style::default().fg(pal.accent)),
             Span::styled(" select   ", Style::default().fg(pal.dim)),
             Span::styled("Tab", Style::default().fg(pal.accent)),
-            Span::styled(" switch   ", Style::default().fg(pal.dim)),
-            Span::styled("←→", Style::default().fg(pal.accent)),
-            Span::styled(" theme   ", Style::default().fg(pal.dim)),
+            Span::styled(" switch panel   ", Style::default().fg(pal.dim)),
             Span::styled("Enter", Style::default().fg(pal.accent)),
             Span::styled(" open   ", Style::default().fg(pal.dim)),
             Span::styled("Q", Style::default().fg(pal.accent)),

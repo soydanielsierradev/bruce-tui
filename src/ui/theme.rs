@@ -8,13 +8,14 @@ use ratatui::style::Color;
 /// One of the built-in color themes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
-    Dark,
+    Hacker,
+    Cyberpunk,
+    Claude,
     Dracula,
     Nord,
     Light,
     Amber,
     Tokyo,
-    Hacker,
 }
 
 /// A resolved set of colors for rendering a single theme.
@@ -41,25 +42,49 @@ pub struct Palette {
 
 impl Theme {
     /// All themes in selector order.
-    pub const ALL: [Theme; 7] = [
-        Theme::Dark,
+    pub const ALL: [Theme; 8] = [
+        Theme::Hacker,
+        Theme::Cyberpunk,
+        Theme::Claude,
         Theme::Dracula,
         Theme::Nord,
         Theme::Light,
         Theme::Amber,
         Theme::Tokyo,
-        Theme::Hacker,
     ];
+
+    /// A short palette preview for the welcome theme selector: the theme's
+    /// surface colors (background, text, accent, muted) plus one status color.
+    /// These are what actually distinguish one theme from another at a glance —
+    /// the git-status colors are too conventional to tell themes apart.
+    pub fn swatches(self) -> [Color; 5] {
+        let p = self.palette();
+        [p.bg, p.fg, p.accent, p.dim, p.added]
+    }
 
     /// Resolve this theme to its concrete color palette.
     pub fn palette(self) -> Palette {
         match self {
+            // Cyberpunk: pure-black backdrop with neon pink as the primary
+            // accent and electric blue for modified files — the pink/blue neon
+            // pairing that reads as "cyberpunk".
+            Theme::Cyberpunk => Palette {
+                name: "Cyberpunk",
+                bg: Color::Rgb(0x0a, 0x0a, 0x12),
+                fg: Color::Rgb(0xea, 0xea, 0xff),
+                accent: Color::Rgb(0xff, 0x2e, 0x97),
+                dim: Color::Rgb(0x6c, 0x5c, 0x9e),
+                added: Color::Rgb(0x00, 0xf0, 0xb5),
+                modified: Color::Rgb(0x2d, 0x9c, 0xff),
+                removed: Color::Rgb(0xff, 0x3d, 0x6e),
+                renamed: Color::Rgb(0xff, 0xd1, 0x66),
+            },
             // Mirrors Claude Code's own dark look so the embedded pane and the
             // surrounding Bruce chrome read as one surface: warm near-black
             // background, soft warm-grey text, and Claude's signature coral as
             // the accent. The other themes intentionally diverge.
-            Theme::Dark => Palette {
-                name: "Dark",
+            Theme::Claude => Palette {
+                name: "Claude",
                 bg: Color::Rgb(0x00, 0x00, 0x00),
                 fg: Color::Rgb(0xd4, 0xd0, 0xc8),
                 accent: Color::Rgb(0xd9, 0x77, 0x57),

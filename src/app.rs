@@ -131,25 +131,26 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         KeyCode::Tab | KeyCode::BackTab => welcome.focus_next(),
                         KeyCode::Up => welcome.select_prev(),
                         KeyCode::Down => welcome.select_next(),
-                        KeyCode::Left => welcome.theme = welcome.theme.prev(),
-                        KeyCode::Right => welcome.theme = welcome.theme.next(),
                         KeyCode::Char('n') | KeyCode::Char('N') => welcome.focus_new_session(),
                         KeyCode::Enter => {
                             if welcome.on_new_session() {
                                 welcome.open_new_session();
                             } else if welcome.on_rename() {
                                 welcome.open_rename();
-                            } else if let Some(s) =
-                                welcome.sessions.get(welcome.session_selected)
-                            {
-                                // Existing sessions enable both panes until the
-                                // session module persists per-session config.
-                                transition = Some(Screen::Workspace(WorkspaceState::new(
-                                    s.name.clone(),
-                                    welcome.theme,
-                                    true,
-                                    true,
-                                )));
+                            } else if welcome.on_session() {
+                                if let Some(s) =
+                                    welcome.sessions.get(welcome.session_selected)
+                                {
+                                    // Existing sessions enable both panes until
+                                    // the session module persists per-session
+                                    // config.
+                                    transition = Some(Screen::Workspace(WorkspaceState::new(
+                                        s.name.clone(),
+                                        welcome.theme,
+                                        true,
+                                        true,
+                                    )));
+                                }
                             }
                         }
                         _ => {}
