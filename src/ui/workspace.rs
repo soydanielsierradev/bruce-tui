@@ -9,13 +9,14 @@ use std::cell::Cell;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 
 use crate::panels::git::{self, GitView};
+use crate::panels::metrics::MetricsWatcher;
 use crate::pty::PtySession;
 use crate::ui::theme::{Palette, Theme};
 
@@ -45,6 +46,9 @@ pub struct WorkspaceState {
     pub pty: Option<PtySession>,
     /// Why the PTY couldn't start, if it didn't.
     pub pty_error: Option<String>,
+    /// Live token-usage watcher backing the Metrics pane (`None` if it couldn't
+    /// start — e.g. no home directory).
+    pub metrics: Option<MetricsWatcher>,
     /// `true` after Ctrl+b, waiting for the leader command key.
     pub leader_pending: bool,
     /// Last size the PTY was synced to, to avoid resizing every frame.
@@ -59,6 +63,8 @@ impl WorkspaceState {
         // running in. Once the session module lands, pass the session's path.
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let git = git::load(&cwd);
+        // Watch Claude's transcript for this project to surface live token usage.
+        let metrics = MetricsWatcher::new(&cwd);
 
         // Spawn the PTY with a placeholder size; the first render resizes it to
         // the real Claude-pane dimensions.
@@ -77,6 +83,7 @@ impl WorkspaceState {
             git,
             pty,
             pty_error,
+            metrics,
             leader_pending: false,
             last_pty_size: Cell::new((24, 80)),
         }
@@ -177,9 +184,7 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
         match panel {
             Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git),
             Panel::Claude => render_claude_pane(frame, *col, &pal, focused, state),
-            Panel::Metrics => {
-                render_pane(frame, *col, &pal, " Metrics ", focused, &metrics_placeholder(&pal))
-            }
+            Panel::Metrics => render_metrics_pane(frame, *col, &pal, focused, state),
         }
     }
 
@@ -488,17 +493,72 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
     );
 }
 
-/// Placeholder body for the Metrics pane (file watcher lands in step 6).
-fn metrics_placeholder<'a>(pal: &Palette) -> Vec<Line<'a>> {
-    vec![
-        Line::from(Span::styled("tokens: —", Style::default().fg(pal.accent))),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "Live token usage via a file",
-            Style::default().fg(pal.dim),
-        )),
-        Line::from(Span::styled("watcher (step 6).", Style::default().fg(pal.dim))),
-    ]
+/// Render the Metrics pane: live token usage parsed from Claude's transcript.
+fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
+    let border_color = if focused { pal.accent } else { pal.dim };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            " Metrics ",
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(pal.bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(watcher) = &state.metrics else {
+        return simple_body(frame, inner, pal, "Token metrics unavailable.");
+    };
+    let m = watcher.snapshot();
+    let width = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Headline total, then the breakdown.
+    lines.push(Line::from(vec![
+        Span::styled(" tokens", Style::default().fg(pal.dim)),
+        Span::raw(" ".repeat(width.saturating_sub(1 + 6 + fmt_count(m.total()).len()))),
+        Span::styled(
+            fmt_count(m.total()),
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "┄".repeat(width),
+        Style::default().fg(pal.dim),
+    )));
+    metric_row(&mut lines, pal, width, "input", m.input, pal.fg);
+    metric_row(&mut lines, pal, width, "output", m.output, pal.added);
+    metric_row(&mut lines, pal, width, "cache write", m.cache_write, pal.renamed);
+    metric_row(&mut lines, pal, width, "cache read", m.cache_read, pal.modified);
+    lines.push(Line::raw(""));
+    metric_row(&mut lines, pal, width, "turns", m.messages, pal.dim);
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(pal.bg)),
+        inner,
+    );
+}
+
+/// Push a right-aligned "label … value" row, the value formatted compactly.
+fn metric_row<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, label: &str, value: u64, color: Color) {
+    let value = fmt_count(value);
+    let pad = width.saturating_sub(1 + label.len() + value.len());
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {label}"), Style::default().fg(pal.dim)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(value, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    ]));
+}
+
+/// Compact human count: 1234 -> "1.2k", 1500000 -> "1.5M".
+fn fmt_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
 }
 
 /// Top title bar: app name + the open session's name.
@@ -518,33 +578,6 @@ fn render_title(frame: &mut Frame, area: Rect, state: &WorkspaceState, pal: &Pal
         Paragraph::new(line).style(Style::default().bg(pal.bg)),
         area,
     );
-}
-
-/// One bordered pane whose border colour signals focus.
-fn render_pane(
-    frame: &mut Frame,
-    area: Rect,
-    pal: &Palette,
-    title: &str,
-    focused: bool,
-    body: &[Line],
-) {
-    let border_color = if focused { pal.accent } else { pal.dim };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title,
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(pal.bg));
-
-    let paragraph = Paragraph::new(body.to_vec())
-        .block(block)
-        .alignment(Alignment::Left)
-        .style(Style::default().bg(pal.bg));
-    frame.render_widget(paragraph, area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &WorkspaceState) {

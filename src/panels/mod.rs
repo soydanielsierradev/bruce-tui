@@ -4,3 +4,4 @@
 //! token-usage files) and exposes plain data the `ui` layer renders.
 
 pub mod git;
+pub mod metrics;
