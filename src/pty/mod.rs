@@ -186,11 +186,7 @@ fn respond_to_queries(chunk: &[u8], parser: &Arc<Mutex<vt100::Parser>>, writer: 
 /// `opts.cwd` is the project directory; Claude writes its transcript keyed off
 /// this path, so resuming must use the same cwd it was created with.
 fn spawn_command(opts: SpawnOptions) -> CommandBuilder {
-    let program = match std::env::var("BRUCE_CMD") {
-        Ok(p) if !p.trim().is_empty() => p,
-        _ => "claude".to_string(),
-    };
-    let mut cmd = CommandBuilder::new(program);
+    let mut cmd = CommandBuilder::new(program());
     for arg in &opts.args {
         cmd.arg(arg);
     }
@@ -211,4 +207,52 @@ fn spawn_command(opts: SpawnOptions) -> CommandBuilder {
         cmd.cwd(cwd);
     }
     cmd
+}
+
+/// The program Bruce spawns in the Claude pane: `claude`, or the `BRUCE_CMD`
+/// override when set (e.g. `pwsh` for a plain shell).
+pub fn program() -> String {
+    match std::env::var("BRUCE_CMD") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => "claude".to_string(),
+    }
+}
+
+/// True when Bruce will spawn the default `claude` CLI but it isn't on `PATH`.
+///
+/// Used for a friendly startup warning. Returns false when `BRUCE_CMD` overrides
+/// the program (the user picked something else on purpose) so we don't nag.
+pub fn claude_missing() -> bool {
+    program() == "claude" && !on_path("claude")
+}
+
+/// Best-effort `which`: is an executable named `program` reachable via `PATH`?
+///
+/// Pure lookup (no process spawned). On Windows it also tries the `PATHEXT`
+/// extensions (so a `claude.cmd`/`claude.exe` shim is found); on Unix it checks
+/// for the bare name.
+fn on_path(program: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
+            .split(';')
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&paths) {
+        if dir.join(program).is_file() {
+            return true;
+        }
+        for ext in &exts {
+            if !ext.is_empty() && dir.join(format!("{program}{ext}")).is_file() {
+                return true;
+            }
+        }
+    }
+    false
 }

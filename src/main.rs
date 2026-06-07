@@ -33,6 +33,31 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // No subcommand defaults to the TUI — running `bruce` just opens it.
     match cli.command {
-        Some(Command::Tui) | None => app::run(),
+        Some(Command::Tui) | None => {
+            warn_if_claude_missing();
+            app::run()
+        }
     }
+}
+
+/// Warn (before entering the TUI) if the `claude` CLI isn't on the PATH.
+///
+/// Bruce runs Claude Code inside its workspace, so without it the center pane is
+/// dead. The warning prints to stderr — visible before the alternate screen
+/// opens — and waits for Enter so it isn't missed, but lets the user continue.
+fn warn_if_claude_missing() {
+    use std::io::Write;
+
+    if !pty::claude_missing() {
+        return;
+    }
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "\n⚠  Bruce could not find the `claude` CLI on your PATH.");
+    let _ = writeln!(err, "   Bruce runs Claude Code inside its workspace, so the");
+    let _ = writeln!(err, "   center pane won't work until it's installed:");
+    let _ = writeln!(err, "   https://docs.claude.com/claude-code\n");
+    let _ = write!(err, "   Press Enter to continue anyway, or Ctrl+C to quit... ");
+    let _ = err.flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
 }
