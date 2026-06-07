@@ -49,3 +49,43 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 - [x] Paso 6: Métricas con file watcher
 - [x] Paso 7: Persistencia de sesiones (crear/listar/resumir vía
       `claude --session-id` / `--resume`, captura de tokens al cerrar)
+- [x] Paso 8: Gestión de sesiones — eliminar y duplicar (fork del
+      transcript reescribiendo el `sessionId`), unificadas con renombrar
+      en un picker único con barra de búsqueda
+- [x] Paso 9: Sesiones por proyecto — la welcome solo lista las del
+      directorio donde se abre Bruce (`load_for_project`)
+- [x] Paso 10: Preferencias persistentes (tema + visibilidad de paneles)
+      en `<config>/bruce/config.json`
+- [x] Paso 11: Refresco en vivo del panel Git (poll throttleado a 1s)
+- [x] Paso 12: `bruce` sin subcomando levanta la TUI (alias de `bruce tui`)
+
+## Versionado
+- SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch.
+- Bumpear `version` en Cargo.toml EN EL MISMO commit del cambio (la
+  versión se muestra en la welcome screen). Versión actual: 0.8.0.
+
+## Distribución
+Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
+
+Hecho:
+- [x] GitHub Actions: `release.yml` cross-compila en cada tag `v*` y
+      publica binarios (linux-gnu, macOS intel+arm, windows-msvc)
+- [x] Release `v0.8.0` publicado con los 4 binarios
+- [x] `install.sh` (curl|sh) para Linux/macOS
+- [x] `cargo install --git` funcionando
+- [x] README con guía de instalación por SO
+- [x] LICENSE (MIT)
+- [x] Recetas en `packaging/`: Homebrew (`homebrew/bruce.rb`) y
+      AUR (`aur/PKGBUILD`) con SHA256 reales
+
+Pendiente:
+- [ ] Publicar el tap Homebrew (repo aparte `homebrew-bruce`)
+- [ ] Publicar el paquete AUR `bruce-bin` (repo AUR + cuenta/SSH)
+- [ ] Aviso al arrancar si `claude` no está en el PATH (dependencia
+      de runtime; hoy solo documentada en README)
+- [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
+      (deprecación de Node 20, no bloqueante hasta ~sep 2026)
+
+Para cada release nuevo: bump de versión → `git tag vX.Y.Z` →
+`git push origin vX.Y.Z` (dispara el workflow) → actualizar los 3
+SHA256 + versión en `packaging/homebrew/bruce.rb` y `packaging/aur/PKGBUILD`.
