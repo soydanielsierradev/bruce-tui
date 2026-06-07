@@ -1,13 +1,15 @@
 <div align="center">
   <img src="img/logo.png" alt="Bruce" width="420">
-</div>
+  <br><br>
 
-![Rust](https://img.shields.io/badge/Rust-CE412B?logo=rust&logoColor=white)
-![ratatui](https://img.shields.io/badge/ratatui-TUI-1f6feb)
-![crossterm](https://img.shields.io/badge/crossterm-terminal-2ea043)
-![git2](https://img.shields.io/badge/git2-libgit2-F05133?logo=git&logoColor=white)
-![portable--pty](https://img.shields.io/badge/portable--pty-PTY-8957e5)
-![License: MIT](https://img.shields.io/badge/License-MIT-green)
+  ![Rust](https://img.shields.io/badge/Rust-CE412B?logo=rust&logoColor=white)
+  ![ratatui](https://img.shields.io/badge/ratatui-TUI-1f6feb)
+  ![crossterm](https://img.shields.io/badge/crossterm-terminal-2ea043)
+  ![git2](https://img.shields.io/badge/git2-libgit2-F05133?logo=git&logoColor=white)
+  ![portable--pty](https://img.shields.io/badge/portable--pty-PTY-8957e5)
+  ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+
+</div>
 
 A terminal workspace for [Claude Code](https://docs.claude.com/claude-code): a
 three-pane TUI with **Git** status on the left, **Claude** running live in the
