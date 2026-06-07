@@ -17,8 +17,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "bruce", version, about = "TUI workspace for Claude Code")]
 struct Cli {
+    /// Subcommand to run. When omitted, Bruce launches the TUI directly, so
+    /// `bruce` and `bruce tui` are equivalent.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -29,7 +31,8 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // No subcommand defaults to the TUI — running `bruce` just opens it.
     match cli.command {
-        Command::Tui => app::run(),
+        Some(Command::Tui) | None => app::run(),
     }
 }
