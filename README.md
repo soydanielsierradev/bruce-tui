@@ -1,4 +1,5 @@
-```
+<div align="center">
+<pre>
 ▀█████████▄     ▄████████ ███    █▄   ▄████████    ▄████████
   ███    ███   ███    ███ ███    ███ ███    ███   ███    ███
   ███    ███   ███    ███ ███    ███ ███    █▀    ███    █▀
@@ -8,7 +9,8 @@
   ███    ███   ███    ███ ███    ███ ███    ███   ███    ███
 ▄█████████▀    ███    ███ ████████▀  ████████▀    ██████████
                ███    ███
-```
+</pre>
+</div>
 
 ![Rust](https://img.shields.io/badge/Rust-CE412B?logo=rust&logoColor=white)
 ![ratatui](https://img.shields.io/badge/ratatui-TUI-1f6feb)
