@@ -86,6 +86,12 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             applied_theme = Some(current_theme);
         }
 
+        // Per-frame upkeep before drawing: refresh the Git pane on its throttle
+        // so changes made during the session are reflected live.
+        if let Screen::Workspace(ws) = &mut screen {
+            ws.tick();
+        }
+
         terminal.draw(|frame| match &screen {
             Screen::Welcome => welcome::render(frame, &welcome),
             Screen::Workspace(ws) => workspace::render(frame, ws),

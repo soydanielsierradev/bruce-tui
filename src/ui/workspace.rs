@@ -5,6 +5,7 @@
 //! token-metrics file watcher (step 6).
 
 use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -55,7 +56,14 @@ pub struct WorkspaceState {
     pub leader_pending: bool,
     /// Last size the PTY was synced to, to avoid resizing every frame.
     last_pty_size: Cell<(u16, u16)>,
+    /// When the Git pane was last reloaded, to throttle the refresh poll.
+    last_git_refresh: Instant,
 }
+
+/// How often the Git pane is re-read from disk. Claude (or the user) changes the
+/// repo while a session runs, so the snapshot must refresh; once a second keeps
+/// it current without re-running git status every frame.
+const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 impl WorkspaceState {
     /// Open a workspace running `session`, inheriting the welcome theme and the
@@ -98,6 +106,17 @@ impl WorkspaceState {
             metrics,
             leader_pending: false,
             last_pty_size: Cell::new((24, 80)),
+            last_git_refresh: Instant::now(),
+        }
+    }
+
+    /// Per-frame upkeep. Reloads the Git pane at most once per
+    /// [`GIT_REFRESH_INTERVAL`] so commits/edits made during the session (by
+    /// Claude or the user) show up without re-running git status every frame.
+    pub fn tick(&mut self) {
+        if self.last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
+            self.git = git::load(&self.session.project_path);
+            self.last_git_refresh = Instant::now();
         }
     }
 
