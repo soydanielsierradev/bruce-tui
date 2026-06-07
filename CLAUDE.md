@@ -58,11 +58,14 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
       en `<config>/bruce/config.json`
 - [x] Paso 11: Refresco en vivo del panel Git (poll throttleado a 1s)
 - [x] Paso 12: `bruce` sin subcomando levanta la TUI (alias de `bruce tui`)
+- [x] Paso 13: Chequeo de nueva versión al arrancar (curl best-effort,
+      cacheado 1/día en config), badge sobre el ASCII + bloque "App" al
+      lado de Options con "Check for updates" / "Update to latest"
 
 ## Versionado
 - SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch.
 - Bumpear `version` en Cargo.toml EN EL MISMO commit del cambio (la
-  versión se muestra en la welcome screen). Versión actual: 0.9.1.
+  versión se muestra en la welcome screen). Versión actual: 0.10.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
