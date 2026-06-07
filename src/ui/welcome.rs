@@ -6,6 +6,7 @@
 //! be replaced by real persisted sessions once the `session` module lands.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -19,6 +20,13 @@ use ratatui::{
 use crate::config::Config;
 use crate::session::{self, Session};
 use crate::ui::theme::{Palette, Theme};
+use crate::update;
+
+/// Re-check for a new release at most this often (seconds): once a day.
+const UPDATE_CHECK_TTL: i64 = 24 * 60 * 60;
+
+/// Labels for the App block, in display order (index = `app_selected`).
+const APP_LABELS: [&str; 2] = [" ⟳ Check for updates", " ⬆ Update to latest"];
 
 /// ASCII banner rendered at the top of the welcome screen.
 ///
@@ -50,6 +58,7 @@ const OPTION_LABELS: [&str; 4] = [
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Options,
+    App,
     Sessions,
     Themes,
 }
@@ -70,6 +79,8 @@ pub enum Dialog {
     NewSession(NewSessionDialog),
     /// Searchable session picker shared by rename, duplicate and delete.
     Picker(SessionPicker),
+    /// "Update to latest" info: how to update + open the releases page.
+    UpdateInfo,
 }
 
 /// Which action the [`SessionPicker`] performs on the chosen session.
@@ -151,6 +162,8 @@ pub struct WelcomeState {
     pub focus: Focus,
     /// Selected row within the Options block.
     pub option_selected: usize,
+    /// Selected row within the App block.
+    pub app_selected: usize,
     /// Selected row within the Sessions block.
     pub session_selected: usize,
     /// Active color theme (restored from saved preferences).
@@ -160,6 +173,14 @@ pub struct WelcomeState {
     pub git_enabled: bool,
     /// Whether new/opened sessions start with the Metrics panel shown.
     pub metrics_enabled: bool,
+    /// A newer release version available to update to, if any (drives the badge).
+    pub available_update: Option<String>,
+    /// In-flight background update check; consumed once it finishes.
+    update_check: Option<update::Check>,
+    /// Epoch seconds of the last update check (persisted, throttles the check).
+    last_update_check: i64,
+    /// Latest release version last seen (persisted cache).
+    latest_seen: String,
     /// Open dialog, if any. When `Some`, it captures all input.
     pub dialog: Option<Dialog>,
 }
@@ -173,6 +194,15 @@ impl WelcomeState {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         // Restore the user's last theme + panel choices.
         let config = Config::load();
+
+        // Show a badge immediately from the cached version, then refresh in the
+        // background if the last check is older than the TTL.
+        let available_update = (!config.latest_seen.is_empty()
+            && update::is_newer(&config.latest_seen, update::current()))
+        .then(|| config.latest_seen.clone());
+        let update_check = (now_epoch() - config.last_update_check >= UPDATE_CHECK_TTL)
+            .then(update::Check::spawn);
+
         Self {
             // A load failure (e.g. unreadable config dir) yields an empty list
             // rather than blocking the welcome screen.
@@ -180,12 +210,43 @@ impl WelcomeState {
             project_path,
             focus: Focus::Options,
             option_selected: 0,
+            app_selected: 0,
             session_selected: 0,
             theme: config.theme,
             git_enabled: config.git_enabled,
             metrics_enabled: config.metrics_enabled,
+            available_update,
+            update_check,
+            last_update_check: config.last_update_check,
+            latest_seen: config.latest_seen,
             dialog: None,
         }
+    }
+
+    /// Poll the in-flight update check; when it finishes, update the badge and
+    /// persist the result (so the next launch uses the cache within the TTL).
+    /// Cheap no-op when no check is running. Call once per frame.
+    pub fn poll_update_check(&mut self) {
+        let Some(check) = &self.update_check else {
+            return;
+        };
+        let Some(result) = check.poll() else {
+            return; // still in flight
+        };
+        self.update_check = None;
+        self.last_update_check = now_epoch();
+        if let Some(latest) = result {
+            self.latest_seen = latest.clone();
+            self.available_update =
+                update::is_newer(&latest, update::current()).then_some(latest);
+        }
+        self.persist_config();
+    }
+
+    /// Start a fresh update check now, ignoring the TTL (the "Check for updates"
+    /// action).
+    pub fn start_update_check(&mut self) {
+        self.update_check = Some(update::Check::spawn());
     }
 
     /// Persist the current preferences (theme + panel visibility) to disk.
@@ -196,6 +257,8 @@ impl WelcomeState {
             theme: self.theme,
             git_enabled: self.git_enabled,
             metrics_enabled: self.metrics_enabled,
+            last_update_check: self.last_update_check,
+            latest_seen: self.latest_seen.clone(),
         }
         .save();
     }
@@ -213,7 +276,8 @@ impl WelcomeState {
     /// Cycle focus across the Options, Sessions and Themes panels.
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
-            Focus::Options => Focus::Sessions,
+            Focus::Options => Focus::App,
+            Focus::App => Focus::Sessions,
             Focus::Sessions => Focus::Themes,
             Focus::Themes => Focus::Options,
         };
@@ -226,6 +290,10 @@ impl WelcomeState {
             Focus::Options => {
                 let n = OPTION_LABELS.len();
                 self.option_selected = (self.option_selected + n - 1) % n;
+            }
+            Focus::App => {
+                let n = APP_LABELS.len();
+                self.app_selected = (self.app_selected + n - 1) % n;
             }
             Focus::Sessions => {
                 let n = self.sessions.len();
@@ -248,6 +316,10 @@ impl WelcomeState {
             Focus::Options => {
                 let n = OPTION_LABELS.len();
                 self.option_selected = (self.option_selected + 1) % n;
+            }
+            Focus::App => {
+                let n = APP_LABELS.len();
+                self.app_selected = (self.app_selected + 1) % n;
             }
             Focus::Sessions => {
                 let n = self.sessions.len();
@@ -294,6 +366,21 @@ impl WelcomeState {
         self.focus == Focus::Options && self.option_selected == 3
     }
 
+    /// True when the App block's "Check for updates" row is selected.
+    pub fn on_app_check(&self) -> bool {
+        self.focus == Focus::App && self.app_selected == 0
+    }
+
+    /// True when the App block's "Update to latest" row is selected.
+    pub fn on_app_update(&self) -> bool {
+        self.focus == Focus::App && self.app_selected == 1
+    }
+
+    /// Open the "Update to latest" info dialog.
+    pub fn open_update_info(&mut self) {
+        self.dialog = Some(Dialog::UpdateInfo);
+    }
+
     /// Open the searchable session picker for `action` (rename / duplicate /
     /// delete). Starts in browse mode with an empty query, so every session is
     /// shown until the user types.
@@ -317,6 +404,16 @@ impl WelcomeState {
             Some(Dialog::NewSession(_)) => self.new_session_key(code),
             Some(Dialog::Picker(_)) => {
                 self.picker_key(code);
+                WelcomeEvent::None
+            }
+            Some(Dialog::UpdateInfo) => {
+                match code {
+                    KeyCode::Char('o') | KeyCode::Char('O') => {
+                        update::open_in_browser(&update::releases_url());
+                    }
+                    KeyCode::Esc | KeyCode::Enter => self.dialog = None,
+                    _ => {}
+                }
                 WelcomeEvent::None
             }
             None => WelcomeEvent::None,
@@ -510,8 +607,15 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     let mid = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[3]);
 
+    // Options and the App block share the row: Options is wider (4 items with
+    // longer labels), App sits beside it.
+    let top = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(chunks[2]);
+
+    render_badge(frame, chunks[0], state);
     render_logo(frame, chunks[1], state);
-    render_options(frame, chunks[2], state);
+    render_options(frame, top[0], state);
+    render_app(frame, top[1], state);
     render_sessions(frame, mid[0], state);
     render_themes(frame, mid[1], state);
     render_footer(frame, chunks[4], state);
@@ -520,8 +624,115 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     match &state.dialog {
         Some(Dialog::NewSession(d)) => render_new_session_dialog(frame, area, &pal, d),
         Some(Dialog::Picker(p)) => render_picker_dialog(frame, area, &pal, state, p),
+        Some(Dialog::UpdateInfo) => render_update_info_dialog(frame, area, &pal, state),
         None => {}
     }
+}
+
+/// Badge above the logo: shown only when a newer release is available.
+fn render_badge(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let Some(latest) = &state.available_update else {
+        return;
+    };
+    let pal = state.theme.palette();
+    let text = format!(" ⬆ v{latest} available — App ▸ Update to latest ");
+    let badge = Paragraph::new(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(pal.bg)
+            .bg(pal.accent)
+            .add_modifier(Modifier::BOLD),
+    )))
+    .alignment(Alignment::Center)
+    .style(Style::default().bg(pal.bg));
+    frame.render_widget(badge, area);
+}
+
+/// The App block beside Options: application-level actions (updates).
+fn render_app(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let pal = state.theme.palette();
+    let focused = state.focus == Focus::App;
+
+    let items: Vec<ListItem> = APP_LABELS
+        .iter()
+        .map(|label| {
+            ListItem::new(Line::from(Span::styled(
+                *label,
+                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+            )))
+        })
+        .collect();
+
+    let title = match &state.available_update {
+        Some(v) => format!(" App · v{v} available "),
+        None => format!(" App · v{} ", update::current()),
+    };
+    let block = panel_block(&pal, &title, focused);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style(&pal));
+
+    let mut list_state = ListState::default();
+    list_state.select(focused.then_some(state.app_selected));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Draw the "Update to latest" info dialog: current/latest version and the
+/// per-channel update commands, with a key to open the releases page.
+fn render_update_info_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, state: &WelcomeState) {
+    let area = centered_rect(70, 70, screen);
+    frame.render_widget(Clear, area);
+
+    let block = dialog_block(pal, " Update to latest ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let status = match &state.available_update {
+        Some(v) => format!("  v{} installed · v{} available", update::current(), v),
+        None => format!("  v{} installed · up to date (or check pending)", update::current()),
+    };
+
+    let label = |s: &'static str| Span::styled(s, Style::default().fg(pal.dim));
+    let cmd = |s: String| Span::styled(s, Style::default().fg(pal.fg).add_modifier(Modifier::BOLD));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            status,
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Update with the command for how you installed Bruce:",
+            Style::default().fg(pal.dim),
+        )),
+        Line::raw(""),
+        Line::from(vec![label("  Homebrew   "), cmd("brew upgrade bruce".into())]),
+        Line::from(vec![
+            label("  curl       "),
+            cmd("curl -fsSL .../install.sh | sh".into()),
+        ]),
+        Line::from(vec![
+            label("  Windows    "),
+            cmd("irm .../install.ps1 | iex".into()),
+        ]),
+        Line::from(vec![
+            label("  cargo      "),
+            cmd("cargo install --git <repo> --force".into()),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(pal.dim)),
+            Span::styled("O", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" to open the releases page, ", Style::default().fg(pal.dim)),
+            Span::styled("Esc", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" to close.", Style::default().fg(pal.dim)),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(pal.bg)),
+        inner,
+    );
 }
 
 fn render_logo(frame: &mut Frame, area: Rect, state: &WelcomeState) {
@@ -712,6 +923,12 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Span::styled(" create   ", Style::default().fg(pal.dim)),
             Span::styled("Esc", Style::default().fg(pal.accent)),
             Span::styled(" cancel", Style::default().fg(pal.dim)),
+        ]),
+        Some(Dialog::UpdateInfo) => Line::from(vec![
+            Span::styled("  O", Style::default().fg(pal.accent)),
+            Span::styled(" open releases   ", Style::default().fg(pal.dim)),
+            Span::styled("Esc", Style::default().fg(pal.accent)),
+            Span::styled(" close", Style::default().fg(pal.dim)),
         ]),
         None => Line::from(vec![
             Span::styled("  ↑↓", Style::default().fg(pal.accent)),
@@ -939,6 +1156,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     Layout::horizontal([Constraint::Percentage(percent_x)])
         .flex(Flex::Center)
         .split(vertical[0])[0]
+}
+
+/// Current time as Unix epoch seconds (0 on a pre-epoch clock).
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Indices into `sessions` whose name or branch contains `query`

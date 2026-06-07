@@ -26,6 +26,14 @@ pub struct Config {
     pub git_enabled: bool,
     /// Whether the Metrics panel is shown.
     pub metrics_enabled: bool,
+    /// Unix-epoch seconds of the last update check (0 = never). Throttles the
+    /// network check to roughly once a day.
+    #[serde(default)]
+    pub last_update_check: i64,
+    /// Latest release version last seen (empty = unknown). Lets the badge show
+    /// immediately on startup from cache, before any new network check returns.
+    #[serde(default)]
+    pub latest_seen: String,
 }
 
 impl Default for Config {
@@ -34,6 +42,8 @@ impl Default for Config {
             theme: Theme::Hacker,
             git_enabled: true,
             metrics_enabled: true,
+            last_update_check: 0,
+            latest_seen: String::new(),
         }
     }
 }

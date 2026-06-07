@@ -91,6 +91,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         if let Screen::Workspace(ws) = &mut screen {
             ws.tick();
         }
+        // Pick up the background update check whenever it finishes (cheap no-op
+        // otherwise); the welcome state lives across both screens.
+        welcome.poll_update_check();
 
         terminal.draw(|frame| match &screen {
             Screen::Welcome => welcome::render(frame, &welcome),
@@ -167,6 +170,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                                 welcome.open_picker(welcome::PickerAction::Duplicate);
                             } else if welcome.on_delete() {
                                 welcome.open_picker(welcome::PickerAction::Delete);
+                            } else if welcome.on_app_check() {
+                                welcome.start_update_check();
+                            } else if welcome.on_app_update() {
+                                welcome.open_update_info();
                             } else if welcome.on_session() {
                                 if let Some(s) =
                                     welcome.sessions.get(welcome.session_selected)

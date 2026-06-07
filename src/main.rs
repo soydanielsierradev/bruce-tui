@@ -9,6 +9,7 @@ mod panels;
 mod pty;
 mod session;
 mod ui;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
