@@ -650,14 +650,11 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     ])
     .split(area);
 
-    // Sessions and Themes share the width side by side; Sessions gets more
-    // room for its columns, Themes just needs name + color swatches.
-    let mid = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+    // All four blocks share a common width: each row splits evenly so Options,
+    // App, Sessions and Themes line up at the same size.
+    let mid = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[3]);
-
-    // Options and the App block share the row: Options is wider (4 items with
-    // longer labels), App sits beside it.
-    let top = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+    let top = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[2]);
 
     render_badge(frame, chunks[0], state);
