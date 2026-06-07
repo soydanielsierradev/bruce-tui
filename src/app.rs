@@ -155,6 +155,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                                 welcome.open_new_session();
                             } else if welcome.on_rename() {
                                 welcome.open_rename();
+                            } else if welcome.on_duplicate() {
+                                welcome.duplicate_selected();
+                            } else if welcome.on_delete() {
+                                welcome.open_confirm_delete();
                             } else if welcome.on_session() {
                                 if let Some(s) =
                                     welcome.sessions.get(welcome.session_selected)

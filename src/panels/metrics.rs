@@ -138,6 +138,30 @@ pub fn newest_transcript(dir: &Path) -> Option<PathBuf> {
     newest.map(|(_, path)| path)
 }
 
+/// Fork a session's transcript: copy `<old_id>.jsonl` to `<new_id>.jsonl`,
+/// rewriting the embedded `sessionId` so the copy resumes as its own session.
+///
+/// Claude stores `"sessionId":"<id>"` on every line, matching the filename, so a
+/// raw copy would leave the duplicate pointing at the original. A UUID is
+/// globally unique, so replacing that exact string only rewrites session-id
+/// fields — per-message `uuid`s hold different values and are untouched.
+///
+/// No transcript yet (a session forked before Claude wrote anything) is not an
+/// error: the duplicate simply starts empty. Returns whether a file was copied.
+pub fn fork_transcript(project_path: &Path, old_id: &str, new_id: &str) -> std::io::Result<bool> {
+    let Some(dir) = transcript_dir(project_path) else {
+        return Ok(false);
+    };
+    let old_path = dir.join(format!("{old_id}.jsonl"));
+    if !old_path.exists() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(&old_path)?;
+    let rewritten = content.replace(old_id, new_id);
+    fs::write(dir.join(format!("{new_id}.jsonl")), rewritten)?;
+    Ok(true)
+}
+
 /// Total tokens recorded for a specific session's transcript, if it exists.
 ///
 /// Because Bruce launches `claude --session-id <id>`, the transcript file is

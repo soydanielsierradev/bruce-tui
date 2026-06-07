@@ -77,6 +77,44 @@ impl Session {
         self.last_used = now_epoch();
         self.save()
     }
+
+    /// Delete this session's JSON from disk.
+    ///
+    /// Deliberately leaves Claude's transcript (`<id>.jsonl`) in place: removing
+    /// the conversation history is destructive and recoverable only by Claude,
+    /// so Bruce only forgets its own pointer to it. A missing file is not an
+    /// error (already gone).
+    pub fn delete(&self) -> Result<()> {
+        let path = sessions_dir()?.join(format!("{}.json", self.id));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("deleting session {}", path.display())),
+        }
+    }
+
+    /// Duplicate this session: a fresh id and `(copy)` name pointing at the same
+    /// project, with the conversation forked so the copy can diverge without
+    /// touching the original. The new session is persisted before being
+    /// returned.
+    ///
+    /// The transcript fork is best-effort: if it can't be copied the duplicate
+    /// still exists, just without prior history.
+    pub fn duplicate(&self) -> Result<Session> {
+        let now = now_epoch();
+        let copy = Session {
+            id: Uuid::new_v4().to_string(),
+            name: format!("{} (copy)", self.name),
+            project_path: self.project_path.clone(),
+            branch: self.branch.clone(),
+            created_at: now,
+            last_used: now,
+            tokens_used: self.tokens_used,
+        };
+        let _ = crate::panels::metrics::fork_transcript(&self.project_path, &self.id, &copy.id);
+        copy.save()?;
+        Ok(copy)
+    }
 }
 
 /// Load every valid session from disk, most-recently-used first.

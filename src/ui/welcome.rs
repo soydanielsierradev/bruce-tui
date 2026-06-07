@@ -36,7 +36,12 @@ const LOGO: &str = r#"
 
 /// Labels for the Options block, in display order. The index of each entry is
 /// what [`WelcomeState::option_selected`] points at.
-const OPTION_LABELS: [&str; 2] = [" + New session", " ✎ Rename session"];
+const OPTION_LABELS: [&str; 4] = [
+    " + New session",
+    " ✎ Rename session",
+    " ⧉ Duplicate session",
+    " ✕ Delete session",
+];
 
 /// Which panel currently has keyboard focus. `Tab` cycles through them.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,6 +66,8 @@ pub enum WelcomeEvent {
 pub enum Dialog {
     Rename(RenameDialog),
     NewSession(NewSessionDialog),
+    /// Confirm deletion of the session at this list index.
+    ConfirmDelete(usize),
 }
 
 /// Modal state for renaming a session.
@@ -196,6 +203,35 @@ impl WelcomeState {
         self.focus == Focus::Options && self.option_selected == 1
     }
 
+    /// True when the "Duplicate session" option is selected.
+    pub fn on_duplicate(&self) -> bool {
+        self.focus == Focus::Options && self.option_selected == 2
+    }
+
+    /// True when the "Delete session" option is selected.
+    pub fn on_delete(&self) -> bool {
+        self.focus == Focus::Options && self.option_selected == 3
+    }
+
+    /// Duplicate the currently selected session (fork its conversation) and
+    /// reload the list so the copy appears. No-op when the list is empty.
+    pub fn duplicate_selected(&mut self) {
+        if let Some(s) = self.sessions.get(self.session_selected) {
+            // Best-effort: a failed duplicate just leaves the list unchanged.
+            let _ = s.duplicate();
+            self.reload_sessions();
+        }
+    }
+
+    /// Open the delete-confirmation dialog for the selected session, unless the
+    /// list is empty.
+    pub fn open_confirm_delete(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.dialog = Some(Dialog::ConfirmDelete(self.session_selected));
+    }
+
     /// Open the new-session form.
     pub fn open_new_session(&mut self) {
         self.dialog = Some(Dialog::NewSession(NewSessionDialog::new()));
@@ -220,7 +256,34 @@ impl WelcomeState {
                 WelcomeEvent::None
             }
             Some(Dialog::NewSession(_)) => self.new_session_key(code),
+            Some(Dialog::ConfirmDelete(_)) => {
+                self.confirm_delete_key(code);
+                WelcomeEvent::None
+            }
             None => WelcomeEvent::None,
+        }
+    }
+
+    /// Delete-confirmation key handling: `y`/Enter deletes and reloads the list,
+    /// `n`/Esc cancels. Any other key is ignored so a stray press can't confirm.
+    fn confirm_delete_key(&mut self, code: KeyCode) {
+        let Some(Dialog::ConfirmDelete(idx)) = self.dialog else {
+            return;
+        };
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(s) = self.sessions.get(idx) {
+                    // Best-effort: even if the file delete fails, reloading keeps
+                    // the list consistent with what's actually on disk.
+                    let _ = s.delete();
+                }
+                self.dialog = None;
+                self.reload_sessions();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.dialog = None;
+            }
+            _ => {}
         }
     }
 
@@ -334,7 +397,7 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     let chunks = Layout::vertical([
         Constraint::Length(2),  // top margin (breathing room above the banner)
         Constraint::Length(10), // logo (9-line Delta Corps Priest 1 banner)
-        Constraint::Length(4),  // options block (2 rows + borders)
+        Constraint::Length(6),  // options block (4 rows + borders)
         Constraint::Min(5),     // Sessions + Themes row
         Constraint::Length(1),  // footer hints
     ])
@@ -355,6 +418,9 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     match &state.dialog {
         Some(Dialog::Rename(d)) => render_rename_dialog(frame, area, &pal, state, d),
         Some(Dialog::NewSession(d)) => render_new_session_dialog(frame, area, &pal, d),
+        Some(Dialog::ConfirmDelete(idx)) => {
+            render_confirm_delete_dialog(frame, area, &pal, state, *idx)
+        }
         None => {}
     }
 }
@@ -536,6 +602,14 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Span::styled("Esc", Style::default().fg(pal.accent)),
             Span::styled(" cancel", Style::default().fg(pal.dim)),
         ]),
+        Some(Dialog::ConfirmDelete(_)) => Line::from(vec![
+            Span::styled("  Y", Style::default().fg(pal.accent)),
+            Span::styled(" delete   ", Style::default().fg(pal.dim)),
+            Span::styled("N", Style::default().fg(pal.accent)),
+            Span::styled("/", Style::default().fg(pal.dim)),
+            Span::styled("Esc", Style::default().fg(pal.accent)),
+            Span::styled(" cancel", Style::default().fg(pal.dim)),
+        ]),
         None => Line::from(vec![
             Span::styled("  ↑↓", Style::default().fg(pal.accent)),
             Span::styled(" select   ", Style::default().fg(pal.dim)),
@@ -635,6 +709,48 @@ fn render_new_session_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, dia
 
     let form = Paragraph::new(lines).style(Style::default().bg(pal.bg));
     frame.render_widget(form, inner);
+}
+
+/// Draw the modal delete-confirmation dialog centred over `screen`.
+fn render_confirm_delete_dialog(
+    frame: &mut Frame,
+    screen: Rect,
+    pal: &Palette,
+    state: &WelcomeState,
+    idx: usize,
+) {
+    let area = centered_rect(50, 30, screen);
+    frame.render_widget(Clear, area);
+
+    let block = dialog_block(pal, " Delete session ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let name = state
+        .sessions
+        .get(idx)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "  Delete this session?",
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("  {name}"),
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  The Claude conversation is kept on disk.",
+            Style::default().fg(pal.dim),
+        )),
+    ];
+
+    let body = Paragraph::new(lines).style(Style::default().bg(pal.bg));
+    frame.render_widget(body, inner);
 }
 
 /// A bordered panel whose border colour signals focus.
