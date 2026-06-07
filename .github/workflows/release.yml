@@ -72,3 +72,50 @@ jobs:
         with:
           files: ${{ env.ASSET }}
           fail_on_unmatched_files: true
+
+  # After all binaries are published, regenerate the Homebrew formula from the
+  # template (filling in the new version + SHA256s) and push it to the tap repo,
+  # so `brew install` serves the new release without any manual step.
+  update-tap:
+    name: update Homebrew tap
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bruce-tui (for the formula template)
+        uses: actions/checkout@v4
+
+      - name: Checkout the tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: soydanielsierradev/homebrew-bruce
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Render formula and push
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          export VERSION="${tag#v}"
+          export BASE="https://github.com/${{ github.repository }}/releases/download/${tag}"
+
+          # Download each published asset and hash it.
+          dl() { curl -fsSL "$BASE/$1" -o "$1"; sha256sum "$1" | cut -d' ' -f1; }
+          export SHA_ARM=$(dl bruce-aarch64-apple-darwin.tar.gz)
+          export SHA_INTEL=$(dl bruce-x86_64-apple-darwin.tar.gz)
+          export SHA_LINUX=$(dl bruce-x86_64-unknown-linux-gnu.tar.gz)
+
+          # Fill the template's ${...} placeholders only; leave Ruby's #{...} alone.
+          mkdir -p tap/Formula
+          envsubst '${VERSION} ${BASE} ${SHA_ARM} ${SHA_INTEL} ${SHA_LINUX}' \
+            < packaging/homebrew/bruce.rb > tap/Formula/bruce.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/bruce.rb
+          if git diff --staged --quiet; then
+            echo "Formula already up to date."
+          else
+            git commit -m "bruce ${VERSION}"
+            git push
+          fi
