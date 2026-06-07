@@ -1,9 +1,26 @@
-# Bruce — a terminal workspace for Claude Code
+```
+▀█████████▄     ▄████████ ███    █▄   ▄████████    ▄████████
+  ███    ███   ███    ███ ███    ███ ███    ███   ███    ███
+  ███    ███   ███    ███ ███    ███ ███    █▀    ███    █▀
+ ▄███▄▄▄██▀   ▄███▄▄▄▄██▀ ███    ███ ███         ▄███▄▄▄
+▀▀███▀▀▀██▄  ▀▀███▀▀▀▀▀   ███    ███ ███        ▀▀███▀▀▀
+  ███    ██▄ ▀███████████ ███    ███ ███    █▄    ███    █▄
+  ███    ███   ███    ███ ███    ███ ███    ███   ███    ███
+▄█████████▀    ███    ███ ████████▀  ████████▀    ██████████
+               ███    ███
+```
 
-Bruce is a TUI that wraps [Claude Code](https://docs.claude.com/claude-code) in a
-three-pane workspace: **Git** status on the left, **Claude** running live in the
+![Rust](https://img.shields.io/badge/Rust-CE412B?logo=rust&logoColor=white)
+![ratatui](https://img.shields.io/badge/ratatui-TUI-1f6feb)
+![crossterm](https://img.shields.io/badge/crossterm-terminal-2ea043)
+![git2](https://img.shields.io/badge/git2-libgit2-F05133?logo=git&logoColor=white)
+![portable--pty](https://img.shields.io/badge/portable--pty-PTY-8957e5)
+![License: MIT](https://img.shields.io/badge/License-MIT-green)
+
+A terminal workspace for [Claude Code](https://docs.claude.com/claude-code): a
+three-pane TUI with **Git** status on the left, **Claude** running live in the
 center, and token **Metrics** on the right. It keeps a session per project — open
-Bruce in a directory, pick up exactly where you left off, with the full
+Bruce in a directory and pick up exactly where you left off, with the full
 conversation restored.
 
 ```
