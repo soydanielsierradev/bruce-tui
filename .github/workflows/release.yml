@@ -44,14 +44,16 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # Package the binary as bruce-<tag>-<target>.{tar.gz,zip} so install
-      # scripts can predict the asset name from the platform.
+      # Package with a STABLE per-target name (no version in it) so install
+      # scripts can fetch `releases/latest/download/bruce-<target>.tar.gz`
+      # without resolving the tag first. The release page still shows the
+      # version.
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/bruce"
-          pkg="bruce-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          pkg="bruce-${{ matrix.target }}.tar.gz"
           tar -czf "$pkg" -C "$(dirname "$bin")" bruce
           echo "ASSET=$pkg" >> "$GITHUB_ENV"
 
@@ -60,7 +62,7 @@ jobs:
         shell: bash
         run: |
           bin="target/${{ matrix.target }}/release/bruce.exe"
-          pkg="bruce-${GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          pkg="bruce-${{ matrix.target }}.zip"
           7z a "$pkg" "$bin"
           echo "ASSET=$pkg" >> "$GITHUB_ENV"
 
