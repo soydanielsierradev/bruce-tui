@@ -47,3 +47,5 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 - [x] Paso 4: Panel Git con git2
 - [x] Paso 5: PTY con portable-pty
 - [x] Paso 6: Métricas con file watcher
+- [x] Paso 7: Persistencia de sesiones (crear/listar/resumir vía
+      `claude --session-id` / `--resume`, captura de tokens al cerrar)
