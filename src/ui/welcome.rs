@@ -16,6 +16,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::config::Config;
 use crate::session::{self, Session};
 use crate::ui::theme::{Palette, Theme};
 
@@ -152,18 +153,26 @@ pub struct WelcomeState {
     pub option_selected: usize,
     /// Selected row within the Sessions block.
     pub session_selected: usize,
-    /// Active color theme.
+    /// Active color theme (restored from saved preferences).
     pub theme: Theme,
+    /// Whether new/opened sessions start with the Git panel shown. Restored
+    /// from preferences and updated when the user toggles it in a workspace.
+    pub git_enabled: bool,
+    /// Whether new/opened sessions start with the Metrics panel shown.
+    pub metrics_enabled: bool,
     /// Open dialog, if any. When `Some`, it captures all input.
     pub dialog: Option<Dialog>,
 }
 
 impl WelcomeState {
-    /// Build the initial state, loading the current project's sessions.
+    /// Build the initial state: restore saved preferences and load the current
+    /// project's sessions.
     pub fn new() -> Self {
         // The directory Bruce was launched in defines the project.
         let project_path =
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Restore the user's last theme + panel choices.
+        let config = Config::load();
         Self {
             // A load failure (e.g. unreadable config dir) yields an empty list
             // rather than blocking the welcome screen.
@@ -172,9 +181,23 @@ impl WelcomeState {
             focus: Focus::Options,
             option_selected: 0,
             session_selected: 0,
-            theme: Theme::Hacker,
+            theme: config.theme,
+            git_enabled: config.git_enabled,
+            metrics_enabled: config.metrics_enabled,
             dialog: None,
         }
+    }
+
+    /// Persist the current preferences (theme + panel visibility) to disk.
+    /// Best-effort: a failed write just means the next run falls back to the
+    /// previous saved state.
+    pub fn persist_config(&self) {
+        let _ = Config {
+            theme: self.theme,
+            git_enabled: self.git_enabled,
+            metrics_enabled: self.metrics_enabled,
+        }
+        .save();
     }
 
     /// Reload this project's session list from disk, clamping the selection to
@@ -210,7 +233,11 @@ impl WelcomeState {
                     self.session_selected = (self.session_selected + n - 1) % n;
                 }
             }
-            Focus::Themes => self.theme = self.theme.prev(),
+            Focus::Themes => {
+                self.theme = self.theme.prev();
+                // Remember the theme choice immediately.
+                self.persist_config();
+            }
         }
     }
 
@@ -228,7 +255,11 @@ impl WelcomeState {
                     self.session_selected = (self.session_selected + 1) % n;
                 }
             }
-            Focus::Themes => self.theme = self.theme.next(),
+            Focus::Themes => {
+                self.theme = self.theme.next();
+                // Remember the theme choice immediately.
+                self.persist_config();
+            }
         }
     }
 

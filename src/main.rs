@@ -4,6 +4,7 @@
 //! lives in [`app`].
 
 mod app;
+mod config;
 mod panels;
 mod pty;
 mod session;

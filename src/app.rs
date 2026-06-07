@@ -135,14 +135,14 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         // Best-effort persist: if the disk write fails the
                         // workspace still opens, only this run won't be resumable.
                         let _ = session.save();
-                        // New sessions start with every pane visible; the user
-                        // toggles them live with Ctrl+g / Ctrl+m.
+                        // Open with the user's saved panel preferences; they can
+                        // still toggle them live with Ctrl+g / Ctrl+m.
                         transition = Some(Screen::Workspace(WorkspaceState::new(
                             session,
                             false,
                             welcome.theme,
-                            true,
-                            true,
+                            welcome.git_enabled,
+                            welcome.metrics_enabled,
                         )));
                     }
                 } else {
@@ -175,8 +175,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                                         session,
                                         true,
                                         welcome.theme,
-                                        true,
-                                        true,
+                                        welcome.git_enabled,
+                                        welcome.metrics_enabled,
                                     )));
                                 }
                             }
@@ -224,10 +224,14 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         }
 
         // Leaving a workspace (back to welcome or quitting): persist its soft
-        // metrics — token total + last_used — to the session JSON.
+        // metrics, and remember the panel visibility the user ended on as the
+        // new global preference.
         if quit || matches!(transition, Some(Screen::Welcome)) {
             if let Screen::Workspace(ws) = &mut screen {
                 ws.persist_metrics();
+                welcome.git_enabled = ws.git_enabled;
+                welcome.metrics_enabled = ws.metrics_enabled;
+                welcome.persist_config();
             }
         }
 

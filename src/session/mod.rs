@@ -178,31 +178,8 @@ fn load_file(path: &Path) -> Result<Session> {
 }
 
 /// Directory holding session files: `<config>/bruce/sessions`.
-///
-/// Config base resolution, in order: `XDG_CONFIG_HOME`, then `HOME/.config`,
-/// then `USERPROFILE/.config` (Windows). No OS-exclusive APIs, so it builds and
-/// runs the same on macOS, Linux and the developer's Windows box.
 fn sessions_dir() -> Result<PathBuf> {
-    Ok(config_base()?.join("bruce").join("sessions"))
-}
-
-/// Resolve the platform config base directory.
-fn config_base() -> Result<PathBuf> {
-    if let Some(xdg) = env_path("XDG_CONFIG_HOME") {
-        return Ok(xdg);
-    }
-    let home = env_path("HOME")
-        .or_else(|| env_path("USERPROFILE"))
-        .context("no XDG_CONFIG_HOME, HOME or USERPROFILE set; cannot locate config dir")?;
-    Ok(home.join(".config"))
-}
-
-/// Read an environment variable as a non-empty path.
-fn env_path(key: &str) -> Option<PathBuf> {
-    match std::env::var(key) {
-        Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
-        _ => None,
-    }
+    Ok(crate::config::bruce_dir()?.join("sessions"))
 }
 
 /// Current time as Unix epoch seconds. Clamps a pre-epoch clock to 0 rather than

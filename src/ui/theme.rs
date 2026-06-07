@@ -4,9 +4,10 @@
 //! plain `Copy` values so they can be cycled cheaply from the event loop.
 
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
 
 /// One of the built-in color themes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
     Hacker,
     Cyberpunk,
