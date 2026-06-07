@@ -62,7 +62,7 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 ## Versionado
 - SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch.
 - Bumpear `version` en Cargo.toml EN EL MISMO commit del cambio (la
-  versión se muestra en la welcome screen). Versión actual: 0.9.0.
+  versión se muestra en la welcome screen). Versión actual: 0.9.1.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
@@ -91,6 +91,8 @@ Pendiente:
 - [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
       (deprecación de Node 20, no bloqueante hasta ~sep 2026)
 
-Para cada release nuevo: bump de versión → `git tag vX.Y.Z` →
-`git push origin vX.Y.Z` (dispara el workflow) → actualizar los 3
-SHA256 + versión en `packaging/homebrew/bruce.rb` y `packaging/aur/PKGBUILD`.
+Para cada release nuevo: bump de versión en Cargo.toml → commit → push →
+`git tag vX.Y.Z` → `git push origin vX.Y.Z`. El workflow compila los
+binarios, publica el release Y **actualiza el tap Homebrew solo** (job
+`update-tap`, vía el secret `TAP_GITHUB_TOKEN`). El AUR todavía es manual:
+actualizar `pkgver` + `sha256sums` en `packaging/aur/PKGBUILD`.
