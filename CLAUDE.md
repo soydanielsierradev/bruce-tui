@@ -61,11 +61,14 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 - [x] Paso 13: Chequeo de nueva versión al arrancar (curl best-effort,
       cacheado 1/día en config), badge sobre el ASCII + bloque "App" al
       lado de Options con "Check for updates" / "Update to latest"
+- [x] Paso 14: Detección del método de instalación (por ruta de
+      `current_exe`) + auto-update in-app para brew/cargo (tecla U), comando
+      manual para AUR/curl/PS; feedback de "Check for updates"
 
 ## Versionado
 - SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch.
 - Bumpear `version` en Cargo.toml EN EL MISMO commit del cambio (la
-  versión se muestra en la welcome screen). Versión actual: 0.10.0.
+  versión se muestra en la welcome screen). Versión actual: 0.11.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
