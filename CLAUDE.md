@@ -62,7 +62,7 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 ## Versionado
 - SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch.
 - Bumpear `version` en Cargo.toml EN EL MISMO commit del cambio (la
-  versión se muestra en la welcome screen). Versión actual: 0.8.0.
+  versión se muestra en la welcome screen). Versión actual: 0.9.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
@@ -78,11 +78,13 @@ Hecho:
 - [x] Recetas en `packaging/`: Homebrew (`homebrew/bruce.rb`) y
       AUR (`aur/PKGBUILD`) con SHA256 reales
 
+- [x] Aviso al arrancar si `claude` no está en el PATH (chequeo en
+      `main.rs` vía `pty::claude_missing`, respeta `BRUCE_CMD`)
+
 Pendiente:
 - [ ] Publicar el tap Homebrew (repo aparte `homebrew-bruce`)
 - [ ] Publicar el paquete AUR `bruce-bin` (repo AUR + cuenta/SSH)
-- [ ] Aviso al arrancar si `claude` no está en el PATH (dependencia
-      de runtime; hoy solo documentada en README)
+- [ ] Instalador para Windows (`install.ps1`: baja + extrae + agrega al PATH)
 - [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
       (deprecación de Node 20, no bloqueante hasta ~sep 2026)
 
