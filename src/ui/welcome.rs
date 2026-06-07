@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
+use crate::session::{self, Session};
 use crate::ui::theme::{Palette, Theme};
 
 /// ASCII banner rendered at the top of the welcome screen.
@@ -43,17 +44,6 @@ pub enum Focus {
     Options,
     Sessions,
     Themes,
-}
-
-/// Lightweight summary of a saved session, shown as one list row.
-///
-/// This is intentionally *not* the persisted `Session` struct — it only holds
-/// what the welcome list needs to display.
-pub struct SessionSummary {
-    pub name: String,
-    pub branch: String,
-    pub last_used: String,
-    pub tokens: u64,
 }
 
 /// Outcome of routing a key to an open dialog.
@@ -101,8 +91,8 @@ impl NewSessionDialog {
 
 /// State backing the welcome screen.
 pub struct WelcomeState {
-    /// Saved sessions, in display order.
-    pub sessions: Vec<SessionSummary>,
+    /// Saved sessions loaded from disk, most-recently-used first.
+    pub sessions: Vec<Session>,
     /// Which panel has focus.
     pub focus: Focus,
     /// Selected row within the Options block.
@@ -116,35 +106,27 @@ pub struct WelcomeState {
 }
 
 impl WelcomeState {
-    /// Build the initial state with hardcoded sample sessions.
+    /// Build the initial state, loading saved sessions from disk.
     pub fn new() -> Self {
-        let sessions = vec![
-            SessionSummary {
-                name: "bruce".into(),
-                branch: "main".into(),
-                last_used: "2026-06-04".into(),
-                tokens: 47_832,
-            },
-            SessionSummary {
-                name: "oauth-service".into(),
-                branch: "feature/oauth".into(),
-                last_used: "2026-06-02".into(),
-                tokens: 128_410,
-            },
-            SessionSummary {
-                name: "tui-experiments".into(),
-                branch: "spike/ratatui".into(),
-                last_used: "2026-05-29".into(),
-                tokens: 9_204,
-            },
-        ];
         Self {
-            sessions,
+            // A load failure (e.g. unreadable config dir) yields an empty list
+            // rather than blocking the welcome screen.
+            sessions: session::load_all().unwrap_or_default(),
             focus: Focus::Options,
             option_selected: 0,
             session_selected: 0,
             theme: Theme::Hacker,
             dialog: None,
+        }
+    }
+
+    /// Reload the session list from disk, clamping the selection to the new
+    /// length. Called when returning from a workspace so a freshly created or
+    /// just-used session shows up with up-to-date metrics.
+    pub fn reload_sessions(&mut self) {
+        self.sessions = session::load_all().unwrap_or_default();
+        if self.session_selected >= self.sessions.len() {
+            self.session_selected = self.sessions.len().saturating_sub(1);
         }
     }
 
@@ -276,6 +258,8 @@ impl WelcomeState {
                     if !new_name.is_empty() {
                         if let Some(s) = self.sessions.get_mut(idx) {
                             s.name = new_name;
+                            // Persist the rename so it survives a restart.
+                            let _ = s.save();
                         }
                     }
                 }
@@ -463,17 +447,18 @@ fn render_sessions(frame: &mut Frame, area: Rect, state: &WelcomeState) {
 }
 
 /// One formatted session row: name, branch, last-used date and token count.
-fn session_row<'a>(state: &WelcomeState, s: &'a SessionSummary) -> Line<'a> {
+fn session_row<'a>(state: &WelcomeState, s: &'a Session) -> Line<'a> {
     let pal = state.theme.palette();
+    let branch = s.branch.as_deref().unwrap_or("—");
     Line::from(vec![
         Span::styled(
             format!(" {:<18}", s.name),
             Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("{:<22}", s.branch), Style::default().fg(pal.accent)),
-        Span::styled(format!("{:<12}", s.last_used), Style::default().fg(pal.dim)),
+        Span::styled(format!("{:<22}", branch), Style::default().fg(pal.accent)),
+        Span::styled(format!("{:<12}", fmt_date(s.last_used)), Style::default().fg(pal.dim)),
         Span::styled(
-            format!("{:>10} tok", fmt_tokens(s.tokens)),
+            format!("{:>10} tok", fmt_tokens(s.tokens_used)),
             Style::default().fg(pal.dim),
         ),
     ])
@@ -609,7 +594,10 @@ fn render_rename_dialog(
             ListItem::new(Line::from(vec![
                 name_span,
                 Span::raw("  "),
-                Span::styled(s.branch.clone(), Style::default().fg(pal.dim)),
+                Span::styled(
+                    s.branch.clone().unwrap_or_else(|| "—".to_string()),
+                    Style::default().fg(pal.dim),
+                ),
             ]))
         })
         .collect();
@@ -692,6 +680,29 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     Layout::horizontal([Constraint::Percentage(percent_x)])
         .flex(Flex::Center)
         .split(vertical[0])[0]
+}
+
+/// Format a Unix-epoch timestamp (seconds, UTC) as `YYYY-MM-DD`.
+///
+/// Uses Howard Hinnant's `civil_from_days` algorithm so no date crate is needed.
+/// A zero/invalid timestamp renders as a dash.
+fn fmt_date(epoch: i64) -> String {
+    if epoch <= 0 {
+        return "—".to_string();
+    }
+    let days = epoch.div_euclid(86_400);
+    // Shift the epoch so the era starts on a 400-year boundary (0000-03-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month-shifted [0, 11], March = 0
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Format a token count with thousands separators (e.g. `47_832` -> `47,832`).

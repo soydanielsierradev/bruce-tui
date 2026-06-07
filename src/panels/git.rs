@@ -113,6 +113,18 @@ pub fn load(path: &Path) -> GitView {
 }
 
 /// Branch shorthand, falling back to readable markers for edge cases.
+/// The checked-out branch name for the repo at `path`, or `None` when there's
+/// no repository, a detached HEAD, or an unborn branch. Used to tag a session
+/// with a clean branch name at creation time (no display markers).
+pub fn current_branch_name(path: &Path) -> Option<String> {
+    let repo = Repository::discover(path).ok()?;
+    if repo.head_detached().unwrap_or(false) {
+        return None;
+    }
+    let head = repo.head().ok()?;
+    head.shorthand().map(str::to_string)
+}
+
 fn current_branch(repo: &Repository) -> String {
     match repo.head() {
         Ok(head) => {

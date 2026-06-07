@@ -6,6 +6,7 @@
 mod app;
 mod panels;
 mod pty;
+mod session;
 mod ui;
 
 use anyhow::Result;

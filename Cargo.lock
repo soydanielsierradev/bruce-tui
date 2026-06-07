@@ -147,7 +147,9 @@ dependencies = [
  "notify",
  "portable-pty",
  "ratatui",
+ "serde",
  "serde_json",
+ "uuid",
  "vt100",
 ]
 

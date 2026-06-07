@@ -13,7 +13,11 @@ git2 = { version = "0.20.2", default-features = false }
 notify = "8.2.0"
 portable-pty = "0.9.0"
 ratatui = "0.30.0"
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Session IDs: a UUID Bruce owns and passes to `claude --session-id`, so the
+# same id can later resume the conversation via `claude --resume`.
+uuid = { version = "1.23.2", features = ["v4"] }
 # Terminal emulator: parse the child's ANSI output into a cell grid we render
 # ourselves (decoupled from any ratatui-version-specific widget crate).
 vt100 = "0.16.2"

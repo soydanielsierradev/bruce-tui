@@ -7,6 +7,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::Color;
 
+use crate::session::Session;
 use crate::ui::theme::Theme;
 use crate::ui::welcome::{self, WelcomeEvent, WelcomeState};
 use crate::ui::workspace::{self, Panel, WorkspaceState};
@@ -108,6 +109,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         // Pending screen change, applied after the match so we never reassign
         // `screen` while it is borrowed.
         let mut transition: Option<Screen> = None;
+        // Set instead of breaking mid-match, so leaving a workspace can persist
+        // its metrics at one central point before the loop exits.
+        let mut quit = false;
 
         match &mut screen {
             Screen::Welcome => {
@@ -116,10 +120,24 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 // confirmed new-session form comes back as an event to act on.
                 if welcome.dialog.is_some() {
                     if let WelcomeEvent::CreateSession { name } = welcome.dialog_key(key.code) {
+                        // A new session is persisted the moment it's created
+                        // (write-on-create), so it survives a crash or power cut
+                        // even before any clean exit. Launch fresh (--session-id)
+                        // pinned to the new id so it can be resumed later.
+                        let cwd = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        // Tag the session with the repo's current branch so the
+                        // welcome list shows it (None outside a repo / detached).
+                        let branch = crate::panels::git::current_branch_name(&cwd);
+                        let session = Session::new(name, cwd, branch);
+                        // Best-effort persist: if the disk write fails the
+                        // workspace still opens, only this run won't be resumable.
+                        let _ = session.save();
                         // New sessions start with every pane visible; the user
                         // toggles them live with Ctrl+g / Ctrl+m.
                         transition = Some(Screen::Workspace(WorkspaceState::new(
-                            name,
+                            session,
+                            false,
                             welcome.theme,
                             true,
                             true,
@@ -141,11 +159,15 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                                 if let Some(s) =
                                     welcome.sessions.get(welcome.session_selected)
                                 {
-                                    // Existing sessions enable both panes until
-                                    // the session module persists per-session
-                                    // config.
+                                    // Resume the persisted conversation: launch
+                                    // `claude --resume <id>` in its project dir so
+                                    // Claude rebuilds the full transcript. Bump
+                                    // last_used now that it's being opened.
+                                    let mut session = s.clone();
+                                    let _ = session.touch();
                                     transition = Some(Screen::Workspace(WorkspaceState::new(
-                                        s.name.clone(),
+                                        session,
+                                        true,
                                         welcome.theme,
                                         true,
                                         true,
@@ -171,7 +193,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                             KeyCode::BackTab => ws.focus_prev(),
                             KeyCode::Char('g') => ws.toggle_git(),
                             KeyCode::Char('m') => ws.toggle_metrics(),
-                            KeyCode::Char('q') => break,
+                            KeyCode::Char('q') => quit = true,
                             _ => {} // unknown command: swallow it
                         }
                     } else if ctrl && matches!(key.code, KeyCode::Char('b')) {
@@ -183,7 +205,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 } else {
                     // A side pane has focus: navigate Bruce directly.
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                        KeyCode::Char('q') | KeyCode::Char('Q') => quit = true,
                         KeyCode::Esc => transition = Some(Screen::Welcome),
                         KeyCode::Tab => ws.focus_next(),
                         KeyCode::BackTab => ws.focus_prev(),
@@ -195,7 +217,24 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
             }
         }
 
+        // Leaving a workspace (back to welcome or quitting): persist its soft
+        // metrics — token total + last_used — to the session JSON.
+        if quit || matches!(transition, Some(Screen::Welcome)) {
+            if let Screen::Workspace(ws) = &mut screen {
+                ws.persist_metrics();
+            }
+        }
+
+        if quit {
+            break;
+        }
+
         if let Some(next) = transition {
+            // Returning to the welcome screen: reload sessions so a session just
+            // created or used shows up with fresh last_used / token metrics.
+            if matches!(next, Screen::Welcome) {
+                welcome.reload_sessions();
+            }
             screen = next;
         }
     }

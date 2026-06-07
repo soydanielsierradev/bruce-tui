@@ -138,6 +138,20 @@ pub fn newest_transcript(dir: &Path) -> Option<PathBuf> {
     newest.map(|(_, path)| path)
 }
 
+/// Total tokens recorded for a specific session's transcript, if it exists.
+///
+/// Because Bruce launches `claude --session-id <id>`, the transcript file is
+/// named `<id>.jsonl` — so we can target the exact session rather than guessing
+/// the newest file. Returns `None` if the home dir is unknown or no transcript
+/// exists yet (a session closed before Claude wrote anything).
+pub fn session_total_tokens(project_path: &Path, session_id: &str) -> Option<u64> {
+    let path = transcript_dir(project_path)?.join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return None;
+    }
+    Some(parse_transcript(&path).total())
+}
+
 /// Parse a transcript into [`Metrics`]. Malformed lines are skipped, never fatal.
 pub fn parse_transcript(path: &Path) -> Metrics {
     let Ok(content) = fs::read_to_string(path) else {

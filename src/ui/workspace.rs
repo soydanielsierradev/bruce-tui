@@ -16,8 +16,9 @@ use ratatui::{
 };
 
 use crate::panels::git::{self, GitView};
-use crate::panels::metrics::MetricsWatcher;
-use crate::pty::PtySession;
+use crate::panels::metrics::{self, MetricsWatcher};
+use crate::pty::{PtySession, SpawnOptions};
+use crate::session::Session;
 use crate::ui::theme::{Palette, Theme};
 
 /// Which pane currently has keyboard focus. `Tab` cycles through them.
@@ -30,8 +31,9 @@ pub enum Panel {
 
 /// State backing the workspace screen.
 pub struct WorkspaceState {
-    /// Name of the session this workspace was opened for.
-    pub session_name: String,
+    /// The session this workspace is running. Owns the id used to update token
+    /// metrics on exit, and the name shown in the header.
+    pub session: Session,
     /// Active color theme, carried over from the welcome screen.
     pub theme: Theme,
     /// Which pane has focus.
@@ -56,25 +58,35 @@ pub struct WorkspaceState {
 }
 
 impl WorkspaceState {
-    /// Open a workspace for `session_name`, inheriting the welcome theme and
-    /// the chosen optional-panel configuration.
-    pub fn new(session_name: String, theme: Theme, git_enabled: bool, metrics_enabled: bool) -> Self {
-        // Sessions don't persist a project path yet, so read the repo Bruce is
-        // running in. Once the session module lands, pass the session's path.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    /// Open a workspace running `session`, inheriting the welcome theme and the
+    /// chosen optional-panel configuration.
+    ///
+    /// `resume` decides how Claude is launched: `false` starts a fresh
+    /// conversation pinned to the session id (`--session-id`); `true` continues
+    /// an existing one (`--resume`). Either way the PTY runs in the session's
+    /// `project_path`, which is the directory Claude keys its transcript on.
+    pub fn new(session: Session, resume: bool, theme: Theme, git_enabled: bool, metrics_enabled: bool) -> Self {
+        let cwd = session.project_path.clone();
         let git = git::load(&cwd);
         // Watch Claude's transcript for this project to surface live token usage.
         let metrics = MetricsWatcher::new(&cwd);
 
+        // Pin the conversation to the session id so it can be resumed later.
+        let flag = if resume { "--resume" } else { "--session-id" };
+        let opts = SpawnOptions {
+            cwd: Some(cwd),
+            args: vec![flag.to_string(), session.id.clone()],
+        };
+
         // Spawn the PTY with a placeholder size; the first render resizes it to
         // the real Claude-pane dimensions.
-        let (pty, pty_error) = match PtySession::new(24, 80) {
+        let (pty, pty_error) = match PtySession::new(24, 80, opts) {
             Ok(pty) => (Some(pty), None),
             Err(e) => (None, Some(e.to_string())),
         };
 
         Self {
-            session_name,
+            session,
             theme,
             // Center pane (Claude) is where the user works, so focus it first.
             focus: Panel::Claude,
@@ -87,6 +99,22 @@ impl WorkspaceState {
             leader_pending: false,
             last_pty_size: Cell::new((24, 80)),
         }
+    }
+
+    /// Persist this session's soft metrics to disk. Call when leaving the
+    /// workspace (back to welcome or on quit).
+    ///
+    /// Reads the session's own transcript (`<id>.jsonl`) for the cumulative
+    /// token total, then `touch`es to refresh `last_used` and save. Best-effort:
+    /// if the transcript isn't there yet the token count is left as-is, and a
+    /// failed save only leaves metrics slightly stale — the session is intact.
+    pub fn persist_metrics(&mut self) {
+        if let Some(total) =
+            metrics::session_total_tokens(&self.session.project_path, &self.session.id)
+        {
+            self.session.tokens_used = total;
+        }
+        let _ = self.session.touch();
     }
 
     /// Forward a key event to the embedded process (no-op without a PTY).
@@ -664,7 +692,7 @@ fn render_title(frame: &mut Frame, area: Rect, state: &WorkspaceState, pal: &Pal
         ),
         Span::styled("· ", Style::default().fg(pal.dim)),
         Span::styled(
-            state.session_name.clone(),
+            state.session.name.clone(),
             Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
         ),
     ]);

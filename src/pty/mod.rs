@@ -12,11 +12,25 @@
 //! the project's threading rule. The child is killed on drop.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+
+/// How to launch the child process inside the PTY.
+///
+/// Deliberately session-agnostic: the PTY layer only needs a working directory
+/// and the extra CLI args. The caller (the workspace) decides whether those args
+/// mean `--session-id <uuid>` (new) or `--resume <uuid>` (continue).
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOptions {
+    /// Directory to launch the child in. `None` falls back to Bruce's own cwd.
+    pub cwd: Option<PathBuf>,
+    /// Extra arguments appended after the program name.
+    pub args: Vec<String>,
+}
 
 /// Shared, locked PTY writer (used by both the UI thread and the reader thread).
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -36,8 +50,9 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    /// Spawn [`spawn_command`] in a new PTY sized `rows`x`cols`.
-    pub fn new(rows: u16, cols: u16) -> Result<Self> {
+    /// Spawn [`spawn_command`] in a new PTY sized `rows`x`cols`, launched per
+    /// `opts` (working directory + extra CLI args).
+    pub fn new(rows: u16, cols: u16, opts: SpawnOptions) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -46,7 +61,7 @@ impl PtySession {
             pixel_height: 0,
         })?;
 
-        let child = pair.slave.spawn_command(spawn_command())?;
+        let child = pair.slave.spawn_command(spawn_command(opts))?;
         // The slave handle isn't needed once the child owns it.
         drop(pair.slave);
 
@@ -158,19 +173,27 @@ fn respond_to_queries(chunk: &[u8], parser: &Arc<Mutex<vt100::Parser>>, writer: 
     }
 }
 
-/// The command run inside the PTY: Claude Code.
+/// The command run inside the PTY: Claude Code, launched per `opts`.
 ///
 /// `CreateProcess` / exec resolve `claude` via PATH (so this needs the parent
 /// environment, propagated below). Override with the `BRUCE_CMD` env var to run
 /// something else, e.g. `BRUCE_CMD=pwsh` for a plain shell. If `claude` is only
 /// installed as a `.cmd`/`.ps1` shim (not an `.exe`) on some Windows setups,
 /// point BRUCE_CMD at the shim's full path.
-fn spawn_command() -> CommandBuilder {
+///
+/// `opts.args` (e.g. `--session-id <uuid>` or `--resume <uuid>`) are appended so
+/// the spawned conversation can be created with, or resumed from, a known id.
+/// `opts.cwd` is the project directory; Claude writes its transcript keyed off
+/// this path, so resuming must use the same cwd it was created with.
+fn spawn_command(opts: SpawnOptions) -> CommandBuilder {
     let program = match std::env::var("BRUCE_CMD") {
         Ok(p) if !p.trim().is_empty() => p,
         _ => "claude".to_string(),
     };
     let mut cmd = CommandBuilder::new(program);
+    for arg in &opts.args {
+        cmd.arg(arg);
+    }
 
     // portable-pty doesn't inherit the parent environment, so propagate it —
     // otherwise PATH is empty and `claude` can't be resolved.
@@ -179,7 +202,12 @@ fn spawn_command() -> CommandBuilder {
     }
     // Advertise a capable terminal so the child emits colour sequences.
     cmd.env("TERM", "xterm-256color");
-    if let Ok(cwd) = std::env::current_dir() {
+
+    // Launch in the session's project directory; fall back to Bruce's own cwd.
+    let cwd = opts
+        .cwd
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(cwd) = cwd {
         cmd.cwd(cwd);
     }
     cmd
