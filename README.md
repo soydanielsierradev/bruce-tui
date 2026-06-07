@@ -32,14 +32,16 @@ your `PATH` (see [Requirements](#requirements)).
 
 ### macOS
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.sh | sh
-```
-
-Works on both Apple Silicon and Intel. Homebrew (once the tap is published):
+With [Homebrew](https://brew.sh) (works on Apple Silicon and Intel):
 
 ```sh
 brew install soydanielsierradev/bruce/bruce
+```
+
+Or with the install script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.sh | sh
 ```
 
 ### Linux
@@ -53,11 +55,8 @@ and tells you if that directory isn't on your `PATH`.
 
 ### Arch Linux
 
-Once published to the AUR:
-
-```sh
-paru -S bruce-bin     # or: yay -S bruce-bin
-```
+AUR support is planned for a future release. For now, use the install script
+above or `cargo install --git`.
 
 ### Windows
 
