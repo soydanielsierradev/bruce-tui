@@ -80,11 +80,13 @@ Hecho:
 
 - [x] Aviso al arrancar si `claude` no está en el PATH (chequeo en
       `main.rs` vía `pty::claude_missing`, respeta `BRUCE_CMD`)
+- [x] Instalador para Windows: `install.ps1` (baja + extrae + agrega al
+      PATH), vía `irm ... | iex`
+- [x] Release `v0.9.0` publicado (Latest) con los 4 binarios
 
 Pendiente:
 - [ ] Publicar el tap Homebrew (repo aparte `homebrew-bruce`)
 - [ ] Publicar el paquete AUR `bruce-bin` (repo AUR + cuenta/SSH)
-- [ ] Instalador para Windows (`install.ps1`: baja + extrae + agrega al PATH)
 - [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
       (deprecación de Node 20, no bloqueante hasta ~sep 2026)
 
