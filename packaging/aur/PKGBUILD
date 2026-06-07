@@ -4,7 +4,7 @@
 # publish it, push it to the AUR git repo `bruce-bin`. Bump pkgver and sha256sums
 # on every release.
 pkgname=bruce-bin
-pkgver=0.9.0
+pkgver=0.9.1
 pkgrel=1
 pkgdesc="Terminal workspace for Claude Code"
 arch=('x86_64')
@@ -16,7 +16,7 @@ conflicts=('bruce')
 # repos, so it's noted here rather than as a hard dependency.
 optdepends=('claude-code: the Claude CLI Bruce runs inside its workspace')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/soydanielsierradev/bruce-tui/releases/download/v$pkgver/bruce-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('cba858045d6b3409d5aabc4ff63bee4290ee664113a7ea2f1a871c8f78e44e00')
+sha256sums=('44ff316671e5668520eaa3334efd6d1d847c984116f305cbc1137e581811705e')
 
 package() {
   install -Dm755 "$srcdir/bruce" "$pkgdir/usr/bin/bruce"
