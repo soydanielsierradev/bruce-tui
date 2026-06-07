@@ -5,6 +5,8 @@
 //! *rendering* ([`render`]). For step 1 the session list is hardcoded; it will
 //! be replaced by real persisted sessions once the `session` module lands.
 
+use std::path::PathBuf;
+
 use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
@@ -139,7 +141,10 @@ impl NewSessionDialog {
 
 /// State backing the welcome screen.
 pub struct WelcomeState {
-    /// Saved sessions loaded from disk, most-recently-used first.
+    /// Project directory Bruce was opened in. Sessions are scoped to it: the
+    /// list shows only this project's sessions and new ones are created here.
+    pub project_path: PathBuf,
+    /// This project's saved sessions, most-recently-used first.
     pub sessions: Vec<Session>,
     /// Which panel has focus.
     pub focus: Focus,
@@ -154,12 +159,16 @@ pub struct WelcomeState {
 }
 
 impl WelcomeState {
-    /// Build the initial state, loading saved sessions from disk.
+    /// Build the initial state, loading the current project's sessions.
     pub fn new() -> Self {
+        // The directory Bruce was launched in defines the project.
+        let project_path =
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             // A load failure (e.g. unreadable config dir) yields an empty list
             // rather than blocking the welcome screen.
-            sessions: session::load_all().unwrap_or_default(),
+            sessions: session::load_for_project(&project_path).unwrap_or_default(),
+            project_path,
             focus: Focus::Options,
             option_selected: 0,
             session_selected: 0,
@@ -168,11 +177,11 @@ impl WelcomeState {
         }
     }
 
-    /// Reload the session list from disk, clamping the selection to the new
-    /// length. Called when returning from a workspace so a freshly created or
-    /// just-used session shows up with up-to-date metrics.
+    /// Reload this project's session list from disk, clamping the selection to
+    /// the new length. Called when returning from a workspace so a freshly
+    /// created or just-used session shows up with up-to-date metrics.
     pub fn reload_sessions(&mut self) {
-        self.sessions = session::load_all().unwrap_or_default();
+        self.sessions = session::load_for_project(&self.project_path).unwrap_or_default();
         if self.session_selected >= self.sessions.len() {
             self.session_selected = self.sessions.len().saturating_sub(1);
         }

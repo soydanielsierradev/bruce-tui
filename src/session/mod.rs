@@ -148,6 +148,26 @@ pub fn load_all() -> Result<Vec<Session>> {
     Ok(sessions)
 }
 
+/// Load only the sessions belonging to `project_path`, most-recently-used first.
+///
+/// Bruce is a workspace *per project*: opened in a directory, it shows that
+/// project's sessions, not every session ever created. Paths are compared after
+/// a best-effort canonicalisation so equivalent spellings (trailing slash,
+/// symlinks, drive-letter case on Windows) still match.
+pub fn load_for_project(project_path: &Path) -> Result<Vec<Session>> {
+    let target = canonical(project_path);
+    Ok(load_all()?
+        .into_iter()
+        .filter(|s| canonical(&s.project_path) == target)
+        .collect())
+}
+
+/// Canonicalise a path for comparison, falling back to the path as-is when it
+/// can't be resolved (e.g. it no longer exists).
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Parse a single session file.
 fn load_file(path: &Path) -> Result<Session> {
     let raw =

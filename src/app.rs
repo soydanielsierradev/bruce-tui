@@ -124,8 +124,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                         // (write-on-create), so it survives a crash or power cut
                         // even before any clean exit. Launch fresh (--session-id)
                         // pinned to the new id so it can be resumed later.
-                        let cwd = std::env::current_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        // Sessions are scoped to the project Bruce was opened
+                        // in; reuse the welcome's project path so creation and
+                        // the filtered list agree on one source of truth.
+                        let cwd = welcome.project_path.clone();
                         // Tag the session with the repo's current branch so the
                         // welcome list shows it (None outside a repo / detached).
                         let branch = crate::panels::git::current_branch_name(&cwd);
