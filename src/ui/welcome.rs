@@ -868,6 +868,33 @@ fn render_options(frame: &mut Frame, area: Rect, state: &WelcomeState) {
 fn render_sessions(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let pal = state.theme.palette();
     let focused = state.focus == Focus::Sessions;
+    let block = panel_block(&pal, " Sessions ", focused);
+
+    // Empty state: no sessions yet for this project — show a centred hint inside
+    // the panel instead of a blank box.
+    if state.sessions.is_empty() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let lines = vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "No sessions yet",
+                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Press N to create one",
+                Style::default().fg(pal.dim),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(pal.bg)),
+            inner,
+        );
+        return;
+    }
 
     let items: Vec<ListItem> = state
         .sessions
@@ -875,7 +902,6 @@ fn render_sessions(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         .map(|s| ListItem::new(session_row(state, s)))
         .collect();
 
-    let block = panel_block(&pal, " Sessions ", focused);
     let list = List::new(items)
         .block(block)
         .highlight_style(highlight_style(&pal));
