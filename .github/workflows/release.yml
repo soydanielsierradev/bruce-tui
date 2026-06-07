@@ -61,9 +61,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/bruce.exe"
           pkg="bruce-${{ matrix.target }}.zip"
-          7z a "$pkg" "$bin"
+          # cd into the binary's dir so the zip holds bruce.exe at the root,
+          # not the full target/.../release/ path.
+          (cd "target/${{ matrix.target }}/release" && 7z a "$GITHUB_WORKSPACE/$pkg" bruce.exe)
           echo "ASSET=$pkg" >> "$GITHUB_ENV"
 
       - name: Upload to release
