@@ -72,6 +72,21 @@ pub enum WelcomeEvent {
     None,
     /// The user confirmed the new-session form; open a workspace with this name.
     CreateSession { name: String },
+    /// The user asked to auto-update; run this argv after tearing down the TUI.
+    RunUpdate(Vec<String>),
+}
+
+/// State of the version check, for visible feedback in the App block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateStatus {
+    /// No check has run / nothing to report.
+    Idle,
+    /// A check is in flight (shown after the user presses "Check for updates").
+    Checking,
+    /// The installed version is the latest.
+    UpToDate,
+    /// A newer release is available.
+    Available(String),
 }
 
 /// The single dialog that can be open over the welcome screen.
@@ -173,8 +188,8 @@ pub struct WelcomeState {
     pub git_enabled: bool,
     /// Whether new/opened sessions start with the Metrics panel shown.
     pub metrics_enabled: bool,
-    /// A newer release version available to update to, if any (drives the badge).
-    pub available_update: Option<String>,
+    /// Result of the version check (drives the badge and the App block).
+    pub update_status: UpdateStatus,
     /// In-flight background update check; consumed once it finishes.
     update_check: Option<update::Check>,
     /// Epoch seconds of the last update check (persisted, throttles the check).
@@ -197,9 +212,13 @@ impl WelcomeState {
 
         // Show a badge immediately from the cached version, then refresh in the
         // background if the last check is older than the TTL.
-        let available_update = (!config.latest_seen.is_empty()
-            && update::is_newer(&config.latest_seen, update::current()))
-        .then(|| config.latest_seen.clone());
+        let update_status = if !config.latest_seen.is_empty()
+            && update::is_newer(&config.latest_seen, update::current())
+        {
+            UpdateStatus::Available(config.latest_seen.clone())
+        } else {
+            UpdateStatus::Idle
+        };
         let update_check = (now_epoch() - config.last_update_check >= UPDATE_CHECK_TTL)
             .then(update::Check::spawn);
 
@@ -215,7 +234,7 @@ impl WelcomeState {
             theme: config.theme,
             git_enabled: config.git_enabled,
             metrics_enabled: config.metrics_enabled,
-            available_update,
+            update_status,
             update_check,
             last_update_check: config.last_update_check,
             latest_seen: config.latest_seen,
@@ -237,16 +256,31 @@ impl WelcomeState {
         self.last_update_check = now_epoch();
         if let Some(latest) = result {
             self.latest_seen = latest.clone();
-            self.available_update =
-                update::is_newer(&latest, update::current()).then_some(latest);
+            self.update_status = if update::is_newer(&latest, update::current()) {
+                UpdateStatus::Available(latest)
+            } else {
+                UpdateStatus::UpToDate
+            };
+        } else if self.update_status == UpdateStatus::Checking {
+            // The fetch failed (offline / no curl); don't claim up-to-date.
+            self.update_status = UpdateStatus::Idle;
         }
         self.persist_config();
     }
 
     /// Start a fresh update check now, ignoring the TTL (the "Check for updates"
-    /// action).
+    /// action). Shows a "Checking…" state for immediate feedback.
     pub fn start_update_check(&mut self) {
+        self.update_status = UpdateStatus::Checking;
         self.update_check = Some(update::Check::spawn());
+    }
+
+    /// The newer version available, if any (drives the badge).
+    pub fn available_version(&self) -> Option<&str> {
+        match &self.update_status {
+            UpdateStatus::Available(v) => Some(v),
+            _ => None,
+        }
     }
 
     /// Persist the current preferences (theme + panel visibility) to disk.
@@ -410,11 +444,25 @@ impl WelcomeState {
                 match code {
                     KeyCode::Char('o') | KeyCode::Char('O') => {
                         update::open_in_browser(&update::releases_url());
+                        WelcomeEvent::None
                     }
-                    KeyCode::Esc | KeyCode::Enter => self.dialog = None,
-                    _ => {}
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
+                        // Auto-update only for methods where it's safe; otherwise
+                        // the dialog already shows the command to run by hand.
+                        match update::InstallMethod::detect().auto_update_argv() {
+                            Some(argv) => {
+                                self.dialog = None;
+                                WelcomeEvent::RunUpdate(argv)
+                            }
+                            None => WelcomeEvent::None,
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Enter => {
+                        self.dialog = None;
+                        WelcomeEvent::None
+                    }
+                    _ => WelcomeEvent::None,
                 }
-                WelcomeEvent::None
             }
             None => WelcomeEvent::None,
         }
@@ -631,7 +679,7 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
 
 /// Badge above the logo: shown only when a newer release is available.
 fn render_badge(frame: &mut Frame, area: Rect, state: &WelcomeState) {
-    let Some(latest) = &state.available_update else {
+    let Some(latest) = state.available_version() else {
         return;
     };
     let pal = state.theme.palette();
@@ -663,9 +711,11 @@ fn render_app(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         })
         .collect();
 
-    let title = match &state.available_update {
-        Some(v) => format!(" App · v{v} available "),
-        None => format!(" App · v{} ", update::current()),
+    let title = match &state.update_status {
+        UpdateStatus::Checking => " App · checking… ".to_string(),
+        UpdateStatus::UpToDate => format!(" App · v{} (up to date) ", update::current()),
+        UpdateStatus::Available(v) => format!(" App · v{v} available "),
+        UpdateStatus::Idle => format!(" App · v{} ", update::current()),
     };
     let block = panel_block(&pal, &title, focused);
     let list = List::new(items)
@@ -687,47 +737,63 @@ fn render_update_info_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, sta
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let status = match &state.available_update {
-        Some(v) => format!("  v{} installed · v{} available", update::current(), v),
-        None => format!("  v{} installed · up to date (or check pending)", update::current()),
+    let status = match &state.update_status {
+        UpdateStatus::Available(v) => {
+            format!("  v{} installed · v{} available", update::current(), v)
+        }
+        UpdateStatus::UpToDate => format!("  v{} installed · up to date", update::current()),
+        _ => format!("  v{} installed", update::current()),
     };
 
-    let label = |s: &'static str| Span::styled(s, Style::default().fg(pal.dim));
-    let cmd = |s: String| Span::styled(s, Style::default().fg(pal.fg).add_modifier(Modifier::BOLD));
+    let method = update::InstallMethod::detect();
+    let auto = method.auto_update_argv().is_some();
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             status,
             Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Installed via: ", Style::default().fg(pal.dim)),
+            Span::styled(
+                method.label(),
+                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled("  Update command:", Style::default().fg(pal.dim))),
         Line::from(Span::styled(
-            "  Update with the command for how you installed Bruce:",
-            Style::default().fg(pal.dim),
+            format!("  {}", method.command()),
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
-        Line::from(vec![label("  Homebrew   "), cmd("brew upgrade bruce".into())]),
-        Line::from(vec![
-            label("  curl       "),
-            cmd("curl -fsSL .../install.sh | sh".into()),
-        ]),
-        Line::from(vec![
-            label("  Windows    "),
-            cmd("irm .../install.ps1 | iex".into()),
-        ]),
-        Line::from(vec![
-            label("  cargo      "),
-            cmd("cargo install --git <repo> --force".into()),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
+    ];
+
+    // Action hints depend on whether we can run the update ourselves.
+    if auto {
+        lines.push(Line::from(vec![
             Span::styled("  Press ", Style::default().fg(pal.dim)),
+            Span::styled("U", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" to update now, ", Style::default().fg(pal.dim)),
             Span::styled("O", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(" to open the releases page, ", Style::default().fg(pal.dim)),
+            Span::styled(" for releases, ", Style::default().fg(pal.dim)),
             Span::styled("Esc", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
             Span::styled(" to close.", Style::default().fg(pal.dim)),
-        ]),
-    ];
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Run the command above to update.",
+            Style::default().fg(pal.dim),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  Press ", Style::default().fg(pal.dim)),
+            Span::styled("O", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" for releases, ", Style::default().fg(pal.dim)),
+            Span::styled("Esc", Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" to close.", Style::default().fg(pal.dim)),
+        ]));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(pal.bg)),
@@ -925,8 +991,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Span::styled(" cancel", Style::default().fg(pal.dim)),
         ]),
         Some(Dialog::UpdateInfo) => Line::from(vec![
-            Span::styled("  O", Style::default().fg(pal.accent)),
-            Span::styled(" open releases   ", Style::default().fg(pal.dim)),
+            Span::styled("  U", Style::default().fg(pal.accent)),
+            Span::styled(" update now   ", Style::default().fg(pal.dim)),
+            Span::styled("O", Style::default().fg(pal.accent)),
+            Span::styled(" releases   ", Style::default().fg(pal.dim)),
             Span::styled("Esc", Style::default().fg(pal.accent)),
             Span::styled(" close", Style::default().fg(pal.dim)),
         ]),

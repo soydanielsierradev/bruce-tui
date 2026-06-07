@@ -27,12 +27,39 @@ enum Screen {
 /// and always restores the terminal afterwards — even on error.
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal);
+    let outcome = run_loop(&mut terminal);
     // Hand the terminal back with its own colours restored before leaving the
     // alternate screen, so the user's normal prompt isn't left recoloured.
     reset_terminal_colors();
     ratatui::restore();
-    result
+
+    // If the user asked to auto-update, run it now — outside the TUI, so the
+    // package manager's output is visible — then exit (the new binary is picked
+    // up on the next launch).
+    if let Some(argv) = outcome? {
+        run_update(&argv);
+    }
+    Ok(())
+}
+
+/// Run the resolved update command with inherited stdio so the user sees the
+/// package manager's progress, then print whether to restart.
+fn run_update(argv: &[String]) {
+    let Some((program, args)) = argv.split_first() else {
+        return;
+    };
+    println!("\nUpdating Bruce: {}\n", argv.join(" "));
+    match std::process::Command::new(program).args(args).status() {
+        Ok(status) if status.success() => {
+            println!("\nDone. Restart `bruce` to use the new version.");
+        }
+        Ok(status) => {
+            eprintln!("\nUpdate command exited with {status}. Try running it manually.");
+        }
+        Err(e) => {
+            eprintln!("\nCouldn't run the update command ({e}). Run it manually.");
+        }
+    }
 }
 
 /// Tell the host terminal to recolour its *default* foreground/background to the
@@ -67,12 +94,15 @@ fn rgb(color: Color) -> Option<(u8, u8, u8)> {
     }
 }
 
-/// Draw / input loop. Returns when the user quits.
-fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+/// Draw / input loop. Returns when the user quits; `Some(argv)` means the user
+/// asked to auto-update, to be run after the TUI is torn down.
+fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String>>> {
     let mut welcome = WelcomeState::new();
     let mut screen = Screen::Welcome;
     // Last theme pushed to the terminal via OSC, so we only re-emit on change.
     let mut applied_theme: Option<Theme> = None;
+    // Set when the user triggers an auto-update; returned to `run` to execute.
+    let mut pending_update: Option<Vec<String>> = None;
 
     loop {
         // The active theme lives on whichever screen is showing; the workspace
@@ -128,7 +158,13 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                 // and Esc — so nothing leaks to the underlying navigation. A
                 // confirmed new-session form comes back as an event to act on.
                 if welcome.dialog.is_some() {
-                    if let WelcomeEvent::CreateSession { name } = welcome.dialog_key(key.code) {
+                    match welcome.dialog_key(key.code) {
+                        WelcomeEvent::RunUpdate(argv) => {
+                            // Tear down the TUI and run the update from `run`.
+                            pending_update = Some(argv);
+                            break;
+                        }
+                        WelcomeEvent::CreateSession { name } => {
                         // A new session is persisted the moment it's created
                         // (write-on-create), so it survives a crash or power cut
                         // even before any clean exit. Launch fresh (--session-id)
@@ -153,6 +189,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                             welcome.git_enabled,
                             welcome.metrics_enabled,
                         )));
+                        }
+                        WelcomeEvent::None => {}
                     }
                 } else {
                     match key.code {
@@ -262,5 +300,5 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(pending_update)
 }
