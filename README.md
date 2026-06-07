@@ -27,16 +27,59 @@ Install it from <https://docs.claude.com/claude-code> if that fails.
 
 ## Install
 
-| Platform | Command |
-|----------|---------|
-| Linux / macOS | `curl -fsSL https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.sh \| sh` |
-| Any (with Rust) | `cargo install --git https://github.com/soydanielsierradev/bruce-tui` |
-| Windows | Download the `.zip` from [Releases](https://github.com/soydanielsierradev/bruce-tui/releases) and put `bruce.exe` on your `PATH` |
+Pick your platform and run the command. Remember Bruce needs the `claude` CLI on
+your `PATH` (see [Requirements](#requirements)).
 
-> Homebrew and AUR packages are planned once the first release is published.
+### macOS
 
-The `curl` installer drops the binary in `~/.local/bin` (override with
-`BRUCE_BIN_DIR`). If that directory isn't on your `PATH`, the script tells you.
+```sh
+curl -fsSL https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.sh | sh
+```
+
+Works on both Apple Silicon and Intel. Homebrew (once the tap is published):
+
+```sh
+brew install soydanielsierradev/bruce/bruce
+```
+
+### Linux
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.sh | sh
+```
+
+The installer drops the binary in `~/.local/bin` (override with `BRUCE_BIN_DIR`)
+and tells you if that directory isn't on your `PATH`.
+
+### Arch Linux
+
+Once published to the AUR:
+
+```sh
+paru -S bruce-bin     # or: yay -S bruce-bin
+```
+
+### Windows
+
+In PowerShell, download the latest release and add it to your `PATH`:
+
+```powershell
+$dir = "$env:LOCALAPPDATA\Programs\bruce"
+New-Item -ItemType Directory -Force $dir | Out-Null
+Invoke-WebRequest "https://github.com/soydanielsierradev/bruce-tui/releases/latest/download/bruce-x86_64-pc-windows-msvc.zip" -OutFile "$env:TEMP\bruce.zip"
+Expand-Archive -Force "$env:TEMP\bruce.zip" $dir
+[Environment]::SetEnvironmentVariable("Path", "$env:Path;$dir", "User")
+```
+
+Open a new terminal afterward so the `PATH` change takes effect.
+
+### Any platform (from source)
+
+With a [Rust toolchain](https://rustup.rs) installed:
+
+```sh
+cargo install --git https://github.com/soydanielsierradev/bruce-tui
+```
 
 ## Usage
 
@@ -70,4 +113,4 @@ cargo install --path .
 
 ## License
 
-See [LICENSE](LICENSE) if present; otherwise all rights reserved by the author.
+[MIT](LICENSE) © Daniel Sierra

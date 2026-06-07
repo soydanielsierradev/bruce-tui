@@ -9,8 +9,7 @@ pkgrel=1
 pkgdesc="Terminal workspace for Claude Code"
 arch=('x86_64')
 url="https://github.com/soydanielsierradev/bruce-tui"
-# TODO: add a LICENSE file to the repo and set the matching license here.
-license=('custom')
+license=('MIT')
 provides=('bruce')
 conflicts=('bruce')
 # Bruce launches the Claude CLI at runtime; claude-code isn't in the official

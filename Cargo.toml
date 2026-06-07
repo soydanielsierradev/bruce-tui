@@ -2,6 +2,9 @@
 name = "bruce"
 version = "0.8.0"
 edition = "2024"
+license = "MIT"
+description = "A terminal workspace for Claude Code: live Git, embedded Claude, and token metrics, with per-project sessions."
+repository = "https://github.com/soydanielsierradev/bruce-tui"
 
 [dependencies]
 anyhow = "1.0.102"

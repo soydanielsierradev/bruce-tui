@@ -7,7 +7,7 @@ class Bruce < Formula
   desc "Terminal workspace for Claude Code"
   homepage "https://github.com/soydanielsierradev/bruce-tui"
   version "0.8.0"
-  # TODO: add a LICENSE file to the repo, then declare it here, e.g. license "MIT".
+  license "MIT"
 
   on_macos do
     on_arm do
