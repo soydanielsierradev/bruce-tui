@@ -154,11 +154,11 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
                             if welcome.on_new_session() {
                                 welcome.open_new_session();
                             } else if welcome.on_rename() {
-                                welcome.open_rename();
+                                welcome.open_picker(welcome::PickerAction::Rename);
                             } else if welcome.on_duplicate() {
-                                welcome.duplicate_selected();
+                                welcome.open_picker(welcome::PickerAction::Duplicate);
                             } else if welcome.on_delete() {
-                                welcome.open_confirm_delete();
+                                welcome.open_picker(welcome::PickerAction::Delete);
                             } else if welcome.on_session() {
                                 if let Some(s) =
                                     welcome.sessions.get(welcome.session_selected)

@@ -64,22 +64,63 @@ pub enum WelcomeEvent {
 
 /// The single dialog that can be open over the welcome screen.
 pub enum Dialog {
-    Rename(RenameDialog),
     NewSession(NewSessionDialog),
-    /// Confirm deletion of the session at this list index.
-    ConfirmDelete(usize),
+    /// Searchable session picker shared by rename, duplicate and delete.
+    Picker(SessionPicker),
 }
 
-/// Modal state for renaming a session.
-///
-/// `buffer` is the edit mode toggle: `None` means the user is browsing the
-/// session list; `Some(text)` means they are typing a new name for the row at
-/// `selected`.
-pub struct RenameDialog {
-    /// Row in the session table the dialog is pointing at.
+/// Which action the [`SessionPicker`] performs on the chosen session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerAction {
+    Rename,
+    Duplicate,
+    Delete,
+}
+
+impl PickerAction {
+    /// Lowercase verb for footer hints (e.g. "rename").
+    fn verb(self) -> &'static str {
+        match self {
+            PickerAction::Rename => "rename",
+            PickerAction::Duplicate => "duplicate",
+            PickerAction::Delete => "delete",
+        }
+    }
+
+    /// Title shown on the picker dialog's border.
+    fn title(self) -> &'static str {
+        match self {
+            PickerAction::Rename => " Rename session ",
+            PickerAction::Duplicate => " Duplicate session ",
+            PickerAction::Delete => " Delete session ",
+        }
+    }
+}
+
+/// Step the picker is on: searching/picking, then an action-specific follow-up.
+#[derive(Debug, Clone)]
+pub enum PickerMode {
+    /// Typing in the search box and moving through the filtered results.
+    Browse,
+    /// Rename follow-up: editing the chosen session's name. `target` indexes
+    /// into [`WelcomeState::sessions`].
+    EditName { target: usize, buffer: String },
+    /// Delete follow-up: confirming removal of the chosen session.
+    Confirm { target: usize },
+}
+
+/// A modal session picker: a search box over the full session list, plus an
+/// action-specific follow-up. Shared by rename, duplicate and delete so all
+/// three behave identically — empty query shows every session.
+pub struct SessionPicker {
+    /// What pressing Enter on a result does.
+    pub action: PickerAction,
+    /// Current search text; empty matches everything.
+    pub query: String,
+    /// Selected row *within the filtered results*.
     pub selected: usize,
-    /// `Some` while editing — holds the in-progress name.
-    pub buffer: Option<String>,
+    /// Current step (browse / edit name / confirm delete).
+    pub mode: PickerMode,
 }
 
 /// Modal state for creating a session: just a name. Which panels are visible is
@@ -213,23 +254,16 @@ impl WelcomeState {
         self.focus == Focus::Options && self.option_selected == 3
     }
 
-    /// Duplicate the currently selected session (fork its conversation) and
-    /// reload the list so the copy appears. No-op when the list is empty.
-    pub fn duplicate_selected(&mut self) {
-        if let Some(s) = self.sessions.get(self.session_selected) {
-            // Best-effort: a failed duplicate just leaves the list unchanged.
-            let _ = s.duplicate();
-            self.reload_sessions();
-        }
-    }
-
-    /// Open the delete-confirmation dialog for the selected session, unless the
-    /// list is empty.
-    pub fn open_confirm_delete(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        self.dialog = Some(Dialog::ConfirmDelete(self.session_selected));
+    /// Open the searchable session picker for `action` (rename / duplicate /
+    /// delete). Starts in browse mode with an empty query, so every session is
+    /// shown until the user types.
+    pub fn open_picker(&mut self, action: PickerAction) {
+        self.dialog = Some(Dialog::Picker(SessionPicker {
+            action,
+            query: String::new(),
+            selected: 0,
+            mode: PickerMode::Browse,
+        }));
     }
 
     /// Open the new-session form.
@@ -237,114 +271,142 @@ impl WelcomeState {
         self.dialog = Some(Dialog::NewSession(NewSessionDialog::new()));
     }
 
-    /// Open the rename dialog, unless there are no sessions to rename.
-    pub fn open_rename(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        self.dialog = Some(Dialog::Rename(RenameDialog {
-            selected: 0,
-            buffer: None,
-        }));
-    }
-
     /// Route a key press to the open dialog. No-op if none is open.
     pub fn dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
         match self.dialog {
-            Some(Dialog::Rename(_)) => {
-                self.rename_key(code);
-                WelcomeEvent::None
-            }
             Some(Dialog::NewSession(_)) => self.new_session_key(code),
-            Some(Dialog::ConfirmDelete(_)) => {
-                self.confirm_delete_key(code);
+            Some(Dialog::Picker(_)) => {
+                self.picker_key(code);
                 WelcomeEvent::None
             }
             None => WelcomeEvent::None,
         }
     }
 
-    /// Delete-confirmation key handling: `y`/Enter deletes and reloads the list,
-    /// `n`/Esc cancels. Any other key is ignored so a stray press can't confirm.
-    fn confirm_delete_key(&mut self, code: KeyCode) {
-        let Some(Dialog::ConfirmDelete(idx)) = self.dialog else {
-            return;
-        };
-        match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if let Some(s) = self.sessions.get(idx) {
-                    // Best-effort: even if the file delete fails, reloading keeps
-                    // the list consistent with what's actually on disk.
-                    let _ = s.delete();
-                }
-                self.dialog = None;
-                self.reload_sessions();
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.dialog = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// Rename dialog key handling.
+    /// Session-picker key handling for all three actions.
     ///
-    /// Browse mode (`buffer == None`): Up/Down move, Enter starts editing, Esc
-    /// closes. Edit mode (`buffer == Some`): characters/backspace edit, Enter
-    /// commits the new name (empty is ignored), Esc cancels the edit.
-    fn rename_key(&mut self, code: KeyCode) {
-        let n = self.sessions.len();
-        let Some(Dialog::Rename(dlg)) = self.dialog.as_mut() else {
+    /// Browse: characters/backspace edit the query (resetting the cursor),
+    /// Up/Down move within the filtered results, Enter acts on the selection
+    /// (rename → edit name, duplicate → fork now, delete → confirm), Esc closes.
+    /// The follow-up steps (edit name / confirm) handle their own keys.
+    fn picker_key(&mut self, code: KeyCode) {
+        // Snapshot the picker state so terminal actions (which mutate the session
+        // list and reload) don't fight the borrow on `self.dialog`.
+        let Some(Dialog::Picker(p)) = &self.dialog else {
             return;
         };
+        let action = p.action;
+        let selected = p.selected;
+        let mode = p.mode.clone();
 
-        if dlg.buffer.is_some() {
-            match code {
-                KeyCode::Char(c) => {
-                    if let Some(buf) = dlg.buffer.as_mut() {
-                        buf.push(c);
+        match mode {
+            PickerMode::Browse => {
+                let results = filter_sessions(&self.sessions, &p.query.clone());
+                match code {
+                    KeyCode::Up => self.picker_set_selected(selected.saturating_sub(1)),
+                    KeyCode::Down => {
+                        let max = results.len().saturating_sub(1);
+                        self.picker_set_selected((selected + 1).min(max));
                     }
+                    KeyCode::Char(c) => self.picker_edit_query(Some(c)),
+                    KeyCode::Backspace => self.picker_edit_query(None),
+                    KeyCode::Esc => self.dialog = None,
+                    KeyCode::Enter => {
+                        let Some(&target) = results.get(selected) else {
+                            return;
+                        };
+                        match action {
+                            PickerAction::Rename => {
+                                let name = self
+                                    .sessions
+                                    .get(target)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_default();
+                                self.picker_set_mode(PickerMode::EditName {
+                                    target,
+                                    buffer: name,
+                                });
+                            }
+                            PickerAction::Duplicate => {
+                                if let Some(s) = self.sessions.get(target) {
+                                    let _ = s.duplicate();
+                                }
+                                self.dialog = None;
+                                self.reload_sessions();
+                            }
+                            PickerAction::Delete => {
+                                self.picker_set_mode(PickerMode::Confirm { target });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PickerMode::EditName { target, mut buffer } => match code {
+                KeyCode::Char(c) => {
+                    buffer.push(c);
+                    self.picker_set_mode(PickerMode::EditName { target, buffer });
                 }
                 KeyCode::Backspace => {
-                    if let Some(buf) = dlg.buffer.as_mut() {
-                        buf.pop();
-                    }
+                    buffer.pop();
+                    self.picker_set_mode(PickerMode::EditName { target, buffer });
                 }
-                KeyCode::Esc => dlg.buffer = None,
+                KeyCode::Esc => self.picker_set_mode(PickerMode::Browse),
                 KeyCode::Enter => {
-                    let new_name = dlg
-                        .buffer
-                        .take()
-                        .map(|b| b.trim().to_string())
-                        .unwrap_or_default();
-                    let idx = dlg.selected;
-                    if !new_name.is_empty() {
-                        if let Some(s) = self.sessions.get_mut(idx) {
-                            s.name = new_name;
+                    let name = buffer.trim().to_string();
+                    if !name.is_empty() {
+                        if let Some(s) = self.sessions.get_mut(target) {
+                            s.name = name;
                             // Persist the rename so it survives a restart.
                             let _ = s.save();
                         }
                     }
+                    self.dialog = None;
+                    self.reload_sessions();
                 }
                 _ => {}
-            }
-        } else {
-            match code {
-                KeyCode::Up if n > 0 => dlg.selected = (dlg.selected + n - 1) % n,
-                KeyCode::Down if n > 0 => dlg.selected = (dlg.selected + 1) % n,
-                KeyCode::Enter => {
-                    let cur = self
-                        .sessions
-                        .get(dlg.selected)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default();
-                    if let Some(Dialog::Rename(dlg)) = self.dialog.as_mut() {
-                        dlg.buffer = Some(cur);
+            },
+            PickerMode::Confirm { target } => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    if let Some(s) = self.sessions.get(target) {
+                        let _ = s.delete();
                     }
+                    self.dialog = None;
+                    self.reload_sessions();
                 }
-                KeyCode::Esc => self.dialog = None,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.picker_set_mode(PickerMode::Browse);
+                }
                 _ => {}
+            },
+        }
+    }
+
+    /// Set the picker's selected result (no-op if the picker isn't open).
+    fn picker_set_selected(&mut self, selected: usize) {
+        if let Some(Dialog::Picker(p)) = self.dialog.as_mut() {
+            p.selected = selected;
+        }
+    }
+
+    /// Set the picker's mode (no-op if the picker isn't open).
+    fn picker_set_mode(&mut self, mode: PickerMode) {
+        if let Some(Dialog::Picker(p)) = self.dialog.as_mut() {
+            p.mode = mode;
+        }
+    }
+
+    /// Edit the picker's query: push `Some(c)` or pop on `None`, resetting the
+    /// result cursor to the top so the selection stays valid as matches change.
+    fn picker_edit_query(&mut self, push: Option<char>) {
+        if let Some(Dialog::Picker(p)) = self.dialog.as_mut() {
+            match push {
+                Some(c) => p.query.push(c),
+                None => {
+                    p.query.pop();
+                }
             }
+            p.selected = 0;
         }
     }
 
@@ -416,11 +478,8 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
 
     // Dialogs are modal overlays drawn on top of everything.
     match &state.dialog {
-        Some(Dialog::Rename(d)) => render_rename_dialog(frame, area, &pal, state, d),
         Some(Dialog::NewSession(d)) => render_new_session_dialog(frame, area, &pal, d),
-        Some(Dialog::ConfirmDelete(idx)) => {
-            render_confirm_delete_dialog(frame, area, &pal, state, *idx)
-        }
+        Some(Dialog::Picker(p)) => render_picker_dialog(frame, area, &pal, state, p),
         None => {}
     }
 }
@@ -578,35 +637,39 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
 
     // Hints depend on whether (and which) modal dialog is open.
     let hints = match &state.dialog {
-        Some(Dialog::Rename(d)) if d.buffer.is_some() => Line::from(vec![
-            Span::styled("  type", Style::default().fg(pal.accent)),
-            Span::styled(" new name   ", Style::default().fg(pal.dim)),
-            Span::styled("Enter", Style::default().fg(pal.accent)),
-            Span::styled(" save   ", Style::default().fg(pal.dim)),
-            Span::styled("Esc", Style::default().fg(pal.accent)),
-            Span::styled(" cancel", Style::default().fg(pal.dim)),
-        ]),
-        Some(Dialog::Rename(_)) => Line::from(vec![
-            Span::styled("  ↑↓", Style::default().fg(pal.accent)),
-            Span::styled(" pick   ", Style::default().fg(pal.dim)),
-            Span::styled("Enter", Style::default().fg(pal.accent)),
-            Span::styled(" rename   ", Style::default().fg(pal.dim)),
-            Span::styled("Esc", Style::default().fg(pal.accent)),
-            Span::styled(" close", Style::default().fg(pal.dim)),
-        ]),
+        Some(Dialog::Picker(p)) => match &p.mode {
+            PickerMode::EditName { .. } => Line::from(vec![
+                Span::styled("  type", Style::default().fg(pal.accent)),
+                Span::styled(" new name   ", Style::default().fg(pal.dim)),
+                Span::styled("Enter", Style::default().fg(pal.accent)),
+                Span::styled(" save   ", Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" back", Style::default().fg(pal.dim)),
+            ]),
+            PickerMode::Confirm { .. } => Line::from(vec![
+                Span::styled("  Y", Style::default().fg(pal.accent)),
+                Span::styled(" delete   ", Style::default().fg(pal.dim)),
+                Span::styled("N", Style::default().fg(pal.accent)),
+                Span::styled("/", Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" cancel", Style::default().fg(pal.dim)),
+            ]),
+            PickerMode::Browse => Line::from(vec![
+                Span::styled("  type", Style::default().fg(pal.accent)),
+                Span::styled(" to search   ", Style::default().fg(pal.dim)),
+                Span::styled("↑↓", Style::default().fg(pal.accent)),
+                Span::styled(" pick   ", Style::default().fg(pal.dim)),
+                Span::styled("Enter", Style::default().fg(pal.accent)),
+                Span::styled(format!(" {}   ", p.action.verb()), Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" close", Style::default().fg(pal.dim)),
+            ]),
+        },
         Some(Dialog::NewSession(_)) => Line::from(vec![
             Span::styled("  type", Style::default().fg(pal.accent)),
             Span::styled(" a name   ", Style::default().fg(pal.dim)),
             Span::styled("Enter", Style::default().fg(pal.accent)),
             Span::styled(" create   ", Style::default().fg(pal.dim)),
-            Span::styled("Esc", Style::default().fg(pal.accent)),
-            Span::styled(" cancel", Style::default().fg(pal.dim)),
-        ]),
-        Some(Dialog::ConfirmDelete(_)) => Line::from(vec![
-            Span::styled("  Y", Style::default().fg(pal.accent)),
-            Span::styled(" delete   ", Style::default().fg(pal.dim)),
-            Span::styled("N", Style::default().fg(pal.accent)),
-            Span::styled("/", Style::default().fg(pal.dim)),
             Span::styled("Esc", Style::default().fg(pal.accent)),
             Span::styled(" cancel", Style::default().fg(pal.dim)),
         ]),
@@ -628,59 +691,141 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     );
 }
 
-/// Draw the modal rename dialog centred over `screen`.
-fn render_rename_dialog(
+/// Draw the modal session picker (rename / duplicate / delete) over `screen`.
+///
+/// Browse mode shows a search box above the filtered session list. The
+/// follow-up modes replace the body with a name editor (rename) or a
+/// confirmation prompt (delete).
+fn render_picker_dialog(
     frame: &mut Frame,
     screen: Rect,
     pal: &Palette,
     state: &WelcomeState,
-    dialog: &RenameDialog,
+    picker: &SessionPicker,
 ) {
     let area = centered_rect(60, 60, screen);
     frame.render_widget(Clear, area);
 
-    let block = dialog_block(pal, " Rename session ");
+    let block = dialog_block(pal, picker.action.title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // One row per session: name (or edit buffer for the active row) + branch.
-    let items: Vec<ListItem> = state
-        .sessions
+    match &picker.mode {
+        PickerMode::Browse => render_picker_browse(frame, inner, pal, state, picker),
+        PickerMode::EditName { buffer, .. } => render_picker_edit_name(frame, inner, pal, buffer),
+        PickerMode::Confirm { target } => {
+            render_picker_confirm(frame, inner, pal, state, *target)
+        }
+    }
+}
+
+/// Browse step: a search box on top, the filtered session list below.
+fn render_picker_browse(
+    frame: &mut Frame,
+    inner: Rect,
+    pal: &Palette,
+    state: &WelcomeState,
+    picker: &SessionPicker,
+) {
+    let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+
+    // Search box: a labelled input with a block cursor.
+    let search = Line::from(vec![
+        Span::styled(" Search ", Style::default().fg(pal.dim)),
+        Span::styled(
+            format!("{}▏", picker.query),
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(search).style(Style::default().bg(pal.bg)),
+        rows[0],
+    );
+
+    // Filtered results, or a hint when nothing matches.
+    let matches = filter_sessions(&state.sessions, &picker.query);
+    if matches.is_empty() {
+        let empty = if state.sessions.is_empty() {
+            "  No sessions yet."
+        } else {
+            "  No matches."
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(empty, Style::default().fg(pal.dim)))
+                .style(Style::default().bg(pal.bg)),
+            rows[1],
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = matches
         .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let editing_this = dialog.buffer.is_some() && i == dialog.selected;
-            let name_span = if editing_this {
-                let buf = dialog.buffer.as_deref().unwrap_or("");
-                Span::styled(
-                    format!(" {}▏", buf),
-                    Style::default()
-                        .fg(pal.bg)
-                        .bg(pal.accent)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled(
-                    format!(" {:<18}", s.name),
-                    Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
-                )
-            };
-            ListItem::new(Line::from(vec![
-                name_span,
-                Span::raw("  "),
-                Span::styled(
-                    s.branch.clone().unwrap_or_else(|| "—".to_string()),
-                    Style::default().fg(pal.dim),
-                ),
-            ]))
-        })
+        .filter_map(|&i| state.sessions.get(i))
+        .map(|s| ListItem::new(session_row(state, s)))
         .collect();
 
     let list = List::new(items).highlight_style(highlight_style(pal));
     let mut list_state = ListState::default();
-    // Don't show the row cursor while editing — the inline buffer is the cursor.
-    list_state.select((dialog.buffer.is_none()).then_some(dialog.selected));
-    frame.render_stateful_widget(list, inner, &mut list_state);
+    list_state.select(Some(picker.selected.min(matches.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, rows[1], &mut list_state);
+}
+
+/// Rename follow-up: an inline editor for the chosen session's new name.
+fn render_picker_edit_name(frame: &mut Frame, inner: Rect, pal: &Palette, buffer: &str) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "  New name",
+            Style::default().fg(pal.dim),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("  {buffer}▏"),
+            Style::default()
+                .fg(pal.bg)
+                .bg(pal.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(pal.bg)),
+        inner,
+    );
+}
+
+/// Delete follow-up: confirm removal of the chosen session.
+fn render_picker_confirm(
+    frame: &mut Frame,
+    inner: Rect,
+    pal: &Palette,
+    state: &WelcomeState,
+    target: usize,
+) {
+    let name = state
+        .sessions
+        .get(target)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "  Delete this session?",
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            format!("  {name}"),
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  The Claude conversation is kept on disk.",
+            Style::default().fg(pal.dim),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(pal.bg)),
+        inner,
+    );
 }
 
 /// Draw the modal new-session form centred over `screen`.
@@ -709,48 +854,6 @@ fn render_new_session_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, dia
 
     let form = Paragraph::new(lines).style(Style::default().bg(pal.bg));
     frame.render_widget(form, inner);
-}
-
-/// Draw the modal delete-confirmation dialog centred over `screen`.
-fn render_confirm_delete_dialog(
-    frame: &mut Frame,
-    screen: Rect,
-    pal: &Palette,
-    state: &WelcomeState,
-    idx: usize,
-) {
-    let area = centered_rect(50, 30, screen);
-    frame.render_widget(Clear, area);
-
-    let block = dialog_block(pal, " Delete session ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let name = state
-        .sessions
-        .get(idx)
-        .map(|s| s.name.clone())
-        .unwrap_or_default();
-
-    let lines = vec![
-        Line::from(Span::styled(
-            "  Delete this session?",
-            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("  {name}"),
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  The Claude conversation is kept on disk.",
-            Style::default().fg(pal.dim),
-        )),
-    ];
-
-    let body = Paragraph::new(lines).style(Style::default().bg(pal.bg));
-    frame.render_widget(body, inner);
 }
 
 /// A bordered panel whose border colour signals focus.
@@ -796,6 +899,25 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     Layout::horizontal([Constraint::Percentage(percent_x)])
         .flex(Flex::Center)
         .split(vertical[0])[0]
+}
+
+/// Indices into `sessions` whose name or branch contains `query`
+/// (case-insensitive). An empty query matches every session.
+fn filter_sessions(sessions: &[Session], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            q.is_empty()
+                || s.name.to_lowercase().contains(&q)
+                || s
+                    .branch
+                    .as_deref()
+                    .is_some_and(|b| b.to_lowercase().contains(&q))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Format a Unix-epoch timestamp (seconds, UTC) as `YYYY-MM-DD`.
