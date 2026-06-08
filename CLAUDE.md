@@ -65,10 +65,22 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
       `current_exe`) + auto-update in-app para brew/cargo (tecla U), comando
       manual para AUR/curl/PS; feedback de "Check for updates"
 
+## Commits
+- Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
+  `refactor:`, `test:`. Nunca atribución de IA (`Co-Authored-By`, etc.).
+- Un commit por unidad lógica. Si varios concerns caen en el mismo archivo
+  y no se pueden separar por hunks, agrupá por el concern dominante y
+  describí el resto en el cuerpo.
+- Asunto en imperativo y en inglés. Cuerpo: explicá el PORQUÉ (qué motivó
+  el cambio, qué rompía), no solo el qué.
+
 ## Versionado
-- SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch.
-- Bumpear `version` en Cargo.toml EN EL MISMO commit del cambio (la
-  versión se muestra en la welcome screen). Versión actual: 0.11.0.
+- SemVer, pre-1.0: `feat:` → bump minor, `fix:` → bump patch. Si un release
+  junta varios cambios, manda el de mayor impacto (un `feat:` entre `fix:`
+  hace minor).
+- Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
+  del cambio (la versión se muestra en la welcome screen).
+  Versión actual: 0.12.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
@@ -97,8 +109,43 @@ Pendiente:
 - [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
       (deprecación de Node 20, no bloqueante hasta ~sep 2026)
 
-Para cada release nuevo: bump de versión en Cargo.toml → commit → push →
-`git tag vX.Y.Z` → `git push origin vX.Y.Z`. El workflow compila los
-binarios, publica el release Y **actualiza el tap Homebrew solo** (job
-`update-tap`, vía el secret `TAP_GITHUB_TOKEN`). El AUR todavía es manual:
-actualizar `pkgver` + `sha256sums` en `packaging/aur/PKGBUILD`.
+### Cómo publicar un release (EN ORDEN)
+1. Bump de `version` en `Cargo.toml` + `Cargo.lock` → commit.
+2. `git push origin main`.
+3. `git tag vX.Y.Z` → `git push origin vX.Y.Z`. **El tag es OBLIGATORIO y es
+   lo que dispara el workflow** — nunca lo saltees, ni aunque el usuario vaya
+   a compilar local.
+4. El workflow (`release.yml`) compila los binarios (linux-gnu, macOS
+   intel+arm, windows-msvc), publica el release **con el cuerpo VACÍO** y
+   actualiza el tap Homebrew solo (job `update-tap`, secret
+   `TAP_GITHUB_TOKEN`). El runner de Windows es el más lento: el `.zip`
+   windows-msvc puede aparecer minutos después que el resto.
+5. **Escribir las notas a mano** — el workflow NO las genera. Seguí la
+   plantilla de abajo y aplicalas con
+   `gh release edit vX.Y.Z --notes-file <archivo>`. Un patch chico sin
+   novedades visibles para el usuario puede quedar sin notas (como v0.11.1).
+6. AUR sigue siendo manual: actualizar `pkgver` + `sha256sums` en
+   `packaging/aur/PKGBUILD`.
+
+### Plantilla de notas de release
+Van en **inglés** (como todos los releases anteriores). Bullets con lead-in
+en negrita + descripción orientada al USUARIO, no al código. Referencia:
+`gh release view v0.11.0`.
+
+```markdown
+**Bruce** is a terminal workspace for [Claude Code](https://docs.claude.com/claude-code).
+
+### What's new in vX.Y.Z
+
+- **<Short title>**: <one sentence, user-facing, what changed and why it helps>.
+- **<Short title>**: <...>.
+
+### Install
+
+- **macOS:** `brew install soydanielsierradev/bruce/bruce`
+- **macOS / Linux:** `curl -fsSL https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.sh | sh`
+- **Windows (PowerShell):** `irm https://raw.githubusercontent.com/soydanielsierradev/bruce-tui/main/install.ps1 | iex`
+- **Any platform (Rust):** `cargo install --git https://github.com/soydanielsierradev/bruce-tui`
+
+> Requires the Claude Code CLI (`claude`) on your PATH.
+```
