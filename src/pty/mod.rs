@@ -35,6 +35,10 @@ pub struct SpawnOptions {
 /// Shared, locked PTY writer (used by both the UI thread and the reader thread).
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// How many scrolled-off lines the emulator keeps so the user can page back
+/// through the conversation. Bounded so a long session can't grow unbounded.
+const SCROLLBACK_LINES: usize = 10_000;
+
 /// A running child process attached to a PTY plus its emulated screen.
 pub struct PtySession {
     /// The emulated terminal, shared with the reader thread.
@@ -68,7 +72,7 @@ impl PtySession {
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
 
@@ -124,7 +128,33 @@ impl PtySession {
             pixel_height: 0,
         });
         if let Ok(mut parser) = self.parser.lock() {
-            *parser = vt100::Parser::new(rows, cols, 0);
+            *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+        }
+    }
+
+    /// Scroll the emulated screen back by `lines` (toward older output). The
+    /// offset is clamped to the available scrollback by vt100, so over-scrolling
+    /// simply stops at the top.
+    pub fn scroll_up(&self, lines: usize) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let offset = parser.screen().scrollback();
+            parser.screen_mut().set_scrollback(offset + lines);
+        }
+    }
+
+    /// Scroll the emulated screen forward by `lines` (toward newer output),
+    /// stopping at the live bottom (offset 0).
+    pub fn scroll_down(&self, lines: usize) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let offset = parser.screen().scrollback();
+            parser.screen_mut().set_scrollback(offset.saturating_sub(lines));
+        }
+    }
+
+    /// Jump back to the live bottom of the output (cancel any scrollback).
+    pub fn scroll_to_bottom(&self) {
+        if let Ok(mut parser) = self.parser.lock() {
+            parser.screen_mut().set_scrollback(0);
         }
     }
 }

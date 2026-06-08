@@ -147,8 +147,26 @@ impl WorkspaceState {
                 .map(|p| p.screen().application_cursor())
                 .unwrap_or(false);
             if let Some(bytes) = encode_key(key, app_cursor) {
+                // Typing returns the view to the live bottom, the way a real
+                // terminal snaps back when you start a new command.
+                pty.scroll_to_bottom();
                 pty.send(&bytes);
             }
+        }
+    }
+
+    /// Scroll the Claude pane back by one page (no-op without a PTY). The page
+    /// size is the pane's current height, so it pages like a terminal.
+    pub fn scroll_up(&self) {
+        if let Some(pty) = self.pty.as_ref() {
+            pty.scroll_up(self.last_pty_size.get().0.max(1) as usize);
+        }
+    }
+
+    /// Scroll the Claude pane forward by one page (no-op without a PTY).
+    pub fn scroll_down(&self) {
+        if let Some(pty) = self.pty.as_ref() {
+            pty.scroll_down(self.last_pty_size.get().0.max(1) as usize);
         }
     }
 
@@ -282,11 +300,10 @@ fn render_claude_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: boo
             Paragraph::new(pty_screen_lines(screen, pal)).style(Style::default().bg(pal.bg)),
             inner,
         );
-        // Show the child's cursor only while the pane is focused.
-        if focused && !screen.hide_cursor() {
-            let (row, col) = screen.cursor_position();
-            frame.set_cursor_position((inner.x + col, inner.y + row));
-        }
+        // The child (Claude Code) renders its own cursor inside its input box, so
+        // we deliberately don't place the host terminal cursor here. Repositioning
+        // it every frame made it visibly fly across the pane while Claude streamed
+        // output — redundant and distracting.
     }
 }
 
@@ -745,6 +762,8 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
         // Typing flows to Claude; control keys live behind the leader.
         Line::from(vec![
             txt("  typing → Claude    "),
+            key("Shift+PgUp/PgDn"),
+            txt(" scroll    "),
             key("Ctrl+b"),
             txt(" leader (then b/Tab/g/m/q)"),
         ])

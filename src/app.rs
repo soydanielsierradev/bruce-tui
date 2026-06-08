@@ -255,6 +255,16 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         }
                     } else if ctrl && matches!(key.code, KeyCode::Char('b')) {
                         ws.leader_pending = true;
+                    } else if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && key.code == KeyCode::PageUp
+                    {
+                        // Shift+PageUp/PageDown page through the scrollback, the
+                        // terminal-standard keys — so they don't reach Claude.
+                        ws.scroll_up();
+                    } else if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && key.code == KeyCode::PageDown
+                    {
+                        ws.scroll_down();
                     } else {
                         // Everything else is the user typing into Claude.
                         ws.send_key(&key);
