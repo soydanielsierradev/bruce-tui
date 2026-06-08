@@ -390,14 +390,16 @@ impl MetricsWatcher {
 }
 
 /// Encode an absolute project path the way Claude names its transcript folder:
-/// every path separator (and the drive colon on Windows) becomes a dash.
+/// every character that isn't ASCII-alphanumeric becomes a dash. This covers
+/// path separators, the Windows drive colon, **and** spaces, dots and other
+/// punctuation — Claude Code changed its encoding to dash those out, so a path
+/// like `…/Proyectos Personales/…` maps to `…-Proyectos-Personales-…`. Keeping
+/// the space here pointed the watcher at a directory Claude never writes to,
+/// which silently zeroed out the metrics pane.
 fn encode_project(path: &Path) -> String {
     path.to_string_lossy()
         .chars()
-        .map(|c| match c {
-            ':' | '\\' | '/' => '-',
-            other => other,
-        })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
@@ -458,6 +460,18 @@ mod tests {
     #[test]
     fn computes_duration() {
         assert_eq!(parse_sample().duration_secs(), 300);
+    }
+
+    /// The transcript folder name must match Claude's encoding exactly: every
+    /// non-alphanumeric character (drive colon, separators, **and spaces**)
+    /// becomes a dash. A space leaking through silently zeroed the metrics pane.
+    #[test]
+    fn encodes_project_path_like_claude() {
+        let path = Path::new(r"C:\Users\DANIEL\Desktop\Proyectos Personales\bruce-tui");
+        assert_eq!(
+            encode_project(path),
+            "C--Users-DANIEL-Desktop-Proyectos-Personales-bruce-tui"
+        );
     }
 
     #[test]
