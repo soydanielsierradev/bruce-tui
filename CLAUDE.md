@@ -123,7 +123,7 @@ Pendiente:
 5. **Escribir las notas a mano** — el workflow NO las genera. Seguí la
    plantilla de abajo y aplicalas con
    `gh release edit vX.Y.Z --notes-file <archivo>`. Un patch chico sin
-   novedades visibles para el usuario puede quedar sin notas (como v0.11.1).
+   novedades visibles igual lleva notas breves: no te saltees este paso (le pasó a v0.11.1 y quedó sin cuerpo hasta que se corrigió a mano).
 6. AUR sigue siendo manual: actualizar `pkgver` + `sha256sums` en
    `packaging/aur/PKGBUILD`.
 
