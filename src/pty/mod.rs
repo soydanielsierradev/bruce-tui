@@ -13,8 +13,10 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -39,6 +41,11 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// through the conversation. Bounded so a long session can't grow unbounded.
 const SCROLLBACK_LINES: usize = 10_000;
 
+/// After this long without any PTY output we treat the child as idle (waiting
+/// for input) and show its cursor; while output is still streaming we keep the
+/// cursor hidden so it doesn't visibly fly around the pane mid-response.
+const OUTPUT_IDLE: Duration = Duration::from_millis(200);
+
 /// A running child process attached to a PTY plus its emulated screen.
 pub struct PtySession {
     /// The emulated terminal, shared with the reader thread.
@@ -49,6 +56,12 @@ pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     /// The child process, killed on drop.
     child: Box<dyn Child + Send + Sync>,
+    /// When the reader thread last received any output, to tell a streaming
+    /// response apart from an idle prompt (see [`PtySession::output_idle`]).
+    last_output: Arc<Mutex<Instant>>,
+    /// Set once the child has produced its first byte of output, so the loading
+    /// transition knows Claude has started painting (see [`PtySession::has_output`]).
+    got_output: Arc<AtomicBool>,
     /// Reader thread handle; dropping it detaches the thread.
     _reader: JoinHandle<()>,
 }
@@ -75,6 +88,10 @@ impl PtySession {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
+        let last_output = Arc::new(Mutex::new(Instant::now()));
+        let last_output_for_thread = Arc::clone(&last_output);
+        let got_output = Arc::new(AtomicBool::new(false));
+        let got_output_for_thread = Arc::clone(&got_output);
 
         let reader_handle = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -85,6 +102,13 @@ impl PtySession {
                         let chunk = &buf[..n];
                         if let Ok(mut parser) = parser_for_thread.lock() {
                             parser.process(chunk);
+                        }
+                        // Mark this as live output so the UI hides the cursor
+                        // while a response streams, and flag that Claude has begun
+                        // painting (for the loading transition).
+                        got_output_for_thread.store(true, Ordering::Relaxed);
+                        if let Ok(mut t) = last_output_for_thread.lock() {
+                            *t = Instant::now();
                         }
                         // Answer queries *after* processing, so the cursor
                         // position we report is current.
@@ -99,6 +123,8 @@ impl PtySession {
             writer,
             master: pair.master,
             child,
+            last_output,
+            got_output,
             _reader: reader_handle,
         })
     }
@@ -156,6 +182,30 @@ impl PtySession {
         if let Ok(mut parser) = self.parser.lock() {
             parser.screen_mut().set_scrollback(0);
         }
+    }
+
+    /// True when the child hasn't produced output for at least `dur` — i.e. its
+    /// output has gone quiet. The threshold is the caller's: a short one tells a
+    /// streaming response apart from an idle prompt; a longer one tells "still
+    /// booting" apart from "finished its initial paint".
+    pub fn output_quiet(&self, dur: Duration) -> bool {
+        self.last_output
+            .lock()
+            .map(|t| t.elapsed() >= dur)
+            .unwrap_or(true)
+    }
+
+    /// True when the child hasn't produced output for at least [`OUTPUT_IDLE`],
+    /// i.e. it's waiting for input rather than streaming a response. Drives
+    /// whether the UI shows the child's cursor.
+    pub fn output_idle(&self) -> bool {
+        self.output_quiet(OUTPUT_IDLE)
+    }
+
+    /// True once the child has produced any output — i.e. Claude has started
+    /// painting. Used to end the loading transition as soon as it's ready.
+    pub fn has_output(&self) -> bool {
+        self.got_output.load(Ordering::Relaxed)
     }
 }
 

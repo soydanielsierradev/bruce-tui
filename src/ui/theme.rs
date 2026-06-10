@@ -4,6 +4,7 @@
 //! plain `Copy` values so they can be cycled cheaply from the event loop.
 
 use ratatui::style::Color;
+use ratatui::widgets::BorderType;
 use serde::{Deserialize, Serialize};
 
 /// One of the built-in color themes.
@@ -17,6 +18,83 @@ pub enum Theme {
     Light,
     Amber,
     Tokyo,
+}
+
+/// Line style for the framed side panes (Git, Metrics). A Settings option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BorderStyle {
+    #[default]
+    Rounded,
+    Square,
+    Double,
+}
+
+impl BorderStyle {
+    /// Cycle to the next style (wraps), for the Settings toggle.
+    pub fn next(self) -> Self {
+        match self {
+            BorderStyle::Rounded => BorderStyle::Square,
+            BorderStyle::Square => BorderStyle::Double,
+            BorderStyle::Double => BorderStyle::Rounded,
+        }
+    }
+
+    /// Lowercase label shown in the Settings block.
+    pub fn label(self) -> &'static str {
+        match self {
+            BorderStyle::Rounded => "rounded",
+            BorderStyle::Square => "square",
+            BorderStyle::Double => "double",
+        }
+    }
+
+    /// The ratatui border type to draw.
+    pub fn border_type(self) -> BorderType {
+        match self {
+            BorderStyle::Rounded => BorderType::Rounded,
+            BorderStyle::Square => BorderType::Plain,
+            BorderStyle::Double => BorderType::Double,
+        }
+    }
+}
+
+/// How wide each side pane (Git, Metrics) is, as a Settings option. Claude
+/// absorbs the rest of the width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SideWidth {
+    Narrow,
+    #[default]
+    Normal,
+    Wide,
+}
+
+impl SideWidth {
+    /// Cycle to the next width (wraps), for the Settings toggle.
+    pub fn next(self) -> Self {
+        match self {
+            SideWidth::Narrow => SideWidth::Normal,
+            SideWidth::Normal => SideWidth::Wide,
+            SideWidth::Wide => SideWidth::Narrow,
+        }
+    }
+
+    /// Lowercase label shown in the Settings block.
+    pub fn label(self) -> &'static str {
+        match self {
+            SideWidth::Narrow => "narrow",
+            SideWidth::Normal => "normal",
+            SideWidth::Wide => "wide",
+        }
+    }
+
+    /// Percentage of the total width each side pane takes.
+    pub fn percent(self) -> u16 {
+        match self {
+            SideWidth::Narrow => 20,
+            SideWidth::Normal => 25,
+            SideWidth::Wide => 33,
+        }
+    }
 }
 
 /// A resolved set of colors for rendering a single theme.
@@ -139,8 +217,10 @@ impl Theme {
                 removed: Color::Rgb(0xe5, 0x73, 0x73),
                 renamed: Color::Rgb(0xff, 0xca, 0x28),
             },
-            // Tokyo Night: the popular blue/purple dark theme. Its signature is
-            // the soft blue accent on a deep indigo background.
+            // Tokyo Night: the official darkest variant (bg #1a1b26) from the
+            // tokyo-night VS Code theme. Soft blue accent on a deep indigo
+            // background; git-modified uses the palette's cyan so it reads apart
+            // from the blue accent.
             Theme::Tokyo => Palette {
                 name: "Tokyo Night",
                 bg: Color::Rgb(0x1a, 0x1b, 0x26),
@@ -148,7 +228,7 @@ impl Theme {
                 accent: Color::Rgb(0x7a, 0xa2, 0xf7),
                 dim: Color::Rgb(0x56, 0x5f, 0x89),
                 added: Color::Rgb(0x9e, 0xce, 0x6a),
-                modified: Color::Rgb(0x7a, 0xa2, 0xf7),
+                modified: Color::Rgb(0x7d, 0xcf, 0xff),
                 removed: Color::Rgb(0xf7, 0x76, 0x8e),
                 renamed: Color::Rgb(0xe0, 0xaf, 0x68),
             },
@@ -166,17 +246,5 @@ impl Theme {
                 renamed: Color::Rgb(0xe0, 0xaf, 0x68),
             },
         }
-    }
-
-    /// Next theme in selector order, wrapping around.
-    pub fn next(self) -> Theme {
-        let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
-
-    /// Previous theme in selector order, wrapping around.
-    pub fn prev(self) -> Theme {
-        let idx = Self::ALL.iter().position(|&t| t == self).unwrap_or(0);
-        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 }

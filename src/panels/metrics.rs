@@ -51,8 +51,9 @@ pub struct Metrics {
     /// Epoch-second timestamp of the first and last transcript entries.
     pub first_ts: Option<i64>,
     pub last_ts: Option<i64>,
-    /// Per-turn output tokens with their timestamps, for the usage sparkline.
-    pub series: Vec<(i64, u64)>,
+    /// MCP servers exercised this session, derived from `mcp__<server>__<tool>`
+    /// tool-call names. Distinct and sorted for a stable display.
+    pub mcp_servers: Vec<String>,
 }
 
 impl Metrics {
@@ -185,6 +186,7 @@ pub fn parse_transcript(path: &Path) -> Metrics {
     let mut metrics = Metrics::default();
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut files: HashSet<String> = HashSet::new();
+    let mut mcp: HashSet<String> = HashSet::new();
 
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -230,9 +232,6 @@ pub fn parse_transcript(path: &Path) -> Metrics {
                     metrics.turns += 1;
                     // The most recent turn defines the live context size.
                     metrics.context = input + cache_read + cache_write;
-                    metrics
-                        .series
-                        .push((line_ts.unwrap_or(0), output));
                 }
             }
         }
@@ -245,12 +244,28 @@ pub fn parse_transcript(path: &Path) -> Metrics {
                 }
                 metrics.tool_calls += 1;
                 count_edit(block, &mut metrics, &mut files);
+                if let Some(server) = mcp_server(block) {
+                    mcp.insert(server);
+                }
             }
         }
     }
 
     metrics.files_edited = files.len() as u64;
+    let mut mcp_servers: Vec<String> = mcp.into_iter().collect();
+    mcp_servers.sort();
+    metrics.mcp_servers = mcp_servers;
     metrics
+}
+
+/// The MCP server name from a tool-use block whose tool is named
+/// `mcp__<server>__<tool>`, or `None` for built-in tools. Claude prefixes every
+/// MCP tool this way, so the segment between `mcp__` and the next `__` is the
+/// server that handled the call.
+fn mcp_server(block: &serde_json::Value) -> Option<String> {
+    let name = block.get("name").and_then(|n| n.as_str())?;
+    let server = name.strip_prefix("mcp__")?.split("__").next()?;
+    (!server.is_empty()).then(|| server.to_string())
 }
 
 /// Account a Write/Edit/MultiEdit tool call: record the file and approximate
@@ -472,6 +487,16 @@ mod tests {
             encode_project(path),
             "C--Users-DANIEL-Desktop-Proyectos-Personales-bruce-tui"
         );
+    }
+
+    /// MCP tool calls (`mcp__<server>__<tool>`) yield the server name; built-in
+    /// tools yield nothing.
+    #[test]
+    fn extracts_mcp_server_name() {
+        let mcp = serde_json::json!({"type":"tool_use","name":"mcp__plugin_engram_engram__mem_save"});
+        assert_eq!(mcp_server(&mcp).as_deref(), Some("plugin_engram_engram"));
+        let builtin = serde_json::json!({"type":"tool_use","name":"Write"});
+        assert_eq!(mcp_server(&builtin), None);
     }
 
     #[test]

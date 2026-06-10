@@ -1,10 +1,13 @@
 //! Global application state and the terminal event loop.
 
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use ratatui::style::Color;
 
 use crate::session::Session;
@@ -18,7 +21,70 @@ use crate::ui::workspace::{self, Panel, WorkspaceState};
 /// returning from the workspace preserves the welcome selection and theme.
 enum Screen {
     Welcome,
+    /// Brief animated transition while a session's Claude process boots, before
+    /// revealing its workspace.
+    Loading(LoadingState),
     Workspace(WorkspaceState),
+}
+
+/// The loading transition between picking a session and its workspace: holds the
+/// already-built workspace (whose PTY is booting Claude in the background) and
+/// the animation's start time.
+struct LoadingState {
+    /// The workspace to reveal once loading finishes.
+    ws: WorkspaceState,
+    /// Status line shown under the wordmark (e.g. "Creating a new session…").
+    message: &'static str,
+    /// When the transition began, driving both the spinner and the min/max wait.
+    started: Instant,
+}
+
+/// Shortest time the loading screen stays up, so it reads as an intentional
+/// transition rather than a flash.
+const LOADING_MIN: Duration = Duration::from_millis(650);
+/// Longest the loading screen waits for Claude to paint before revealing the
+/// workspace anyway, so a slow or stuck start can't trap the user here.
+const LOADING_MAX: Duration = Duration::from_millis(5_000);
+
+impl LoadingState {
+    fn new(ws: WorkspaceState, message: &'static str) -> Self {
+        Self { ws, message, started: Instant::now() }
+    }
+
+    /// Time to reveal the workspace: past the minimum, and either Claude has
+    /// started painting or we've hit the cap.
+    fn ready(&self) -> bool {
+        let elapsed = self.started.elapsed();
+        elapsed >= LOADING_MIN && (self.ws.pty_has_output() || elapsed >= LOADING_MAX)
+    }
+
+    /// Spinner frame index, derived from elapsed time (~110 ms per frame).
+    fn tick(&self) -> usize {
+        (self.started.elapsed().as_millis() / 110) as usize
+    }
+}
+
+/// Build the loading transition that opens `session` in a workspace, inheriting
+/// the welcome screen's theme and look/panel preferences. `resume` picks how
+/// Claude launches (`--resume` vs `--session-id`); `message` is the loading line.
+fn open_session_loading(
+    welcome: &WelcomeState,
+    session: Session,
+    resume: bool,
+    message: &'static str,
+) -> Screen {
+    let ws = WorkspaceState::new(
+        session,
+        resume,
+        welcome.theme,
+        welcome.git_enabled,
+        welcome.metrics_enabled,
+        welcome.show_footer,
+        welcome.show_title,
+        welcome.border_style,
+        welcome.side_width,
+    );
+    Screen::Loading(LoadingState::new(ws, message))
 }
 
 /// Entry point for the `bruce tui` subcommand.
@@ -30,6 +96,7 @@ pub fn run() -> Result<()> {
     let outcome = run_loop(&mut terminal);
     // Hand the terminal back with its own colours restored before leaving the
     // alternate screen, so the user's normal prompt isn't left recoloured.
+    set_mouse_capture(false);
     reset_terminal_colors();
     ratatui::restore();
 
@@ -40,6 +107,19 @@ pub fn run() -> Result<()> {
         run_update(&argv);
     }
     Ok(())
+}
+
+/// Enable or disable terminal mouse reporting. Used so the welcome screen can
+/// hit-test clicks on the author link, while the workspace keeps native terminal
+/// text selection (capture is turned off there). Best-effort: a terminal without
+/// mouse support simply ignores it.
+fn set_mouse_capture(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = if on {
+        crossterm::execute!(out, EnableMouseCapture)
+    } else {
+        crossterm::execute!(out, DisableMouseCapture)
+    };
 }
 
 /// Run the resolved update command with inherited stdio so the user sees the
@@ -99,21 +179,34 @@ fn rgb(color: Color) -> Option<(u8, u8, u8)> {
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String>>> {
     let mut welcome = WelcomeState::new();
     let mut screen = Screen::Welcome;
-    // Last theme pushed to the terminal via OSC, so we only re-emit on change.
-    let mut applied_theme: Option<Theme> = None;
+    // Last (theme, sync_colors) pushed to the terminal via OSC, so we only
+    // re-emit on a real change (theme switch or the Settings toggle).
+    let mut applied_colors: Option<(Theme, bool)> = None;
     // Set when the user triggers an auto-update; returned to `run` to execute.
     let mut pending_update: Option<Vec<String>> = None;
+
+    // The welcome screen captures mouse to make the author link clickable; it's
+    // turned off in the workspace so the Claude pane keeps native text selection.
+    set_mouse_capture(true);
 
     loop {
         // The active theme lives on whichever screen is showing; the workspace
         // carries a snapshot of the welcome theme it was opened with.
         let current_theme = match &screen {
             Screen::Welcome => welcome.theme,
+            Screen::Loading(load) => load.ws.theme,
             Screen::Workspace(ws) => ws.theme,
         };
-        if applied_theme != Some(current_theme) {
-            apply_terminal_colors(current_theme);
-            applied_theme = Some(current_theme);
+        // The color-sync preference is global (toggled in the welcome Settings
+        // block), so the welcome state is the source of truth on both screens.
+        let desired_colors = (current_theme, welcome.sync_colors);
+        if applied_colors != Some(desired_colors) {
+            if welcome.sync_colors {
+                apply_terminal_colors(current_theme);
+            } else {
+                reset_terminal_colors();
+            }
+            applied_colors = Some(desired_colors);
         }
 
         // Per-frame upkeep before drawing: refresh the Git pane on its throttle
@@ -125,8 +218,19 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
         // otherwise); the welcome state lives across both screens.
         welcome.poll_update_check();
 
+        // Reveal the workspace once its loading transition is ready (Claude has
+        // painted, or the cap elapsed).
+        if matches!(&screen, Screen::Loading(load) if load.ready()) {
+            if let Screen::Loading(load) = std::mem::replace(&mut screen, Screen::Welcome) {
+                screen = Screen::Workspace(load.ws);
+            }
+        }
+
         terminal.draw(|frame| match &screen {
             Screen::Welcome => welcome::render(frame, &welcome),
+            Screen::Loading(load) => {
+                welcome::render_loading(frame, load.ws.theme, load.message, load.tick())
+            }
             Screen::Workspace(ws) => workspace::render(frame, ws),
         })?;
 
@@ -135,7 +239,18 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
+        let evt = event::read()?;
+        // A left-click on the welcome screen may land on the author link.
+        if let Event::Mouse(me) = evt {
+            if matches!(&screen, Screen::Welcome)
+                && welcome.dialog.is_none()
+                && me.kind == MouseEventKind::Down(MouseButton::Left)
+            {
+                welcome.click(me.column, me.row);
+            }
+            continue;
+        }
+        let Event::Key(key) = evt else {
             continue;
         };
 
@@ -182,13 +297,24 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         let _ = session.save();
                         // Open with the user's saved panel preferences; they can
                         // still toggle them live with Ctrl+g / Ctrl+m.
-                        transition = Some(Screen::Workspace(WorkspaceState::new(
+                        transition = Some(open_session_loading(
+                            &welcome,
                             session,
                             false,
-                            welcome.theme,
-                            welcome.git_enabled,
-                            welcome.metrics_enabled,
-                        )));
+                            "Creating a new session…",
+                        ));
+                        }
+                        WelcomeEvent::OpenSession(s) => {
+                            // The user picked a session from the Open picker:
+                            // resume it. Bump last_used now that it's reopened.
+                            let mut session = s;
+                            let _ = session.touch();
+                            transition = Some(open_session_loading(
+                                &welcome,
+                                session,
+                                true,
+                                "Resuming session…",
+                            ));
                         }
                         WelcomeEvent::None => {}
                     }
@@ -200,7 +326,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         KeyCode::Down => welcome.select_next(),
                         KeyCode::Char('n') | KeyCode::Char('N') => welcome.focus_new_session(),
                         KeyCode::Enter => {
-                            if welcome.on_new_session() {
+                            if welcome.on_open_session() {
+                                welcome.open_picker(welcome::PickerAction::Open);
+                            } else if welcome.on_new_session() {
                                 welcome.open_new_session();
                             } else if welcome.on_rename() {
                                 welcome.open_picker(welcome::PickerAction::Rename);
@@ -208,39 +336,48 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                                 welcome.open_picker(welcome::PickerAction::Duplicate);
                             } else if welcome.on_delete() {
                                 welcome.open_picker(welcome::PickerAction::Delete);
-                            } else if welcome.on_app_check() {
+                            } else if welcome.on_check_updates() {
                                 welcome.start_update_check();
-                            } else if welcome.on_app_update() {
+                            } else if welcome.on_update_latest() {
                                 welcome.open_update_info();
-                            } else if welcome.on_session() {
-                                if let Some(s) =
-                                    welcome.sessions.get(welcome.session_selected)
-                                {
-                                    // Resume the persisted conversation: launch
-                                    // `claude --resume <id>` in its project dir so
-                                    // Claude rebuilds the full transcript. Bump
-                                    // last_used now that it's being opened.
-                                    let mut session = s.clone();
-                                    let _ = session.touch();
-                                    transition = Some(Screen::Workspace(WorkspaceState::new(
-                                        session,
-                                        true,
-                                        welcome.theme,
-                                        welcome.git_enabled,
-                                        welcome.metrics_enabled,
-                                    )));
-                                }
+                            } else if welcome.on_settings_theme() {
+                                welcome.open_theme_picker();
+                            } else if welcome.on_settings() {
+                                welcome.toggle_setting();
+                            } else if welcome.on_doc_github() {
+                                welcome.open_github();
+                            } else if welcome.on_doc_keys() {
+                                welcome.open_keybindings();
                             }
                         }
                         _ => {}
                     }
                 }
             }
+            // The loading transition is non-interactive; swallow keys until it
+            // promotes itself to the workspace.
+            Screen::Loading(_) => {}
             Screen::Workspace(ws) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                let claude_focused = ws.focus == Panel::Claude && ws.pty.is_some();
+                // Scrollback pages on Shift+PageUp/PageDown (the terminal-standard
+                // keys); Ctrl is accepted too since some terminals swallow one or
+                // the other. The plain keys still reach Claude.
+                let scroll_mod = ctrl || key.modifiers.contains(KeyModifiers::SHIFT);
 
-                if claude_focused {
+                // Ctrl+1/2/3 jump straight to a pane from anywhere — even while
+                // Claude has focus — so switching never needs the leader chord.
+                let pane = ctrl
+                    .then(|| match key.code {
+                        KeyCode::Char('1') => Some(Panel::Git),
+                        KeyCode::Char('2') => Some(Panel::Claude),
+                        KeyCode::Char('3') => Some(Panel::Metrics),
+                        _ => None,
+                    })
+                    .flatten();
+
+                if let Some(panel) = pane {
+                    ws.focus_panel(panel);
+                } else if ws.focus == Panel::Claude && ws.pty.is_some() {
                     if ws.leader_pending {
                         // Second key of the Ctrl+b chord: a Bruce command.
                         ws.leader_pending = false;
@@ -253,18 +390,12 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                             KeyCode::Char('q') => quit = true,
                             _ => {} // unknown command: swallow it
                         }
+                    } else if scroll_mod && key.code == KeyCode::PageUp {
+                        ws.scroll_up();
+                    } else if scroll_mod && key.code == KeyCode::PageDown {
+                        ws.scroll_down();
                     } else if ctrl && matches!(key.code, KeyCode::Char('b')) {
                         ws.leader_pending = true;
-                    } else if key.modifiers.contains(KeyModifiers::SHIFT)
-                        && key.code == KeyCode::PageUp
-                    {
-                        // Shift+PageUp/PageDown page through the scrollback, the
-                        // terminal-standard keys — so they don't reach Claude.
-                        ws.scroll_up();
-                    } else if key.modifiers.contains(KeyModifiers::SHIFT)
-                        && key.code == KeyCode::PageDown
-                    {
-                        ws.scroll_down();
                     } else {
                         // Everything else is the user typing into Claude.
                         ws.send_key(&key);
@@ -278,6 +409,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         KeyCode::BackTab => ws.focus_prev(),
                         KeyCode::Char('g') if ctrl => ws.toggle_git(),
                         KeyCode::Char('m') if ctrl => ws.toggle_metrics(),
+                        KeyCode::PageUp if scroll_mod => ws.scroll_up(),
+                        KeyCode::PageDown if scroll_mod => ws.scroll_down(),
                         _ => {}
                     }
                 }
@@ -301,10 +434,18 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
         }
 
         if let Some(next) = transition {
-            // Returning to the welcome screen: reload sessions so a session just
-            // created or used shows up with fresh last_used / token metrics.
-            if matches!(next, Screen::Welcome) {
-                welcome.reload_sessions();
+            match &next {
+                // Returning to the welcome screen: reload sessions so a session
+                // just created or used shows up with fresh metrics, and re-arm
+                // the mouse so the author link is clickable again.
+                Screen::Welcome => {
+                    welcome.reload_sessions();
+                    set_mouse_capture(true);
+                }
+                // Entering a workspace (via the loading screen): release the mouse
+                // so the Claude pane keeps native terminal selection.
+                Screen::Loading(_) => set_mouse_capture(false),
+                Screen::Workspace(_) => {}
             }
             screen = next;
         }

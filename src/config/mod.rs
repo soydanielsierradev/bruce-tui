@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::{BorderStyle, SideWidth, Theme};
 
 /// Persisted user preferences. Defaults match Bruce's first-run look: the Hacker
 /// theme with every panel visible.
@@ -34,6 +34,29 @@ pub struct Config {
     /// immediately on startup from cache, before any new network check returns.
     #[serde(default)]
     pub latest_seen: String,
+    /// Repaint the terminal's default fg/bg to match the theme (via OSC). Off
+    /// leaves the host terminal's own colors. Defaults on.
+    #[serde(default = "default_true")]
+    pub sync_colors: bool,
+    /// Show the one-line hint bar at the bottom of the workspace. Defaults on.
+    #[serde(default = "default_true")]
+    pub show_footer: bool,
+    /// Show the top title bar (app name + session). Defaults on.
+    #[serde(default = "default_true")]
+    pub show_title: bool,
+    /// Line style for the framed side panes. Defaults rounded.
+    #[serde(default)]
+    pub border_style: BorderStyle,
+    /// Width of each side pane. Defaults normal (25%).
+    #[serde(default)]
+    pub side_width: SideWidth,
+}
+
+/// Serde default for the boolean preferences added after the first release, so
+/// an older `config.json` missing these keys loads them as enabled (the prior
+/// always-on behaviour) instead of `false`.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -44,6 +67,11 @@ impl Default for Config {
             metrics_enabled: true,
             last_update_check: 0,
             latest_seen: String::new(),
+            sync_colors: true,
+            show_footer: true,
+            show_title: true,
+            border_style: BorderStyle::default(),
+            side_width: SideWidth::default(),
         }
     }
 }
