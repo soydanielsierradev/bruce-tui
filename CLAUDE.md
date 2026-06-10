@@ -3,7 +3,10 @@
 ## Qué es este proyecto
 Aplicación TUI en Rust con 3 paneles: Git (izquierdo), Claude Code 
 embebido en PTY (centro), Métricas de tokens (derecho). 
-Pantalla de bienvenida con selección de sesiones y temas.
+Pantalla de bienvenida con 3 bloques (Options, Settings, Documentation):
+abrir/crear/renombrar/duplicar/eliminar sesiones vía picker con búsqueda,
+preferencias de look en Settings (tema, bordes, layout) y repo + atajos en
+Documentation. Transición de loading al abrir una sesión.
 
 ## Stack
 - ratatui + crossterm — TUI
@@ -28,7 +31,7 @@ src/main.rs — entry point + clap
 src/app.rs — estado global y event loop
 src/ui/ — layout, welcome screen, temas
 src/session/ — struct Session, persistencia JSON
-src/panels/ — git.rs, claude.rs, metrics.rs
+src/panels/ — git.rs, metrics.rs
 src/pty/ — spawn y comunicación PTY
 
 ## Sesiones
@@ -64,6 +67,16 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
 - [x] Paso 14: Detección del método de instalación (por ruta de
       `current_exe`) + auto-update in-app para brew/cargo (tecla U), comando
       manual para AUR/curl/PS; feedback de "Check for updates"
+- [x] Paso 15 (v0.13.0): overhaul de UX. Bloque Settings (tema vía modal,
+      sync de colores OSC, estilo de borde, ancho de paneles, title/footer
+      bars; persiste al toggle). Welcome rediseñada: 3 bloques (Options,
+      Settings, Documentation), picker "Open session", tagline con link al
+      autor (mouse capture solo en welcome), foco por color, dim de fondo
+      tras los dialogs. Bloque App eliminado (Check/Update pasaron a Options).
+      Loading full-screen + overlay "waking Claude" en el panel. Panel Claude
+      sin bordes (Git/Metrics enmarcados), cursor oculto mientras streamea,
+      MCP activos en métricas. Navegación Ctrl+1/2/3 (+Tab), scroll
+      Shift+PageUp/Down. Tokyo Night: `modified` en cyan.
 
 ## Commits
 - Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
@@ -80,7 +93,7 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
   hace minor).
 - Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
   del cambio (la versión se muestra en la welcome screen).
-  Versión actual: 0.12.0.
+  Versión actual: 0.13.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).

@@ -97,19 +97,59 @@ Run Bruce from inside any project directory:
 bruce          # opens the workspace (same as `bruce tui`)
 ```
 
-On the welcome screen you can create, resume, rename, duplicate and delete
-sessions, and pick a theme — your choices are remembered between runs.
+On the welcome screen you can open, create, rename, duplicate and delete
+sessions, tweak the look under **Settings** (theme, border style, layout, title
+and footer bars), and find the repo and this keybindings list under
+**Documentation** — your choices are remembered between runs.
 
 ### Keys
 
+**Welcome screen**
+
 | Key | Action |
 |-----|--------|
-| `Tab` | Switch focused pane |
-| `Ctrl+b` then `g` / `m` | Toggle the Git / Metrics pane |
-| `Ctrl+b` then `b` | Back to the welcome screen |
-| `Ctrl+b` then `q` | Quit |
+| `Tab` / `Shift+Tab` | Move focus between blocks |
+| `↑` / `↓` | Select a row |
+| `Enter` | Run the selected option |
+| `N` | Jump to “New session” |
+| Click the author’s name | Open the author’s GitHub |
+| `q` / `Esc` | Quit Bruce |
 
-Everything else typed while the Claude pane is focused goes straight to Claude.
+**Session picker** (open / rename / duplicate / delete)
+
+| Key | Action |
+|-----|--------|
+| type | Filter the session list |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Confirm the action |
+| `Y` / `N` | Confirm / cancel a delete |
+| `Esc` | Close the picker |
+
+**Workspace — a side pane (Git / Metrics) focused**
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus Git / Claude / Metrics |
+| `Tab` / `Shift+Tab` | Cycle panes |
+| `Ctrl+g` / `Ctrl+m` | Toggle the Git / Metrics pane |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll Claude’s history |
+| `Esc` | Back to the welcome screen |
+| `q` / `Q` | Quit Bruce |
+
+**Workspace — Claude focused**
+
+| Key | Action |
+|-----|--------|
+| type | Send keystrokes to Claude |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus Git / Claude / Metrics |
+| `Shift+PageUp` / `Shift+PageDown` | Scroll Claude’s history |
+| `Ctrl+b` then `b` | Back to the welcome screen |
+| `Ctrl+b` then `Tab` | Switch pane |
+| `Ctrl+b` then `g` / `m` | Toggle the Git / Metrics pane |
+| `Ctrl+b` then `q` | Quit Bruce |
+
+Anything else typed while the Claude pane is focused goes straight to Claude. The
+same list is available in-app under **Documentation → Keybindings**.
 
 ## Build from source
 
