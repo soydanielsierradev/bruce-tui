@@ -10,17 +10,18 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Padding, Paragraph},
 };
 
+use crate::config::Config;
 use crate::panels::git::{self, GitView};
 use crate::panels::metrics::{self, MetricsWatcher};
 use crate::pty::{PtySession, SpawnOptions};
 use crate::session::Session;
-use crate::ui::theme::{Palette, Theme};
+use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 
 /// Which pane currently has keyboard focus. `Tab` cycles through them.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,14 @@ pub struct WorkspaceState {
     pub git_enabled: bool,
     /// Whether the Metrics pane is shown.
     pub metrics_enabled: bool,
+    /// Show the bottom hint bar (Settings → Footer hints).
+    pub show_footer: bool,
+    /// Show the top title bar (Settings → Title bar).
+    pub show_title: bool,
+    /// Line style for the framed side panes (Settings → Border style).
+    pub border_style: BorderStyle,
+    /// Width of each side pane (Settings → Side width).
+    pub side_width: SideWidth,
     /// Snapshot of the repository state shown in the Git pane.
     pub git: GitView,
     /// The embedded process + emulated terminal for the Claude pane.
@@ -58,6 +67,11 @@ pub struct WorkspaceState {
     last_pty_size: Cell<(u16, u16)>,
     /// When the Git pane was last reloaded, to throttle the refresh poll.
     last_git_refresh: Instant,
+    /// When this workspace opened, used to animate the "waking Claude" overlay.
+    opened_at: Instant,
+    /// Latches `true` once Claude has finished its initial paint, so the waking
+    /// overlay is shown only while it boots and never again.
+    claude_awake: Cell<bool>,
 }
 
 /// How often the Git pane is re-read from disk. Claude (or the user) changes the
@@ -73,7 +87,17 @@ impl WorkspaceState {
     /// conversation pinned to the session id (`--session-id`); `true` continues
     /// an existing one (`--resume`). Either way the PTY runs in the session's
     /// `project_path`, which is the directory Claude keys its transcript on.
-    pub fn new(session: Session, resume: bool, theme: Theme, git_enabled: bool, metrics_enabled: bool) -> Self {
+    pub fn new(
+        session: Session,
+        resume: bool,
+        theme: Theme,
+        git_enabled: bool,
+        metrics_enabled: bool,
+        show_footer: bool,
+        show_title: bool,
+        border_style: BorderStyle,
+        side_width: SideWidth,
+    ) -> Self {
         let cwd = session.project_path.clone();
         let git = git::load(&cwd);
         // Watch Claude's transcript for this project to surface live token usage.
@@ -100,6 +124,10 @@ impl WorkspaceState {
             focus: Panel::Claude,
             git_enabled,
             metrics_enabled,
+            show_footer,
+            show_title,
+            border_style,
+            side_width,
             git,
             pty,
             pty_error,
@@ -107,6 +135,8 @@ impl WorkspaceState {
             leader_pending: false,
             last_pty_size: Cell::new((24, 80)),
             last_git_refresh: Instant::now(),
+            opened_at: Instant::now(),
+            claude_awake: Cell::new(false),
         }
     }
 
@@ -134,6 +164,13 @@ impl WorkspaceState {
             self.session.tokens_used = total;
         }
         let _ = self.session.touch();
+    }
+
+    /// Whether Claude has started painting (its PTY produced output). Used by
+    /// the loading transition to know when to reveal the workspace. With no PTY
+    /// there's nothing to wait for, so this reports ready.
+    pub fn pty_has_output(&self) -> bool {
+        self.pty.as_ref().map_or(true, |p| p.has_output())
     }
 
     /// Forward a key event to the embedded process (no-op without a PTY).
@@ -183,14 +220,24 @@ impl WorkspaceState {
         panels
     }
 
-    /// Cycle focus to the next enabled pane, skipping disabled ones.
+    /// Give keyboard focus to `panel` directly, if it's currently enabled
+    /// (Claude always is). Bound to Ctrl+1/2/3 so the user can jump between
+    /// panes directly — where the terminal delivers those keys.
+    pub fn focus_panel(&mut self, panel: Panel) {
+        if self.enabled_panels().contains(&panel) {
+            self.focus = panel;
+        }
+    }
+
+    /// Cycle focus to the next enabled pane, skipping disabled ones. The
+    /// universal fallback (Tab) for terminals that don't deliver Ctrl+1/2/3.
     pub fn focus_next(&mut self) {
         let panels = self.enabled_panels();
         let i = panels.iter().position(|&p| p == self.focus).unwrap_or(0);
         self.focus = panels[(i + 1) % panels.len()];
     }
 
-    /// Cycle focus to the previous enabled pane, skipping disabled ones.
+    /// Cycle focus to the previous enabled pane, skipping disabled ones (BackTab).
     pub fn focus_prev(&mut self) {
         let panels = self.enabled_panels();
         let i = panels.iter().position(|&p| p == self.focus).unwrap_or(0);
@@ -203,6 +250,7 @@ impl WorkspaceState {
         if !self.git_enabled && self.focus == Panel::Git {
             self.focus = Panel::Claude;
         }
+        self.persist_panels();
     }
 
     /// Toggle the Metrics pane. If it was focused while being hidden, focus Claude.
@@ -211,6 +259,19 @@ impl WorkspaceState {
         if !self.metrics_enabled && self.focus == Panel::Metrics {
             self.focus = Panel::Claude;
         }
+        self.persist_panels();
+    }
+
+    /// Save the panel-visibility choice to disk *immediately*, so it survives
+    /// even when the terminal is closed without a clean quit (which kills the
+    /// process before the exit-time save runs). Loads the existing config first
+    /// so the theme and update-check cache (last_update_check / latest_seen) are
+    /// preserved rather than reset.
+    fn persist_panels(&self) {
+        let mut config = Config::load();
+        config.git_enabled = self.git_enabled;
+        config.metrics_enabled = self.metrics_enabled;
+        let _ = config.save();
     }
 }
 
@@ -222,59 +283,140 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
     // Paint the whole background first.
     frame.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
-    // Vertical sections: title bar, the three panes, footer.
+    // Vertical sections: title bar, the three panes, footer. The title and
+    // footer rows collapse to zero height when hidden (Settings → Title bar /
+    // Footer hints), giving those lines back to the panes.
+    let title_height = if state.show_title { 1 } else { 0 };
+    let footer_height = if state.show_footer { 1 } else { 0 };
     let rows = Layout::vertical([
-        Constraint::Length(1), // title bar
-        Constraint::Min(3),    // panes
-        Constraint::Length(1), // footer hints
+        Constraint::Length(title_height),  // title bar
+        Constraint::Min(3),                // panes
+        Constraint::Length(footer_height), // footer hints
     ])
     .split(area);
 
-    render_title(frame, rows[0], state, &pal);
+    if state.show_title {
+        render_title(frame, rows[0], state, &pal);
+    }
 
-    // Columns adapt to which panes are enabled: each side pane takes 25%, the
-    // Claude pane absorbs the rest (50% with both, 75% with one, 100% alone).
+    // Columns adapt to which panes are enabled: each side pane takes the
+    // configured width (Settings → Side width), Claude absorbs the rest.
+    let side = state.side_width.percent();
     let side_panes = state.git_enabled as u16 + state.metrics_enabled as u16;
-    let claude_width = 100 - 25 * side_panes;
+    let claude_width = 100 - side * side_panes;
 
     let mut constraints = Vec::with_capacity(3);
     let mut order = Vec::with_capacity(3);
     if state.git_enabled {
-        constraints.push(Constraint::Percentage(25));
+        constraints.push(Constraint::Percentage(side));
         order.push(Panel::Git);
     }
     constraints.push(Constraint::Percentage(claude_width));
     order.push(Panel::Claude);
     if state.metrics_enabled {
-        constraints.push(Constraint::Percentage(25));
+        constraints.push(Constraint::Percentage(side));
         order.push(Panel::Metrics);
     }
 
     let cols = Layout::horizontal(constraints).split(rows[1]);
     for (col, panel) in cols.iter().zip(order) {
         let focused = state.focus == panel;
+        // Only the side panes (Git, Metrics) are framed; the Claude pane stays
+        // borderless so the embedded terminal blends in, keeping the same spacing
+        // via padding.
         match panel {
-            Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git),
+            Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git, state.border_style.border_type()),
             Panel::Claude => render_claude_pane(frame, *col, &pal, focused, state),
             Panel::Metrics => render_metrics_pane(frame, *col, &pal, focused, state),
         }
     }
 
-    render_footer(frame, rows[2], &pal, state);
+    if state.show_footer {
+        render_footer(frame, rows[2], &pal, state);
+    }
+}
+
+/// Build a pane's surrounding block. With borders on it's a rounded box whose
+/// edge is the accent color when focused; with borders off (Settings → Borders)
+/// it drops the lines entirely and keeps just the title, padding the content
+/// down one row so it doesn't sit under the title.
+fn pane_block<'a>(
+    pal: &Palette,
+    title: &'a str,
+    focused: bool,
+    bordered: bool,
+    border_type: BorderType,
+) -> Block<'a> {
+    let mut block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(pal.bg));
+    if bordered {
+        let edge = if focused { pal.accent } else { pal.dim };
+        block = block
+            .borders(Borders::ALL)
+            .border_type(border_type)
+            .border_style(Style::default().fg(edge));
+    } else {
+        // Borderless (the Claude pane): pad two cells left/right so it breathes a
+        // bit more from the framed side panes, and one top/bottom to line its
+        // content up with their bordered inner area.
+        block = block.padding(Padding::new(2, 2, 1, 1));
+    }
+    block
+}
+
+/// How long Claude's PTY output must stay quiet before we consider it "awake"
+/// and reveal the pane. Long enough to span the bursts and pauses of its boot,
+/// so the waking overlay stays up until Claude is really at its prompt.
+const WAKE_SETTLE: Duration = Duration::from_millis(700);
+/// Hard cap on the waking overlay, so the pane reveals even if Claude keeps
+/// emitting output and never goes quiet.
+const WAKE_MAX: Duration = Duration::from_secs(10);
+
+/// Pixel-style spinner frames for the "waking Claude" overlay.
+const WAKE_SPINNER: [&str; 8] = [
+    "▰ ▱ ▱ ▱ ▱",
+    "▱ ▰ ▱ ▱ ▱",
+    "▱ ▱ ▰ ▱ ▱",
+    "▱ ▱ ▱ ▰ ▱",
+    "▱ ▱ ▱ ▱ ▰",
+    "▱ ▱ ▱ ▰ ▱",
+    "▱ ▱ ▰ ▱ ▱",
+    "▱ ▰ ▱ ▱ ▱",
+];
+
+/// Centered "Bruce is waking Claude up…" message plus a pixel spinner, shown in
+/// the Claude pane while its process finishes its initial paint. `opened_at`
+/// drives the spinner frame.
+fn render_waking(frame: &mut Frame, area: Rect, pal: &Palette, opened_at: Instant) {
+    if area.height == 0 {
+        return;
+    }
+    let mid = area.y + area.height.saturating_sub(2) / 2;
+    frame.render_widget(
+        Paragraph::new("Bruce is waking Claude up…")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(pal.fg).bg(pal.bg).add_modifier(Modifier::BOLD)),
+        Rect { x: area.x, y: mid, width: area.width, height: 1 },
+    );
+    let spin_y = mid + 2;
+    if spin_y < area.y + area.height {
+        let tick = (opened_at.elapsed().as_millis() / 110) as usize;
+        frame.render_widget(
+            Paragraph::new(WAKE_SPINNER[tick % WAKE_SPINNER.len()])
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+            Rect { x: area.x, y: spin_y, width: area.width, height: 1 },
+        );
+    }
 }
 
 /// Render the Claude pane: the embedded terminal's emulated screen.
 fn render_claude_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
-    let border_color = if focused { pal.accent } else { pal.dim };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            " Claude Code ",
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(pal.bg));
+    let block = pane_block(pal, " Claude Code ", focused, false, BorderType::Rounded);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -294,16 +436,40 @@ fn render_claude_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: boo
         state.last_pty_size.set(size);
     }
 
+    // While Claude is still booting, cover its half-painted screen with a waking
+    // overlay until it has produced output *and* gone quiet for WAKE_SETTLE —
+    // long enough to mean "finished its initial paint", not just a mid-boot
+    // pause. A hard cap (WAKE_MAX) guarantees the pane reveals even if Claude
+    // never fully settles. Once revealed it latches, so it never returns.
+    if !state.claude_awake.get() {
+        let booted = pty.has_output() && pty.output_quiet(WAKE_SETTLE);
+        if booted || state.opened_at.elapsed() >= WAKE_MAX {
+            state.claude_awake.set(true);
+        } else {
+            render_waking(frame, inner, pal, state.opened_at);
+            return;
+        }
+    }
+
     if let Some(parser) = pty.lock_parser() {
         let screen = parser.screen();
         frame.render_widget(
             Paragraph::new(pty_screen_lines(screen, pal)).style(Style::default().bg(pal.bg)),
             inner,
         );
-        // The child (Claude Code) renders its own cursor inside its input box, so
-        // we deliberately don't place the host terminal cursor here. Repositioning
-        // it every frame made it visibly fly across the pane while Claude streamed
-        // output — redundant and distracting.
+        // Show the child's cursor only while the pane is focused, the child
+        // isn't hiding it, we're at the live bottom (not paging through history),
+        // and output has gone idle. The idle check is the key one: it keeps the
+        // cursor visible while you type a prompt but hides it while a response
+        // streams, so it no longer flies across the pane mid-generation.
+        if focused
+            && !screen.hide_cursor()
+            && screen.scrollback() == 0
+            && pty.output_idle()
+        {
+            let (row, col) = screen.cursor_position();
+            frame.set_cursor_position((inner.x + col, inner.y + row));
+        }
     }
 }
 
@@ -384,21 +550,12 @@ fn conv_color(color: vt100::Color, fallback: Color) -> Color {
 
 /// Render the Git pane: branches, recent commits and the working tree as titled
 /// sections, plus a pinned stats footer (ahead/behind/staged/unstaged).
-fn render_git_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, view: &GitView) {
+fn render_git_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, view: &GitView, border_type: BorderType) {
     let title = match view {
         GitView::Repo(info) => format!(" git · {} ", info.branch),
         _ => " git ".to_string(),
     };
-    let border_color = if focused { pal.accent } else { pal.dim };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            title.as_str(),
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(pal.bg));
+    let block = pane_block(pal, title.as_str(), focused, true, border_type);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -566,16 +723,7 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
 
 /// Render the Metrics pane: live token usage parsed from Claude's transcript.
 fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
-    let border_color = if focused { pal.accent } else { pal.dim };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            " Metrics ",
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(pal.bg));
+    let block = pane_block(pal, " Metrics ", focused, true, state.border_style.border_type());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -614,14 +762,18 @@ fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bo
     lines.push(dim_line(pal, &format!(" {}", model_short(&m.model))));
     lines.push(Line::raw(""));
 
-    // ── usage sparkline ──
-    section_header(&mut lines, pal, "uso · sesión", width);
-    let series: Vec<u64> = m.series.iter().map(|(_, v)| *v).collect();
-    lines.push(Line::from(Span::styled(
-        format!(" {}", spark(&series, width.saturating_sub(2))),
-        Style::default().fg(pal.accent),
-    )));
-    lines.push(dim_line(pal, " output / turno"));
+    // ── active MCP servers (those exercised this session) ──
+    section_header(&mut lines, pal, "mcp · activos", width);
+    if m.mcp_servers.is_empty() {
+        lines.push(dim_line(pal, " —"));
+    } else {
+        for server in &m.mcp_servers {
+            lines.push(Line::from(vec![
+                Span::styled(" ● ", Style::default().fg(pal.added)),
+                Span::styled(server.clone(), Style::default().fg(pal.fg)),
+            ]));
+        }
+    }
     lines.push(Line::raw(""));
 
     // ── current session ──
@@ -675,22 +827,6 @@ fn bar_line<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, pct: u64
         Span::styled("█".repeat(filled), Style::default().fg(color)),
         Span::styled("░".repeat(cells.saturating_sub(filled)), Style::default().fg(pal.dim)),
     ]));
-}
-
-/// A unicode block sparkline of the most recent `width` samples.
-fn spark(series: &[u64], width: usize) -> String {
-    if series.is_empty() || width == 0 {
-        return String::new();
-    }
-    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let tail: Vec<u64> = series.iter().rev().take(width).rev().copied().collect();
-    let max = tail.iter().copied().max().unwrap_or(1).max(1);
-    tail.iter()
-        .map(|&v| {
-            let idx = (v.saturating_mul(bars.len() as u64 - 1) / max) as usize;
-            bars[idx.min(bars.len() - 1)]
-        })
-        .collect()
 }
 
 /// Human-friendly elapsed time: `2h 5m`, `5m 12s`, `42s`.
@@ -759,19 +895,23 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
             txt(" quit"),
         ])
     } else if state.focus == Panel::Claude && state.pty.is_some() {
-        // Typing flows to Claude; control keys live behind the leader.
+        // Typing flows to Claude; control keys stay on Ctrl-chords.
         Line::from(vec![
             txt("  typing → Claude    "),
+            key("Ctrl+1/2/3"),
+            txt(" panes    "),
             key("Shift+PgUp/PgDn"),
             txt(" scroll    "),
             key("Ctrl+b"),
-            txt(" leader (then b/Tab/g/m/q)"),
+            txt(" leader (Tab/b/g/m/q)"),
         ])
     } else {
         // Side pane focused: direct navigation.
         Line::from(vec![
-            key("  Tab"),
-            txt(" switch   "),
+            key("  Ctrl+1/2/3"),
+            txt(" / "),
+            key("Tab"),
+            txt(" panes   "),
             key("^g"),
             txt(" git   "),
             key("^m"),

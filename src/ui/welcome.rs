@@ -5,6 +5,7 @@
 //! *rendering* ([`render`]). For step 1 the session list is hardcoded; it will
 //! be replaced by real persisted sessions once the `session` module lands.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,19 +15,17 @@ use ratatui::{
     layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph},
 };
 
 use crate::config::Config;
 use crate::session::{self, Session};
-use crate::ui::theme::{Palette, Theme};
+use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 use crate::update;
 
 /// Re-check for a new release at most this often (seconds): once a day.
 const UPDATE_CHECK_TTL: i64 = 24 * 60 * 60;
 
-/// Labels for the App block, in display order (index = `app_selected`).
-const APP_LABELS: [&str; 2] = [" ⟳ Check for updates", " ⬆ Update to latest"];
 
 /// ASCII banner rendered at the top of the welcome screen.
 ///
@@ -47,21 +46,76 @@ const LOGO: &str = r#"
 
 /// Labels for the Options block, in display order. The index of each entry is
 /// what [`WelcomeState::option_selected`] points at.
-const OPTION_LABELS: [&str; 4] = [
+const OPTION_LABELS: [&str; 7] = [
+    " ▸ Open session",
     " + New session",
     " ✎ Rename session",
     " ⧉ Duplicate session",
     " ✕ Delete session",
+    " ⟳ Check for updates",
+    " ⬆ Update to latest",
 ];
 
 /// Which panel currently has keyboard focus. `Tab` cycles through them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Options,
-    App,
-    Sessions,
-    Themes,
+    Settings,
+    Documentation,
 }
+
+/// Documentation-block rows, in display order (index = `doc_selected`).
+const DOC_LABELS: [&str; 2] = [" ↗ GitHub", " ≡ Keybindings"];
+
+/// Every keybinding, shown in the Documentation → Keybindings dialog as
+/// `(key, description)` rows. An empty key with a non-empty description is a
+/// section header; a fully empty entry is a blank spacer.
+const KEYBINDINGS: &[(&str, &str)] = &[
+    ("", "Welcome"),
+    ("Tab / Shift+Tab", "Move focus between blocks"),
+    ("↑ / ↓", "Select a row · cycle the theme"),
+    ("Enter", "Run the selected option"),
+    ("N", "Jump to “New session”"),
+    ("Click author", "Open the author’s GitHub"),
+    ("q / Q / Esc", "Quit Bruce"),
+    ("", ""),
+    ("Session picker (open / rename / duplicate / delete)", ""),
+    ("type", "Filter the session list"),
+    ("↑ / ↓", "Move the selection"),
+    ("Enter", "Confirm the action"),
+    ("Y / N", "Confirm / cancel a delete"),
+    ("Esc", "Close the picker"),
+    ("", ""),
+    ("Workspace — side pane focused (Git / Metrics)", ""),
+    ("Ctrl+1 / Ctrl+2 / Ctrl+3", "Focus Git / Claude / Metrics"),
+    ("Tab / Shift+Tab", "Cycle panes"),
+    ("Ctrl+g / Ctrl+m", "Toggle the Git / Metrics pane"),
+    ("Shift+PgUp / Shift+PgDn", "Scroll Claude’s history"),
+    ("Esc", "Back to the welcome screen"),
+    ("q / Q", "Quit Bruce"),
+    ("", ""),
+    ("Workspace — Claude focused", ""),
+    ("type", "Send keystrokes to Claude"),
+    ("Ctrl+1 / Ctrl+2 / Ctrl+3", "Focus Git / Claude / Metrics"),
+    ("Shift+PgUp / Shift+PgDn", "Scroll Claude’s history"),
+    ("Ctrl+b", "Leader — then one of:"),
+    ("Ctrl+b  b", "Back to the welcome screen"),
+    ("Ctrl+b  Tab", "Switch pane"),
+    ("Ctrl+b  g / m", "Toggle the Git / Metrics pane"),
+    ("Ctrl+b  q", "Quit Bruce"),
+];
+
+/// Settings-block rows, in display order (index = `settings_selected`). Each
+/// toggles a persisted look preference; the on/off value is read live from
+/// state, not from this label.
+const SETTINGS_LABELS: [&str; 6] = [
+    "Theme",
+    "Terminal colors",
+    "Border style",
+    "Side width",
+    "Title bar",
+    "Footer hints",
+];
 
 /// Outcome of routing a key to an open dialog.
 ///
@@ -72,6 +126,8 @@ pub enum WelcomeEvent {
     None,
     /// The user confirmed the new-session form; open a workspace with this name.
     CreateSession { name: String },
+    /// The user picked a session to open from the Open-session picker; resume it.
+    OpenSession(Session),
     /// The user asked to auto-update; run this argv after tearing down the TUI.
     RunUpdate(Vec<String>),
 }
@@ -96,11 +152,17 @@ pub enum Dialog {
     Picker(SessionPicker),
     /// "Update to latest" info: how to update + open the releases page.
     UpdateInfo,
+    /// Scrollable list of every keybinding; the `u16` is the scroll offset.
+    Keybindings(u16),
+    /// Theme selector; the `usize` is the highlighted theme's index in
+    /// [`Theme::ALL`]. Moving previews (and persists) the theme live.
+    ThemePicker(usize),
 }
 
 /// Which action the [`SessionPicker`] performs on the chosen session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerAction {
+    Open,
     Rename,
     Duplicate,
     Delete,
@@ -110,6 +172,7 @@ impl PickerAction {
     /// Lowercase verb for footer hints (e.g. "rename").
     fn verb(self) -> &'static str {
         match self {
+            PickerAction::Open => "open",
             PickerAction::Rename => "rename",
             PickerAction::Duplicate => "duplicate",
             PickerAction::Delete => "delete",
@@ -119,6 +182,7 @@ impl PickerAction {
     /// Title shown on the picker dialog's border.
     fn title(self) -> &'static str {
         match self {
+            PickerAction::Open => " Open session ",
             PickerAction::Rename => " Rename session ",
             PickerAction::Duplicate => " Duplicate session ",
             PickerAction::Delete => " Delete session ",
@@ -177,10 +241,13 @@ pub struct WelcomeState {
     pub focus: Focus,
     /// Selected row within the Options block.
     pub option_selected: usize,
-    /// Selected row within the App block.
-    pub app_selected: usize,
-    /// Selected row within the Sessions block.
-    pub session_selected: usize,
+    /// Selected row within the Settings block.
+    pub settings_selected: usize,
+    /// Selected row within the Documentation block.
+    pub doc_selected: usize,
+    /// Screen rectangle of the clickable author link in the tagline, recorded at
+    /// render time so the event loop can hit-test mouse clicks against it.
+    pub name_link: Cell<Rect>,
     /// Active color theme (restored from saved preferences).
     pub theme: Theme,
     /// Whether new/opened sessions start with the Git panel shown. Restored
@@ -188,6 +255,16 @@ pub struct WelcomeState {
     pub git_enabled: bool,
     /// Whether new/opened sessions start with the Metrics panel shown.
     pub metrics_enabled: bool,
+    /// Repaint the terminal fg/bg to match the theme via OSC (Settings toggle).
+    pub sync_colors: bool,
+    /// Show the workspace footer hint bar (Settings block toggle).
+    pub show_footer: bool,
+    /// Show the workspace top title bar (Settings toggle).
+    pub show_title: bool,
+    /// Line style for the framed side panes (Settings option).
+    pub border_style: BorderStyle,
+    /// Width of each side pane (Settings option).
+    pub side_width: SideWidth,
     /// Result of the version check (drives the badge and the App block).
     pub update_status: UpdateStatus,
     /// In-flight background update check; consumed once it finishes.
@@ -229,11 +306,17 @@ impl WelcomeState {
             project_path,
             focus: Focus::Options,
             option_selected: 0,
-            app_selected: 0,
-            session_selected: 0,
+            settings_selected: 0,
+            doc_selected: 0,
+            name_link: Cell::new(Rect::ZERO),
             theme: config.theme,
             git_enabled: config.git_enabled,
             metrics_enabled: config.metrics_enabled,
+            sync_colors: config.sync_colors,
+            show_footer: config.show_footer,
+            show_title: config.show_title,
+            border_style: config.border_style,
+            side_width: config.side_width,
             update_status,
             update_check,
             last_update_check: config.last_update_check,
@@ -275,6 +358,22 @@ impl WelcomeState {
         self.update_check = Some(update::Check::spawn());
     }
 
+    /// Handle a mouse click at screen cell `(col, row)`. Opens the author's
+    /// GitHub profile when the click lands on the tagline link. Returns whether
+    /// the click was on the link (so the caller knows it was handled).
+    pub fn click(&self, col: u16, row: u16) -> bool {
+        let r = self.name_link.get();
+        let hit = r.width > 0
+            && col >= r.x
+            && col < r.x + r.width
+            && row >= r.y
+            && row < r.y + r.height;
+        if hit {
+            update::open_in_browser(AUTHOR_URL);
+        }
+        hit
+    }
+
     /// The newer version available, if any (drives the badge).
     pub fn available_version(&self) -> Option<&str> {
         match &self.update_status {
@@ -293,27 +392,28 @@ impl WelcomeState {
             metrics_enabled: self.metrics_enabled,
             last_update_check: self.last_update_check,
             latest_seen: self.latest_seen.clone(),
+            sync_colors: self.sync_colors,
+            show_footer: self.show_footer,
+            show_title: self.show_title,
+            border_style: self.border_style,
+            side_width: self.side_width,
         }
         .save();
     }
 
-    /// Reload this project's session list from disk, clamping the selection to
-    /// the new length. Called when returning from a workspace so a freshly
-    /// created or just-used session shows up with up-to-date metrics.
+    /// Reload this project's session list from disk. Called when returning from a
+    /// workspace so a freshly created or just-used session shows up (with
+    /// up-to-date metrics) in the Open-session picker.
     pub fn reload_sessions(&mut self) {
         self.sessions = session::load_for_project(&self.project_path).unwrap_or_default();
-        if self.session_selected >= self.sessions.len() {
-            self.session_selected = self.sessions.len().saturating_sub(1);
-        }
     }
 
-    /// Cycle focus across the Options, Sessions and Themes panels.
+    /// Cycle focus across the Options, Settings and Documentation panels.
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
-            Focus::Options => Focus::App,
-            Focus::App => Focus::Sessions,
-            Focus::Sessions => Focus::Themes,
-            Focus::Themes => Focus::Options,
+            Focus::Options => Focus::Settings,
+            Focus::Settings => Focus::Documentation,
+            Focus::Documentation => Focus::Options,
         };
     }
 
@@ -325,20 +425,13 @@ impl WelcomeState {
                 let n = OPTION_LABELS.len();
                 self.option_selected = (self.option_selected + n - 1) % n;
             }
-            Focus::App => {
-                let n = APP_LABELS.len();
-                self.app_selected = (self.app_selected + n - 1) % n;
+            Focus::Settings => {
+                let n = SETTINGS_LABELS.len();
+                self.settings_selected = (self.settings_selected + n - 1) % n;
             }
-            Focus::Sessions => {
-                let n = self.sessions.len();
-                if n > 0 {
-                    self.session_selected = (self.session_selected + n - 1) % n;
-                }
-            }
-            Focus::Themes => {
-                self.theme = self.theme.prev();
-                // Remember the theme choice immediately.
-                self.persist_config();
+            Focus::Documentation => {
+                let n = DOC_LABELS.len();
+                self.doc_selected = (self.doc_selected + n - 1) % n;
             }
         }
     }
@@ -351,63 +444,147 @@ impl WelcomeState {
                 let n = OPTION_LABELS.len();
                 self.option_selected = (self.option_selected + 1) % n;
             }
-            Focus::App => {
-                let n = APP_LABELS.len();
-                self.app_selected = (self.app_selected + 1) % n;
+            Focus::Settings => {
+                let n = SETTINGS_LABELS.len();
+                self.settings_selected = (self.settings_selected + 1) % n;
             }
-            Focus::Sessions => {
-                let n = self.sessions.len();
-                if n > 0 {
-                    self.session_selected = (self.session_selected + 1) % n;
-                }
-            }
-            Focus::Themes => {
-                self.theme = self.theme.next();
-                // Remember the theme choice immediately.
-                self.persist_config();
+            Focus::Documentation => {
+                let n = DOC_LABELS.len();
+                self.doc_selected = (self.doc_selected + 1) % n;
             }
         }
     }
 
-    /// True when the Sessions panel has focus (used to gate Enter→open).
-    pub fn on_session(&self) -> bool {
-        self.focus == Focus::Sessions
+    /// True when the "Open session" option is selected.
+    pub fn on_open_session(&self) -> bool {
+        self.focus == Focus::Options && self.option_selected == 0
     }
 
     /// Focus the Options block on the "New session" row (the `N` shortcut).
     pub fn focus_new_session(&mut self) {
         self.focus = Focus::Options;
-        self.option_selected = 0;
+        self.option_selected = 1;
     }
 
     /// True when the "New session" option is selected.
     pub fn on_new_session(&self) -> bool {
-        self.focus == Focus::Options && self.option_selected == 0
+        self.focus == Focus::Options && self.option_selected == 1
     }
 
     /// True when the "Rename session" option is selected.
     pub fn on_rename(&self) -> bool {
-        self.focus == Focus::Options && self.option_selected == 1
+        self.focus == Focus::Options && self.option_selected == 2
     }
 
     /// True when the "Duplicate session" option is selected.
     pub fn on_duplicate(&self) -> bool {
-        self.focus == Focus::Options && self.option_selected == 2
+        self.focus == Focus::Options && self.option_selected == 3
     }
 
     /// True when the "Delete session" option is selected.
     pub fn on_delete(&self) -> bool {
-        self.focus == Focus::Options && self.option_selected == 3
+        self.focus == Focus::Options && self.option_selected == 4
     }
 
-    /// True when the App block's "Check for updates" row is selected.
-    pub fn on_app_check(&self) -> bool {
-        self.focus == Focus::App && self.app_selected == 0
+    /// True when the "Check for updates" option is selected.
+    pub fn on_check_updates(&self) -> bool {
+        self.focus == Focus::Options && self.option_selected == 5
     }
 
-    /// True when the App block's "Update to latest" row is selected.
-    pub fn on_app_update(&self) -> bool {
-        self.focus == Focus::App && self.app_selected == 1
+    /// True when the "Update to latest" option is selected.
+    pub fn on_update_latest(&self) -> bool {
+        self.focus == Focus::Options && self.option_selected == 6
+    }
+
+    /// True when the Documentation "GitHub" row is selected.
+    pub fn on_doc_github(&self) -> bool {
+        self.focus == Focus::Documentation && self.doc_selected == 0
+    }
+
+    /// True when the Documentation "Keybindings" row is selected.
+    pub fn on_doc_keys(&self) -> bool {
+        self.focus == Focus::Documentation && self.doc_selected == 1
+    }
+
+    /// Open the project's GitHub repository in the browser.
+    pub fn open_github(&self) {
+        update::open_in_browser(PROJECT_URL);
+    }
+
+    /// Open the keybindings reference dialog, scrolled to the top.
+    pub fn open_keybindings(&mut self) {
+        self.dialog = Some(Dialog::Keybindings(0));
+    }
+
+    /// Scroll the keybindings dialog by `delta` lines, clamped to its contents.
+    fn scroll_keybindings(&mut self, delta: i32) {
+        if let Some(Dialog::Keybindings(off)) = &mut self.dialog {
+            let max = KEYBINDINGS.len().saturating_sub(1) as i32;
+            *off = (*off as i32 + delta).clamp(0, max) as u16;
+        }
+    }
+
+    /// True when the Settings block has focus (gates Enter→toggle).
+    pub fn on_settings(&self) -> bool {
+        self.focus == Focus::Settings
+    }
+
+    /// The Settings rows as (label, current value text), in display order.
+    /// The Theme row shows the active theme's name; booleans read as on/off;
+    /// multi-value options show their current label.
+    pub fn settings_rows(&self) -> [(&'static str, String); 6] {
+        let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+        [
+            (SETTINGS_LABELS[0], self.theme.palette().name.to_string()),
+            (SETTINGS_LABELS[1], on_off(self.sync_colors)),
+            (SETTINGS_LABELS[2], self.border_style.label().to_string()),
+            (SETTINGS_LABELS[3], self.side_width.label().to_string()),
+            (SETTINGS_LABELS[4], on_off(self.show_title)),
+            (SETTINGS_LABELS[5], on_off(self.show_footer)),
+        ]
+    }
+
+    /// True when the Settings block's "Theme" row is selected (it opens the
+    /// theme picker on Enter instead of toggling like the other rows).
+    pub fn on_settings_theme(&self) -> bool {
+        self.focus == Focus::Settings && self.settings_selected == 0
+    }
+
+    /// Advance the selected setting (toggle a boolean, cycle a multi-value) and
+    /// persist immediately. The Theme row (index 0) is handled separately via the
+    /// picker, so it's a no-op here.
+    pub fn toggle_setting(&mut self) {
+        match self.settings_selected {
+            1 => self.sync_colors = !self.sync_colors,
+            2 => self.border_style = self.border_style.next(),
+            3 => self.side_width = self.side_width.next(),
+            4 => self.show_title = !self.show_title,
+            5 => self.show_footer = !self.show_footer,
+            _ => {}
+        }
+        self.persist_config();
+    }
+
+    /// Open the theme picker, highlighting the active theme.
+    pub fn open_theme_picker(&mut self) {
+        let idx = Theme::ALL.iter().position(|&t| t == self.theme).unwrap_or(0);
+        self.dialog = Some(Dialog::ThemePicker(idx));
+    }
+
+    /// Move the theme picker by `delta`, wrapping, and apply+persist the previewed
+    /// theme live (like the old Themes block did).
+    fn move_theme_picker(&mut self, delta: i32) {
+        let n = Theme::ALL.len() as i32;
+        let new_idx = if let Some(Dialog::ThemePicker(idx)) = &mut self.dialog {
+            *idx = (*idx as i32 + delta).rem_euclid(n) as usize;
+            Some(*idx)
+        } else {
+            None
+        };
+        if let Some(idx) = new_idx {
+            self.theme = Theme::ALL[idx];
+            self.persist_config();
+        }
     }
 
     /// Open the "Update to latest" info dialog.
@@ -436,10 +613,7 @@ impl WelcomeState {
     pub fn dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
         match self.dialog {
             Some(Dialog::NewSession(_)) => self.new_session_key(code),
-            Some(Dialog::Picker(_)) => {
-                self.picker_key(code);
-                WelcomeEvent::None
-            }
+            Some(Dialog::Picker(_)) => self.picker_key(code),
             Some(Dialog::UpdateInfo) => {
                 match code {
                     KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -464,21 +638,40 @@ impl WelcomeState {
                     _ => WelcomeEvent::None,
                 }
             }
+            Some(Dialog::Keybindings(_)) => {
+                match code {
+                    KeyCode::Up => self.scroll_keybindings(-1),
+                    KeyCode::Down => self.scroll_keybindings(1),
+                    KeyCode::Esc | KeyCode::Enter => self.dialog = None,
+                    _ => {}
+                }
+                WelcomeEvent::None
+            }
+            Some(Dialog::ThemePicker(_)) => {
+                match code {
+                    KeyCode::Up => self.move_theme_picker(-1),
+                    KeyCode::Down => self.move_theme_picker(1),
+                    KeyCode::Esc | KeyCode::Enter => self.dialog = None,
+                    _ => {}
+                }
+                WelcomeEvent::None
+            }
             None => WelcomeEvent::None,
         }
     }
 
-    /// Session-picker key handling for all three actions.
+    /// Session-picker key handling for all four actions.
     ///
     /// Browse: characters/backspace edit the query (resetting the cursor),
     /// Up/Down move within the filtered results, Enter acts on the selection
-    /// (rename → edit name, duplicate → fork now, delete → confirm), Esc closes.
-    /// The follow-up steps (edit name / confirm) handle their own keys.
-    fn picker_key(&mut self, code: KeyCode) {
+    /// (open → resume it, rename → edit name, duplicate → fork now, delete →
+    /// confirm), Esc closes. Returns [`WelcomeEvent::OpenSession`] when the user
+    /// picks a session to open; otherwise [`WelcomeEvent::None`].
+    fn picker_key(&mut self, code: KeyCode) -> WelcomeEvent {
         // Snapshot the picker state so terminal actions (which mutate the session
         // list and reload) don't fight the borrow on `self.dialog`.
         let Some(Dialog::Picker(p)) = &self.dialog else {
-            return;
+            return WelcomeEvent::None;
         };
         let action = p.action;
         let selected = p.selected;
@@ -498,9 +691,16 @@ impl WelcomeState {
                     KeyCode::Esc => self.dialog = None,
                     KeyCode::Enter => {
                         let Some(&target) = results.get(selected) else {
-                            return;
+                            return WelcomeEvent::None;
                         };
                         match action {
+                            PickerAction::Open => {
+                                let session = self.sessions.get(target).cloned();
+                                self.dialog = None;
+                                if let Some(s) = session {
+                                    return WelcomeEvent::OpenSession(s);
+                                }
+                            }
                             PickerAction::Rename => {
                                 let name = self
                                     .sessions
@@ -565,6 +765,7 @@ impl WelcomeState {
                 _ => {}
             },
         }
+        WelcomeEvent::None
     }
 
     /// Set the picker's selected result (no-op if the picker isn't open).
@@ -639,37 +840,46 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     // Paint the whole background first.
     frame.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
-    // Vertical sections: top margin, logo, Options block (full width), a row
-    // shared by Sessions + Themes, and the footer.
+    // Vertical sections: top margin (badge), logo, tagline, a spacer, the three
+    // blocks (Options, Settings, Themes) side by side, and the footer.
     let chunks = Layout::vertical([
         Constraint::Length(2),  // top margin (breathing room above the banner)
         Constraint::Length(10), // logo (9-line Delta Corps Priest 1 banner)
-        Constraint::Length(6),  // options block (4 rows + borders)
-        Constraint::Min(5),     // Sessions + Themes row
+        Constraint::Length(1),  // tagline
+        Constraint::Length(1),  // spacer between tagline and the blocks
+        Constraint::Min(8),     // blocks row
         Constraint::Length(1),  // footer hints
     ])
     .split(area);
 
-    // All four blocks share a common width: each row splits evenly so Options,
-    // App, Sessions and Themes line up at the same size.
-    let mid = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[3]);
-    let top = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[2]);
+    // One row, three equal blocks: Options, Settings, Documentation.
+    let cols = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
+    ])
+    .split(chunks[4]);
 
     render_badge(frame, chunks[0], state);
     render_logo(frame, chunks[1], state);
-    render_options(frame, top[0], state);
-    render_app(frame, top[1], state);
-    render_sessions(frame, mid[0], state);
-    render_themes(frame, mid[1], state);
-    render_footer(frame, chunks[4], state);
+    render_tagline(frame, chunks[2], state);
+    render_options(frame, cols[0], state);
+    render_settings(frame, cols[1], state);
+    render_documentation(frame, cols[2], state);
+    render_footer(frame, chunks[5], state);
 
-    // Dialogs are modal overlays drawn on top of everything.
+    // Dialogs are modal overlays. Dim everything behind them first so the screen
+    // recedes and focus lands on the modal (a terminal can't truly blur, so this
+    // mutes the background to the theme's dim color), then draw the modal crisp.
+    if state.dialog.is_some() {
+        dim_behind_dialog(frame, area, &pal);
+    }
     match &state.dialog {
         Some(Dialog::NewSession(d)) => render_new_session_dialog(frame, area, &pal, d),
         Some(Dialog::Picker(p)) => render_picker_dialog(frame, area, &pal, state, p),
         Some(Dialog::UpdateInfo) => render_update_info_dialog(frame, area, &pal, state),
+        Some(Dialog::Keybindings(off)) => render_keybindings_dialog(frame, area, &pal, *off),
+        Some(Dialog::ThemePicker(idx)) => render_theme_picker_dialog(frame, area, &pal, *idx),
         None => {}
     }
 }
@@ -680,7 +890,7 @@ fn render_badge(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         return;
     };
     let pal = state.theme.palette();
-    let text = format!(" ⬆ v{latest} available — App ▸ Update to latest ");
+    let text = format!(" ⬆ v{latest} available — Options ▸ Update to latest ");
     let badge = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default()
@@ -693,35 +903,104 @@ fn render_badge(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     frame.render_widget(badge, area);
 }
 
-/// The App block beside Options: application-level actions (updates).
-fn render_app(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+/// The Settings block: persisted look toggles (terminal color sync, footer/title
+/// bars, border style, side width). Each row shows its current value.
+fn render_settings(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let pal = state.theme.palette();
-    let focused = state.focus == Focus::App;
+    let focused = state.focus == Focus::Settings;
 
-    let items: Vec<ListItem> = APP_LABELS
-        .iter()
-        .map(|label| {
-            ListItem::new(Line::from(Span::styled(
-                *label,
+    // Interleave blank spacers between rows so they breathe like the Themes block.
+    let mut items: Vec<ListItem> = Vec::new();
+    for (label, value) in state.settings_rows() {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                format!(" {label}  "),
                 Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
-            )))
-        })
-        .collect();
+            ),
+            Span::styled(value, Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+        ])));
+        items.push(ListItem::new(Line::raw("")));
+    }
 
-    let title = match &state.update_status {
-        UpdateStatus::Checking => " App · checking… ".to_string(),
-        UpdateStatus::UpToDate => format!(" App · v{} (up to date) ", update::current()),
-        UpdateStatus::Available(v) => format!(" App · v{v} available "),
-        UpdateStatus::Idle => format!(" App · v{} ", update::current()),
-    };
-    let block = panel_block(&pal, &title, focused);
+    let block = panel_block(&pal, " Settings ", focused);
     let list = List::new(items)
         .block(block)
         .highlight_style(highlight_style(&pal));
 
     let mut list_state = ListState::default();
-    list_state.select(focused.then_some(state.app_selected));
+    // Rows sit at even indices (each is followed by a spacer).
+    list_state.select(focused.then_some(state.settings_selected * 2));
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// The Documentation block: a link to the project repo and the keybindings ref.
+fn render_documentation(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let pal = state.theme.palette();
+    let focused = state.focus == Focus::Documentation;
+
+    let mut items: Vec<ListItem> = Vec::new();
+    for label in DOC_LABELS {
+        items.push(ListItem::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        ))));
+        items.push(ListItem::new(Line::raw("")));
+    }
+
+    let block = panel_block(&pal, " Documentation ", focused);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style(&pal));
+
+    let mut list_state = ListState::default();
+    list_state.select(focused.then_some(state.doc_selected * 2));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Draw the keybindings reference: a scrollable, sectioned list of every key.
+fn render_keybindings_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, offset: u16) {
+    let area = centered_rect(74, 82, screen);
+    frame.render_widget(Clear, area);
+    let block = dialog_block(pal, " Keybindings ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = keybinding_lines(pal);
+    let height = inner.height as usize;
+    // Clamp the scroll so the last page can't scroll past the end into blank.
+    let off = (offset as usize).min(lines.len().saturating_sub(height));
+    let visible: Vec<Line> = lines.into_iter().skip(off).take(height).collect();
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().bg(pal.bg)),
+        inner,
+    );
+}
+
+/// Build one styled line per [`KEYBINDINGS`] entry: section headers in accent,
+/// rows as a left-aligned key plus a dim description, blanks as empty lines.
+fn keybinding_lines(pal: &Palette) -> Vec<Line<'static>> {
+    KEYBINDINGS
+        .iter()
+        .map(|(key, desc)| match (key.is_empty(), desc.is_empty()) {
+            (true, true) => Line::raw(""),
+            // A section header: either ("", title) or (title, "").
+            (true, false) => Line::from(Span::styled(
+                format!("  {desc}"),
+                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+            )),
+            (false, true) => Line::from(Span::styled(
+                format!("  {key}"),
+                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+            )),
+            (false, false) => Line::from(vec![
+                Span::styled(
+                    format!("  {key:<26}"),
+                    Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*desc).to_string(), Style::default().fg(pal.dim)),
+            ]),
+        })
+        .collect()
 }
 
 /// Draw the "Update to latest" info dialog: current/latest version and the
@@ -798,6 +1077,62 @@ fn render_update_info_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, sta
     );
 }
 
+/// Pixel-style spinner: a single lit block bouncing back and forth on a track.
+const SPINNER: [&str; 8] = [
+    "▰ ▱ ▱ ▱ ▱",
+    "▱ ▰ ▱ ▱ ▱",
+    "▱ ▱ ▰ ▱ ▱",
+    "▱ ▱ ▱ ▰ ▱",
+    "▱ ▱ ▱ ▱ ▰",
+    "▱ ▱ ▱ ▰ ▱",
+    "▱ ▱ ▰ ▱ ▱",
+    "▱ ▰ ▱ ▱ ▱",
+];
+
+/// Full-screen loading transition shown between the welcome and workspace
+/// screens while the chosen session's Claude process boots: a solid theme
+/// background, the Bruce wordmark centered, a status line and a pixel spinner.
+/// `tick` advances the spinner frame; the caller derives it from elapsed time.
+pub fn render_loading(frame: &mut Frame, theme: Theme, message: &str, tick: usize) {
+    let pal = theme.palette();
+    let area = frame.area();
+    frame.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
+
+    // Pad the banner to a uniform width so centered alignment shifts the whole
+    // block instead of staggering rows (same approach as render_logo).
+    let logo_lines: Vec<&str> = LOGO.trim_matches('\n').lines().collect();
+    let logo_h = logo_lines.len() as u16;
+    let width = logo_lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let banner = logo_lines
+        .iter()
+        .map(|l| format!("{:<width$}", l, width = width))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Vertically center the stack: logo, blank, message, blank, spinner.
+    let stack_h = logo_h + 4;
+    let top = area.y + area.height.saturating_sub(stack_h) / 2;
+
+    frame.render_widget(
+        Paragraph::new(banner)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(pal.accent).bg(pal.bg)),
+        Rect { x: area.x, y: top, width: area.width, height: logo_h },
+    );
+    frame.render_widget(
+        Paragraph::new(message.to_string())
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(pal.fg).add_modifier(Modifier::BOLD)),
+        Rect { x: area.x, y: top + logo_h + 1, width: area.width, height: 1 },
+    );
+    frame.render_widget(
+        Paragraph::new(SPINNER[tick % SPINNER.len()])
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(pal.accent).add_modifier(Modifier::BOLD)),
+        Rect { x: area.x, y: top + logo_h + 3, width: area.width, height: 1 },
+    );
+}
+
 fn render_logo(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let pal = state.theme.palette();
 
@@ -844,15 +1179,28 @@ fn render_options(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let pal = state.theme.palette();
     let focused = state.focus == Focus::Options;
 
-    let items: Vec<ListItem> = OPTION_LABELS
-        .iter()
-        .map(|label| {
-            ListItem::new(Line::from(Span::styled(
-                *label,
-                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
-            )))
-        })
-        .collect();
+    // Rows are interleaved with blank spacers so they breathe with the same
+    // rhythm as the Themes block.
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, label) in OPTION_LABELS.iter().enumerate() {
+        let mut spans = vec![Span::styled(
+            *label,
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        )];
+        // Inline update feedback on the two update rows (the old App block's job).
+        if i == 5 {
+            if let Some(s) = update_status_suffix(&state.update_status) {
+                spans.push(Span::styled(format!("  {s}"), Style::default().fg(pal.dim)));
+            }
+        } else if i == 6 {
+            spans.push(Span::styled(
+                format!("  v{}", update::current()),
+                Style::default().fg(pal.dim),
+            ));
+        }
+        items.push(ListItem::new(Line::from(spans)));
+        items.push(ListItem::new(Line::raw("")));
+    }
 
     let block = panel_block(&pal, " Options ", focused);
     let list = List::new(items)
@@ -860,94 +1208,97 @@ fn render_options(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         .highlight_style(highlight_style(&pal));
 
     let mut list_state = ListState::default();
-    // Only show the cursor when this panel has focus.
-    list_state.select(focused.then_some(state.option_selected));
+    // Rows sit at even indices (each is followed by a spacer).
+    list_state.select(focused.then_some(state.option_selected * 2));
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_sessions(frame: &mut Frame, area: Rect, state: &WelcomeState) {
-    let pal = state.theme.palette();
-    let focused = state.focus == Focus::Sessions;
-    let block = panel_block(&pal, " Sessions ", focused);
-
-    // Empty state: no sessions yet for this project — show a centred hint inside
-    // the panel instead of a blank box.
-    if state.sessions.is_empty() {
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let lines = vec![
-            Line::raw(""),
-            Line::from(Span::styled(
-                "No sessions yet",
-                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
-            )),
-            Line::raw(""),
-            Line::from(Span::styled(
-                "Press N to create one",
-                Style::default().fg(pal.dim),
-            )),
-        ];
-        frame.render_widget(
-            Paragraph::new(lines)
-                .alignment(Alignment::Center)
-                .style(Style::default().bg(pal.bg)),
-            inner,
-        );
-        return;
+/// Short inline label for the update check's current state, or `None` when idle.
+fn update_status_suffix(status: &UpdateStatus) -> Option<String> {
+    match status {
+        UpdateStatus::Checking => Some("checking…".to_string()),
+        UpdateStatus::UpToDate => Some("up to date".to_string()),
+        UpdateStatus::Available(v) => Some(format!("v{v} available")),
+        UpdateStatus::Idle => None,
     }
-
-    let items: Vec<ListItem> = state
-        .sessions
-        .iter()
-        .map(|s| ListItem::new(session_row(state, s)))
-        .collect();
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(highlight_style(&pal));
-
-    let mut list_state = ListState::default();
-    list_state.select(focused.then_some(state.session_selected));
-    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-/// One formatted session row: name, branch, last-used date and token count.
+/// Author of the project; the tagline links their name to this GitHub profile.
+pub const AUTHOR_NAME: &str = "Daniel Sierra";
+pub const AUTHOR_URL: &str = "https://github.com/soydanielsierradev";
+/// The project's GitHub repository (Documentation → GitHub).
+pub const PROJECT_URL: &str = "https://github.com/soydanielsierradev/bruce-tui";
+
+/// Centered tagline under the wordmark: a credit line whose author name is an
+/// accented, underlined link. Records the name's on-screen rectangle in
+/// `state.name_link` so the event loop can open the profile on a mouse click.
+fn render_tagline(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let pal = state.theme.palette();
+    let prefix = "A terminal workspace for Claude Code · Developed by ";
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(pal.dim)),
+        Span::styled(
+            AUTHOR_NAME,
+            Style::default()
+                .fg(pal.accent)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+    ]);
+
+    // Work out where the name lands so clicks can be hit-tested. The line is
+    // centered, so the run starts at the centered left edge plus the prefix.
+    let text_w = (prefix.chars().count() + AUTHOR_NAME.chars().count()) as u16;
+    let left = area.x + area.width.saturating_sub(text_w) / 2;
+    let name_x = left + prefix.chars().count() as u16;
+    state.name_link.set(Rect {
+        x: name_x,
+        y: area.y,
+        width: AUTHOR_NAME.chars().count() as u16,
+        height: 1,
+    });
+
+    frame.render_widget(
+        Paragraph::new(line)
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(pal.bg)),
+        area,
+    );
+}
+
+/// One formatted session row for the picker: a bullet, name, branch, relative
+/// last-used time and token count.
 fn session_row<'a>(state: &WelcomeState, s: &'a Session) -> Line<'a> {
     let pal = state.theme.palette();
     let branch = s.branch.as_deref().unwrap_or("—");
     Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(pal.accent)),
         Span::styled(
-            format!(" {:<18}", s.name),
+            format!("{:<18}", s.name),
             Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("{:<22}", branch), Style::default().fg(pal.accent)),
-        Span::styled(format!("{:<12}", fmt_date(s.last_used)), Style::default().fg(pal.dim)),
+        Span::styled(format!("{:<20}", branch), Style::default().fg(pal.accent)),
+        Span::styled(format!("{:<10}", fmt_relative(s.last_used)), Style::default().fg(pal.dim)),
         Span::styled(
-            format!("{:>10} tok", fmt_tokens(s.tokens_used)),
+            format!("{:>9} tok", fmt_tokens(s.tokens_used)),
             Style::default().fg(pal.dim),
         ),
     ])
 }
 
-/// Render the Themes panel: one row per theme with its name and a strip of
-/// color swatches previewing that theme's palette. The active theme is marked
-/// with a leading arrow so it stays visible even when the panel is unfocused.
-fn render_themes(frame: &mut Frame, area: Rect, state: &WelcomeState) {
-    let pal = state.theme.palette();
-    let focused = state.focus == Focus::Themes;
+/// Render the theme picker dialog: one row per theme with its name and a strip
+/// of color swatches previewing its palette. `selected` is the highlighted
+/// theme's index in [`Theme::ALL`]; moving it previews the theme live.
+fn render_theme_picker_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, selected: usize) {
+    let area = centered_rect(46, 70, screen);
+    frame.render_widget(Clear, area);
+    let block = dialog_block(pal, " Theme ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let mut active_idx = 0;
     let mut items: Vec<ListItem> = Vec::new();
     for theme in Theme::ALL {
-        let active = theme == state.theme;
-        if active {
-            // Row index of the active theme within `items` (rows are
-            // interleaved with blank spacers, so this is not the theme index).
-            active_idx = items.len();
-        }
-        let marker = if active { " ▸ " } else { "   " };
         let mut spans = vec![Span::styled(
-            format!("{}{:<12}", marker, theme.palette().name),
+            format!("  {:<12}", theme.palette().name),
             Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
         )];
         // Color swatches: each palette color as a solid block, joined into one
@@ -960,16 +1311,11 @@ fn render_themes(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         items.push(ListItem::new(Line::raw("")));
     }
 
-    let block = panel_block(&pal, " Themes ", focused);
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(highlight_style(&pal));
-
+    let list = List::new(items).highlight_style(highlight_style(pal));
     let mut list_state = ListState::default();
-    // Highlight the active theme only while the panel is focused; otherwise the
-    // ▸ marker already shows which one is active.
-    list_state.select(focused.then_some(active_idx));
-    frame.render_stateful_widget(list, area, &mut list_state);
+    // Rows sit at even indices (each is followed by a spacer).
+    list_state.select(Some(selected * 2));
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
@@ -1020,6 +1366,18 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Span::styled(" releases   ", Style::default().fg(pal.dim)),
             Span::styled("Esc", Style::default().fg(pal.accent)),
             Span::styled(" close", Style::default().fg(pal.dim)),
+        ]),
+        Some(Dialog::Keybindings(_)) => Line::from(vec![
+            Span::styled("  ↑↓", Style::default().fg(pal.accent)),
+            Span::styled(" scroll   ", Style::default().fg(pal.dim)),
+            Span::styled("Esc", Style::default().fg(pal.accent)),
+            Span::styled(" close", Style::default().fg(pal.dim)),
+        ]),
+        Some(Dialog::ThemePicker(_)) => Line::from(vec![
+            Span::styled("  ↑↓", Style::default().fg(pal.accent)),
+            Span::styled(" preview   ", Style::default().fg(pal.dim)),
+            Span::styled("Enter/Esc", Style::default().fg(pal.accent)),
+            Span::styled(" done", Style::default().fg(pal.dim)),
         ]),
         None => Line::from(vec![
             Span::styled("  ↑↓", Style::default().fg(pal.accent)),
@@ -1205,17 +1563,36 @@ fn render_new_session_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, dia
 }
 
 /// A bordered panel whose border colour signals focus.
-fn panel_block<'a>(pal: &Palette, title: &'a str, focused: bool) -> Block<'a> {
-    let border_color = if focused { pal.accent } else { pal.dim };
+fn panel_block(pal: &Palette, title: &str, focused: bool) -> Block<'static> {
+    // The active block reads by color alone: accent border + title when focused,
+    // dim when not.
+    let color = if focused { pal.accent } else { pal.dim };
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
+        .border_style(Style::default().fg(color))
         .title(Span::styled(
-            title,
-            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+            title.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
+        // A blank top row so the first item isn't glued to the border.
+        .padding(Padding::top(1))
         .style(Style::default().bg(pal.bg))
+}
+
+/// Mute every cell on screen to the theme's dim color, used as a backdrop behind
+/// modal dialogs. The modal is drawn crisp on top afterwards, so only the
+/// background recedes — the terminal equivalent of dimming/blurring behind a
+/// dialog. Faded styling is also stripped so nothing in the background stays bold.
+fn dim_behind_dialog(frame: &mut Frame, area: Rect, pal: &Palette) {
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(Style::default().fg(pal.dim).bg(pal.bg));
+            }
+        }
+    }
 }
 
 /// A bordered block for a modal dialog (always accent-bordered).
@@ -1276,27 +1653,22 @@ fn filter_sessions(sessions: &[Session], query: &str) -> Vec<usize> {
         .collect()
 }
 
-/// Format a Unix-epoch timestamp (seconds, UTC) as `YYYY-MM-DD`.
-///
-/// Uses Howard Hinnant's `civil_from_days` algorithm so no date crate is needed.
-/// A zero/invalid timestamp renders as a dash.
-fn fmt_date(epoch: i64) -> String {
+/// Format a Unix-epoch timestamp as a short relative time (e.g. `2h ago`,
+/// `3d ago`). A zero/invalid timestamp renders as a dash; future or just-now
+/// times read as `just now`.
+fn fmt_relative(epoch: i64) -> String {
     if epoch <= 0 {
         return "—".to_string();
     }
-    let days = epoch.div_euclid(86_400);
-    // Shift the epoch so the era starts on a 400-year boundary (0000-03-01).
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097; // day of era [0, 146096]
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month-shifted [0, 11], March = 0
-    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    let year = if month <= 2 { year + 1 } else { year };
-    format!("{year:04}-{month:02}-{day:02}")
+    let diff = now_epoch() - epoch;
+    match diff {
+        d if d < 60 => "just now".to_string(),
+        d if d < 3_600 => format!("{}m ago", d / 60),
+        d if d < 86_400 => format!("{}h ago", d / 3_600),
+        d if d < 7 * 86_400 => format!("{}d ago", d / 86_400),
+        d if d < 30 * 86_400 => format!("{}w ago", d / (7 * 86_400)),
+        d => format!("{}mo ago", d / (30 * 86_400)),
+    }
 }
 
 /// Format a token count with thousands separators (e.g. `47_832` -> `47,832`).
