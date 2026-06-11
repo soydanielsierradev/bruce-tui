@@ -192,6 +192,44 @@ impl WorkspaceState {
         }
     }
 
+    /// Forward pasted text to the embedded process as a *bracketed paste*:
+    /// wrapped in `ESC[200~` … `ESC[201~`. The child then treats the whole block
+    /// as one multi-line insert instead of submitting on every newline — which
+    /// is what made a pasted snippet split into several messages. Claude Code
+    /// also collapses a large paste into a "[Pasted text +N lines]" placeholder
+    /// once it sees these markers, so the input stays readable.
+    pub fn send_paste(&self, text: &str) {
+        if let Some(pty) = self.pty.as_ref() {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            // Snap back to the live bottom, the way typing does.
+            pty.scroll_to_bottom();
+            pty.send(&bytes);
+        }
+    }
+
+    /// Forward a run of plain typed characters to the child, translating each
+    /// newline to a carriage return (the byte Enter sends). Used when a fast
+    /// burst of keystrokes is coalesced but isn't a multi-line paste, so it
+    /// behaves exactly as if the keys had been typed one by one.
+    pub fn send_typed(&self, text: &str) {
+        if let Some(pty) = self.pty.as_ref() {
+            let mut bytes = Vec::with_capacity(text.len());
+            let mut tmp = [0u8; 4];
+            for c in text.chars() {
+                if c == '\n' {
+                    bytes.push(b'\r');
+                } else {
+                    bytes.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                }
+            }
+            pty.scroll_to_bottom();
+            pty.send(&bytes);
+        }
+    }
+
     /// Scroll the Claude pane back by one page (no-op without a PTY). The page
     /// size is the pane's current height, so it pages like a terminal.
     pub fn scroll_up(&self) {

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::style::Color;
 
@@ -93,9 +93,15 @@ fn open_session_loading(
 /// and always restores the terminal afterwards — even on error.
 pub fn run() -> Result<()> {
     let mut terminal = ratatui::init();
+    // Ask the terminal to wrap pasted text in markers (ESC[200~ … ESC[201~) and
+    // deliver it as a single `Event::Paste`. Without this a multi-line paste
+    // arrives as one Enter keypress per line, and the Claude pane submits a
+    // message on each — splitting the paste into many sends.
+    set_bracketed_paste(true);
     let outcome = run_loop(&mut terminal);
     // Hand the terminal back with its own colours restored before leaving the
     // alternate screen, so the user's normal prompt isn't left recoloured.
+    set_bracketed_paste(false);
     set_mouse_capture(false);
     reset_terminal_colors();
     ratatui::restore();
@@ -120,6 +126,103 @@ fn set_mouse_capture(on: bool) {
     } else {
         crossterm::execute!(out, DisableMouseCapture)
     };
+}
+
+/// Enable or disable bracketed paste mode. When on, the terminal delivers a
+/// paste as a single [`Event::Paste`] instead of synthesised keystrokes, so the
+/// Claude pane can forward the whole block at once. Best-effort: terminals
+/// without support simply ignore it (and pasting falls back to per-key events).
+fn set_bracketed_paste(on: bool) {
+    let mut out = std::io::stdout();
+    let _ = if on {
+        crossterm::execute!(out, EnableBracketedPaste)
+    } else {
+        crossterm::execute!(out, DisableBracketedPaste)
+    };
+}
+
+/// Longest gap tolerated between keystrokes while coalescing a burst. A paste
+/// streams in with sub-millisecond gaps between the console's input batches, so
+/// we keep collecting across them; a human types far slower, so after this long
+/// without a key the burst is considered finished. Small enough that the wait
+/// added to ordinary typing is imperceptible.
+const BURST_GAP: Duration = Duration::from_millis(10);
+
+/// Forward typing — and pastes — to the Claude pane, coalescing a burst.
+///
+/// `Event::Paste` covers pastes on Unix, but on Windows crossterm reads the
+/// console via the WinAPI backend, which delivers a paste as a stream of
+/// individual key events and never emits `Event::Paste`. So when a plain
+/// character lands on the Claude pane we keep collecting keys until input goes
+/// quiet (see [`BURST_GAP`]) — spanning the micro-gaps between the console's
+/// batches so the *whole* paste is gathered before anything is sent:
+///
+/// - a multi-line run is sent as ONE bracketed paste, so it lands as a single
+///   insert instead of submitting a message per line. Collecting it whole (not
+///   in fragments) matters: mixing bracketed-paste chunks with directly typed
+///   chunks races inside Claude's input and scrambles the result.
+/// - anything else is replayed verbatim, so ordinary typing and Enter-to-submit
+///   behave exactly as before.
+///
+/// Returns the first event read past the burst (a chord, a resize, …) so the
+/// caller can process it instead of dropping it.
+fn forward_typing(ws: &WorkspaceState, first: KeyEvent) -> Result<Option<Event>> {
+    // The character a plain typing key inserts, or `None` if it isn't plain
+    // text (a modifier chord, an arrow, a function key — which ends the burst).
+    fn as_text(key: &KeyEvent) -> Option<char> {
+        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Char(c) if plain => Some(c),
+            KeyCode::Enter if plain => Some('\n'),
+            KeyCode::Tab if plain => Some('\t'),
+            _ => None,
+        }
+    }
+
+    let Some(first_ch) = as_text(&first) else {
+        ws.send_key(&first);
+        return Ok(None);
+    };
+
+    let mut buf = String::new();
+    buf.push(first_ch);
+    let mut stashed = None;
+
+    // Keep collecting until input stays quiet for BURST_GAP. A paste's bytes
+    // arrive faster than that gap (so the whole block is gathered here); after
+    // the last hand-typed key the wait simply elapses and we fall through.
+    while event::poll(BURST_GAP)? {
+        let evt = event::read()?;
+        match &evt {
+            // Skip key-release events (Windows fires press *and* release).
+            Event::Key(k) if k.kind != KeyEventKind::Press => continue,
+            Event::Key(k) => match as_text(k) {
+                Some(c) => buf.push(c),
+                None => {
+                    stashed = Some(evt);
+                    break;
+                }
+            },
+            _ => {
+                stashed = Some(evt);
+                break;
+            }
+        }
+    }
+
+    // Treat as a paste only when there's a newline with content after it —
+    // genuinely multi-line. A lone key or a single line (even one a fast typist
+    // ended with Enter) is replayed so Enter still submits.
+    let count = buf.chars().count();
+    let multiline = buf.trim_end_matches(['\n', '\r']).contains('\n');
+    if count == 1 {
+        ws.send_key(&first);
+    } else if multiline {
+        ws.send_paste(&buf);
+    } else {
+        ws.send_typed(&buf);
+    }
+    Ok(stashed)
 }
 
 /// Run the resolved update command with inherited stdio so the user sees the
@@ -189,6 +292,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
     // turned off in the workspace so the Claude pane keeps native text selection.
     set_mouse_capture(true);
 
+    // An event read past a coalesced typing burst (see `forward_typing`) that
+    // still needs handling — processed before polling for the next one.
+    let mut pending: Option<Event> = None;
+
     loop {
         // The active theme lives on whichever screen is showing; the workspace
         // carries a snapshot of the welcome theme it was opened with.
@@ -236,10 +343,16 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
 
         // Poll instead of blocking: the reader thread feeds PTY output into the
         // emulator, so we must redraw on a timer even when no key is pressed.
-        if !event::poll(Duration::from_millis(50))? {
-            continue;
-        }
-        let evt = event::read()?;
+        // A `pending` event left over from a coalesced burst jumps the queue.
+        let evt = match pending.take() {
+            Some(evt) => evt,
+            None => {
+                if !event::poll(Duration::from_millis(50))? {
+                    continue;
+                }
+                event::read()?
+            }
+        };
         // A left-click on the welcome screen may land on the author link.
         if let Event::Mouse(me) = evt {
             if matches!(&screen, Screen::Welcome)
@@ -247,6 +360,22 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                 && me.kind == MouseEventKind::Down(MouseButton::Left)
             {
                 welcome.click(me.column, me.row);
+            }
+            continue;
+        }
+        // A paste arrives as one event (bracketed paste). In the workspace it
+        // goes straight to Claude as a bracketed paste so multi-line code lands
+        // as a single insert; in a welcome text field we replay its printable
+        // characters so pasting a name/query still works.
+        if let Event::Paste(text) = evt {
+            match &mut screen {
+                Screen::Workspace(ws) if ws.focus == Panel::Claude => ws.send_paste(&text),
+                Screen::Welcome if welcome.dialog.is_some() => {
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        welcome.dialog_key(KeyCode::Char(c));
+                    }
+                }
+                _ => {}
             }
             continue;
         }
@@ -397,8 +526,13 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                     } else if ctrl && matches!(key.code, KeyCode::Char('b')) {
                         ws.leader_pending = true;
                     } else {
-                        // Everything else is the user typing into Claude.
-                        ws.send_key(&key);
+                        // Everything else is the user typing into Claude. Coalesce
+                        // any burst queued behind this key so a multi-line paste
+                        // lands as one bracketed insert rather than a message per
+                        // line (the Windows path, where crossterm can't surface
+                        // bracketed paste). Any event read past the burst is
+                        // stashed for the next iteration.
+                        pending = forward_typing(ws, key)?;
                     }
                 } else {
                     // A side pane has focus: navigate Bruce directly.
