@@ -773,21 +773,21 @@ fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bo
     let mut lines: Vec<Line> = Vec::new();
 
     // ── tokens · session ──
-    section_header(&mut lines, pal, "tokens · sesión", width);
+    section_header(&mut lines, pal, "tokens · session", width);
     big_number(&mut lines, &fmt_count(m.total()), pal.accent);
-    lines.push(dim_line(pal, &format!(" {} turnos", m.turns)));
+    lines.push(dim_line(pal, &format!(" {} turns", m.turns)));
     lines.push(Line::raw(""));
 
     // ── active context window ──
-    section_header(&mut lines, pal, "contexto activo", width);
+    section_header(&mut lines, pal, "active context", width);
     big_number(&mut lines, &fmt_count(m.context), pal.modified);
     let ctx_pct = m.context_pct();
     bar_line(&mut lines, pal, width, ctx_pct, pal.modified);
-    metric_row_str(&mut lines, pal, width, "% ventana", &format!("{ctx_pct}%"), pal.modified);
+    metric_row_str(&mut lines, pal, width, "% window", &format!("{ctx_pct}%"), pal.modified);
     lines.push(Line::raw(""));
 
     // ── breakdown ──
-    section_header(&mut lines, pal, "desglose", width);
+    section_header(&mut lines, pal, "breakdown", width);
     metric_row(&mut lines, pal, width, "input", m.input, pal.fg);
     metric_row(&mut lines, pal, width, "output", m.output, pal.added);
     metric_row_str(&mut lines, pal, width, "cache hits", &format!("{}%", m.cache_hit_pct()), pal.renamed);
@@ -795,13 +795,13 @@ fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bo
     lines.push(Line::raw(""));
 
     // ── estimated cost (approximate: hard-coded list prices) ──
-    section_header(&mut lines, pal, "costo · est.", width);
+    section_header(&mut lines, pal, "cost · est.", width);
     big_number(&mut lines, &format!("${:.2}", m.cost_usd()), pal.renamed);
     lines.push(dim_line(pal, &format!(" {}", model_short(&m.model))));
     lines.push(Line::raw(""));
 
     // ── active MCP servers (those exercised this session) ──
-    section_header(&mut lines, pal, "mcp · activos", width);
+    section_header(&mut lines, pal, "mcp · active", width);
     if m.mcp_servers.is_empty() {
         lines.push(dim_line(pal, " —"));
     } else {
@@ -815,11 +815,11 @@ fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bo
     lines.push(Line::raw(""));
 
     // ── current session ──
-    section_header(&mut lines, pal, "sesión", width);
-    metric_row_str(&mut lines, pal, width, "duración", &fmt_duration(m.duration_secs()), pal.added);
-    metric_row(&mut lines, pal, width, "archivos", m.files_edited, pal.modified);
-    metric_row_str(&mut lines, pal, width, "líneas +", &format!("+{}", m.lines_added), pal.added);
-    metric_row_str(&mut lines, pal, width, "líneas −", &format!("−{}", m.lines_removed), pal.removed);
+    section_header(&mut lines, pal, "session", width);
+    metric_row_str(&mut lines, pal, width, "duration", &fmt_duration(m.duration_secs()), pal.added);
+    metric_row(&mut lines, pal, width, "files", m.files_edited, pal.modified);
+    metric_row_str(&mut lines, pal, width, "lines +", &format!("+{}", m.lines_added), pal.added);
+    metric_row_str(&mut lines, pal, width, "lines −", &format!("−{}", m.lines_removed), pal.removed);
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(pal.bg)),
