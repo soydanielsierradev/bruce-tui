@@ -513,53 +513,11 @@ fn render_claude_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: boo
 
 /// Convert the emulated screen into one styled line per row.
 ///
-/// Cells that use the terminal *default* colour resolve to the active theme's
-/// `fg`/`bg` (not `Color::Reset`), so the embedded child blends into the rest
-/// of the workspace instead of showing the host terminal's own background.
-/// Colours the child picks explicitly (diff green/red, accents) pass through
-/// untouched — they carry meaning we must not override.
+/// Delegates to `crate::pty::pty_screen_lines` which now owns this logic so
+/// the install dialog can reuse the same render pipeline without pulling in
+/// workspace internals.
 fn pty_screen_lines<'a>(screen: &vt100::Screen, pal: &Palette) -> Vec<Line<'a>> {
-    let (rows, cols) = screen.size();
-    let mut lines = Vec::with_capacity(rows as usize);
-    for row in 0..rows {
-        let mut spans = Vec::with_capacity(cols as usize);
-        for col in 0..cols {
-            let (text, style) = match screen.cell(row, col) {
-                Some(cell) => {
-                    let raw = cell.contents();
-                    // A blank cell yields an empty string; render it as a space.
-                    let content = if raw.is_empty() {
-                        " ".to_string()
-                    } else {
-                        raw.to_string()
-                    };
-                    let mut style = Style::default()
-                        .fg(conv_color(cell.fgcolor(), pal.fg))
-                        .bg(conv_color(cell.bgcolor(), pal.bg));
-                    if cell.bold() {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if cell.italic() {
-                        style = style.add_modifier(Modifier::ITALIC);
-                    }
-                    if cell.underline() {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    if cell.inverse() {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
-                    (content, style)
-                }
-                None => (
-                    " ".to_string(),
-                    Style::default().fg(pal.fg).bg(pal.bg),
-                ),
-            };
-            spans.push(Span::styled(text, style));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines
+    crate::pty::pty_screen_lines(screen, pal)
 }
 
 /// Colour for a working-tree status mark, by change type. Theme-aware: each
@@ -572,17 +530,6 @@ fn mark_color(mark: char, pal: &Palette) -> Color {
         'R' => pal.renamed,  // renamed
         '?' => pal.dim,      // untracked
         _ => pal.fg,
-    }
-}
-
-/// Map a vt100 colour to a ratatui colour. The terminal *default* colour
-/// resolves to `fallback` (the theme's fg or bg) so embedded output shares the
-/// workspace background instead of falling back to the host terminal.
-fn conv_color(color: vt100::Color, fallback: Color) -> Color {
-    match color {
-        vt100::Color::Default => fallback,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
 
@@ -973,7 +920,7 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
 /// the arrow/navigation keys); anything else is dropped. `app_cursor` is the
 /// child's DECCKM state: when on, cursor keys use SS3 (`ESC O x`) instead of
 /// CSI (`ESC [ x`) — the tilde keys (PageUp/Down, Delete) are unaffected.
-fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
+pub fn encode_key(key: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let bytes = match key.code {
         KeyCode::Char(c) => {
