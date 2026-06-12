@@ -2,7 +2,7 @@
 //!
 //! Owns the ledger (`~/.config/bruce/skills.json`), path helpers for the
 //! Claude skills directory, frontmatter parsing, enable/disable/delete
-//! operations, and the background install runner.
+//! operations, and snapshot helpers used by the install dialog.
 //!
 //! This module is purely logic — no TUI. The UI layer (welcome.rs) imports
 //! from here and drives everything through the public API.
@@ -10,9 +10,6 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::{fs, io};
 
 use anyhow::{anyhow, Context, Result};
@@ -358,204 +355,6 @@ pub fn delete_skill(entry: &SkillEntry, ledger: &mut SkillLedger) -> Result<()> 
     ledger.remove(&entry.folder_name)
 }
 
-// ─── Install runner ───────────────────────────────────────────────────────────
-
-/// Background install runner.
-///
-/// Spawns the user-supplied command through the platform shell and collects
-/// stdout + stderr into a shared log, live. Mirrors the cross-thread shape of
-/// `update::Check` (src/update/mod.rs L26–58), extended with line collection
-/// and exit-code capture (design ADR-4).
-///
-/// Polling: `done.load(Ordering::SeqCst)` returns `true` when the child has
-/// exited and the reader threads have finished. The UI timer (50ms) polls this
-/// each frame and reads `exit_ok` to decide post-install actions.
-pub struct InstallRunner {
-    /// Accumulated stdout + stderr lines, interleaved in arrival order.
-    pub log: Arc<Mutex<Vec<String>>>,
-    /// Set to `true` by the wait-thread after the child exits and all reader
-    /// threads have joined.
-    pub done: Arc<AtomicBool>,
-    /// Exit code of the finished child. `None` = still in flight; `Some(0)` =
-    /// success; `Some(n)` = failed with code `n` (or `-1` when there is no code,
-    /// e.g. the child was killed by a signal).
-    pub exit_code: Arc<Mutex<Option<i32>>>,
-    /// Per-root folder snapshot taken immediately before the child was spawned
-    /// (`~/.claude/skills` and `~/.agents/skills`). Diffed against the after
-    /// snapshot when `done` becomes true to find newly installed skills.
-    pub before: Vec<(PathBuf, HashSet<String>)>,
-}
-
-/// Clean one raw output line for display in the install log.
-///
-/// Progress UIs redraw a line in place with carriage returns and dress it with
-/// ANSI escape sequences (colour, cursor moves, the braille spinner). Captured
-/// raw, that turns the log into noise. This keeps only the segment after the
-/// last carriage return (the final frame of a redraw) and strips ESC/BEL
-/// control sequences, leaving plain text. No external crate — a small scan.
-fn sanitize_log_line(raw: &str) -> String {
-    // A carriage return rewinds the cursor to redraw the same line; keep the
-    // last non-empty segment so the log shows the final state, not every frame.
-    let last = raw.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("");
-
-    let mut out = String::with_capacity(last.len());
-    let mut chars = last.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => match chars.next() {
-                // CSI (ESC[…): consume params up to and including the final byte.
-                Some('[') => {
-                    while let Some(&n) = chars.peek() {
-                        chars.next();
-                        if ('@'..='~').contains(&n) {
-                            break;
-                        }
-                    }
-                }
-                // OSC (ESC]…): consume up to BEL or the ESC\ string terminator.
-                Some(']') => {
-                    while let Some(&n) = chars.peek() {
-                        chars.next();
-                        if n == '\u{7}' {
-                            break;
-                        }
-                        if n == '\u{1b}' {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                // Any other escape: drop the single following byte.
-                _ => {}
-            },
-            // Drop stray BEL and other C0 controls except tab.
-            '\u{7}' => {}
-            c if (c.is_control() && c != '\t') => {}
-            c => out.push(c),
-        }
-    }
-    out.trim_end().to_string()
-}
-
-impl InstallRunner {
-    /// Spawn the command through the platform shell and return immediately.
-    ///
-    /// Three threads are started:
-    /// 1. stdout-reader — pushes lines to `log`
-    /// 2. stderr-reader — pushes lines to `log`
-    /// 3. wait-thread — joins readers, calls `child.wait()`, writes `exit_code`,
-    ///    sets `done = true`
-    ///
-    /// The `before` snapshot is taken inside this function, before the child
-    /// starts, to guarantee pre-install state (ADR-3).
-    pub fn spawn(command: String) -> Result<Self> {
-        // Snapshot every watched root BEFORE the child is started (ADR-3), so a
-        // skill landing in ~/.agents/skills (npx skills) is detected too.
-        let before = snapshot_roots();
-
-        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let done = Arc::new(AtomicBool::new(false));
-        let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
-
-        // Dispatch through the platform shell (ADR-1: handles .cmd shims,
-        // pipes, builtins transparently on all platforms).
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = Command::new("cmd");
-            c.args(["/C", &command]);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = Command::new("sh");
-            c.args(["-c", &command]);
-            c
-        };
-
-        // Detach the child from Bruce's stdin. The TUI owns the terminal in raw
-        // mode, so an interactive installer (e.g. `npx skills add` prompting for
-        // the target agent) would otherwise block forever waiting on input it
-        // can never receive — the install appears to hang. With stdin closed it
-        // gets EOF and proceeds or exits instead of stalling. The env vars ask
-        // npm/npx-style tools to run non-interactively and drop the colour and
-        // spinner output that would otherwise litter the log.
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env("CI", "true")
-            .env("NO_COLOR", "1")
-            .env("FORCE_COLOR", "0")
-            .spawn()
-            .map_err(|e| anyhow!("shell not found: {e}"))?;
-
-        // Take the stdout/stderr handles before moving child into the
-        // wait-thread.
-        let stdout_pipe = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("stdout pipe missing"))?;
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("stderr pipe missing"))?;
-
-        // Thread 1 — stdout reader.
-        let log_stdout = Arc::clone(&log);
-        let stdout_handle = std::thread::spawn(move || {
-            let reader = BufReader::new(stdout_pipe);
-            for line in reader.lines().flatten() {
-                let clean = sanitize_log_line(&line);
-                if clean.is_empty() {
-                    continue;
-                }
-                if let Ok(mut guard) = log_stdout.lock() {
-                    guard.push(clean);
-                }
-            }
-        });
-
-        // Thread 2 — stderr reader.
-        let log_stderr = Arc::clone(&log);
-        let stderr_handle = std::thread::spawn(move || {
-            let reader = BufReader::new(stderr_pipe);
-            for line in reader.lines().flatten() {
-                let clean = sanitize_log_line(&line);
-                if clean.is_empty() {
-                    continue;
-                }
-                if let Ok(mut guard) = log_stderr.lock() {
-                    guard.push(clean);
-                }
-            }
-        });
-
-        // Thread 3 — wait-thread: joins readers then waits on the child.
-        let done_t = Arc::clone(&done);
-        let exit_code_t = Arc::clone(&exit_code);
-        std::thread::spawn(move || {
-            // Wait for both readers to drain before checking exit status.
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-
-            // `code()` is `None` when the child was terminated by a signal
-            // (Unix); report -1 there so the UI still has a number to show.
-            let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-            if let Ok(mut guard) = exit_code_t.lock() {
-                *guard = Some(code);
-            }
-            done_t.store(true, Ordering::SeqCst);
-        });
-
-        Ok(Self {
-            log,
-            done,
-            exit_code,
-            before,
-        })
-    }
-}
-
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -591,25 +390,6 @@ mod tests {
             path,
         };
         (ledger, td)
-    }
-
-    // ── install-log sanitising ───────────────────────────────────────────────
-
-    #[test]
-    fn test_sanitize_strips_ansi_and_collapses_redraws() {
-        // Plain text passes through untouched.
-        assert_eq!(sanitize_log_line("downloading skill"), "downloading skill");
-        // ANSI colour codes are stripped.
-        assert_eq!(sanitize_log_line("\u{1b}[32m✓ done\u{1b}[0m"), "✓ done");
-        // A carriage-return redraw keeps only the final frame.
-        assert_eq!(
-            sanitize_log_line("\u{1b}[2K\rfetching…\rfetching done"),
-            "fetching done"
-        );
-        // A spinner frame keeps its glyph; the surrounding colour codes are stripped.
-        assert_eq!(sanitize_log_line("\u{1b}[36m⠋\u{1b}[0m\r"), "⠋");
-        // BEL and stray controls are dropped.
-        assert_eq!(sanitize_log_line("ready\u{7}"), "ready");
     }
 
     // ── P1-T1: SkillLedger ───────────────────────────────────────────────────
