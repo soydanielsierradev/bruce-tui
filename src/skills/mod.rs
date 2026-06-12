@@ -341,6 +341,57 @@ pub struct InstallRunner {
     pub before: HashSet<String>,
 }
 
+/// Clean one raw output line for display in the install log.
+///
+/// Progress UIs redraw a line in place with carriage returns and dress it with
+/// ANSI escape sequences (colour, cursor moves, the braille spinner). Captured
+/// raw, that turns the log into noise. This keeps only the segment after the
+/// last carriage return (the final frame of a redraw) and strips ESC/BEL
+/// control sequences, leaving plain text. No external crate — a small scan.
+fn sanitize_log_line(raw: &str) -> String {
+    // A carriage return rewinds the cursor to redraw the same line; keep the
+    // last non-empty segment so the log shows the final state, not every frame.
+    let last = raw.rsplit('\r').find(|s| !s.is_empty()).unwrap_or("");
+
+    let mut out = String::with_capacity(last.len());
+    let mut chars = last.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI (ESC[…): consume params up to and including the final byte.
+                Some('[') => {
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('@'..='~').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC (ESC]…): consume up to BEL or the ESC\ string terminator.
+                Some(']') => {
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Any other escape: drop the single following byte.
+                _ => {}
+            },
+            // Drop stray BEL and other C0 controls except tab.
+            '\u{7}' => {}
+            c if (c.is_control() && c != '\t') => {}
+            c => out.push(c),
+        }
+    }
+    out.trim_end().to_string()
+}
+
 impl InstallRunner {
     /// Spawn the command through the platform shell and return immediately.
     ///
@@ -363,18 +414,32 @@ impl InstallRunner {
         // Dispatch through the platform shell (ADR-1: handles .cmd shims,
         // pipes, builtins transparently on all platforms).
         #[cfg(windows)]
-        let mut child = Command::new("cmd")
-            .args(["/C", &command])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("shell not found: {e}"))?;
-
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", &command]);
+            c
+        };
         #[cfg(not(windows))]
-        let mut child = Command::new("sh")
-            .args(["-c", &command])
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.args(["-c", &command]);
+            c
+        };
+
+        // Detach the child from Bruce's stdin. The TUI owns the terminal in raw
+        // mode, so an interactive installer (e.g. `npx skills add` prompting for
+        // the target agent) would otherwise block forever waiting on input it
+        // can never receive — the install appears to hang. With stdin closed it
+        // gets EOF and proceeds or exits instead of stalling. The env vars ask
+        // npm/npx-style tools to run non-interactively and drop the colour and
+        // spinner output that would otherwise litter the log.
+        let mut child = cmd
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("CI", "true")
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0")
             .spawn()
             .map_err(|e| anyhow!("shell not found: {e}"))?;
 
@@ -394,8 +459,12 @@ impl InstallRunner {
         let stdout_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stdout_pipe);
             for line in reader.lines().flatten() {
+                let clean = sanitize_log_line(&line);
+                if clean.is_empty() {
+                    continue;
+                }
                 if let Ok(mut guard) = log_stdout.lock() {
-                    guard.push(line);
+                    guard.push(clean);
                 }
             }
         });
@@ -405,8 +474,12 @@ impl InstallRunner {
         let stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr_pipe);
             for line in reader.lines().flatten() {
+                let clean = sanitize_log_line(&line);
+                if clean.is_empty() {
+                    continue;
+                }
                 if let Ok(mut guard) = log_stderr.lock() {
-                    guard.push(line);
+                    guard.push(clean);
                 }
             }
         });
@@ -472,6 +545,25 @@ mod tests {
             path,
         };
         (ledger, td)
+    }
+
+    // ── install-log sanitising ───────────────────────────────────────────────
+
+    #[test]
+    fn test_sanitize_strips_ansi_and_collapses_redraws() {
+        // Plain text passes through untouched.
+        assert_eq!(sanitize_log_line("downloading skill"), "downloading skill");
+        // ANSI colour codes are stripped.
+        assert_eq!(sanitize_log_line("\u{1b}[32m✓ done\u{1b}[0m"), "✓ done");
+        // A carriage-return redraw keeps only the final frame.
+        assert_eq!(
+            sanitize_log_line("\u{1b}[2K\rfetching…\rfetching done"),
+            "fetching done"
+        );
+        // A spinner frame keeps its glyph; the surrounding colour codes are stripped.
+        assert_eq!(sanitize_log_line("\u{1b}[36m⠋\u{1b}[0m\r"), "⠋");
+        // BEL and stray controls are dropped.
+        assert_eq!(sanitize_log_line("ready\u{7}"), "ready");
     }
 
     // ── P1-T1: SkillLedger ───────────────────────────────────────────────────
