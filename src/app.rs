@@ -348,6 +348,12 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
             Some(evt) => evt,
             None => {
                 if !event::poll(Duration::from_millis(50))? {
+                    // Timer tick: poll the install runner if one is active.
+                    // This is the ONLY place where tick_install_runner is called
+                    // (P2-T4: in the timer branch, not the key branch).
+                    if matches!(&screen, Screen::Welcome) {
+                        welcome.tick_install_runner();
+                    }
                     continue;
                 }
                 event::read()?
@@ -445,6 +451,17 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                                 "Resuming session…",
                             ));
                         }
+                        WelcomeEvent::ReopenSession(s) => {
+                            // Re-launch a session after a skill change (resume mode).
+                            let mut session = s;
+                            let _ = session.touch();
+                            transition = Some(open_session_loading(
+                                &welcome,
+                                session,
+                                true,
+                                "Restarting session…",
+                            ));
+                        }
                         WelcomeEvent::None => {}
                     }
                 } else {
@@ -477,6 +494,10 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                                 welcome.open_github();
                             } else if welcome.on_doc_keys() {
                                 welcome.open_keybindings();
+                            } else if welcome.on_skills_manage() {
+                                welcome.open_manage_dialog();
+                            } else if welcome.on_skills_install() {
+                                welcome.open_install_dialog();
                             }
                         }
                         _ => {}

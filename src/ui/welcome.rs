@@ -18,8 +18,13 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph},
 };
 
-use crate::config::Config;
+use crate::config::{Config, claude_skills_dir};
 use crate::session::{self, Session};
+use crate::skills::{
+    InstallRunner, SkillEntry, SkillLedger, SkillState,
+    delete_skill, disable_skill, enable_skill, parse_frontmatter, skill_state,
+    skills_dir_snapshot,
+};
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 use crate::update;
 
@@ -62,10 +67,15 @@ pub enum Focus {
     Options,
     Settings,
     Documentation,
+    /// The new Skills block (bottom-right of the 2×2 grid).
+    Skills,
 }
 
 /// Documentation-block rows, in display order (index = `doc_selected`).
 const DOC_LABELS: [&str; 2] = [" ↗ GitHub", " ≡ Keybindings"];
+
+/// Skills-block rows, in display order (index = `skill_selected`).
+const SKILL_LABELS: [&str; 2] = [" ≋ Manage skills", " + Install a skill"];
 
 /// Every keybinding, shown in the Documentation → Keybindings dialog as
 /// `(key, description)` rows. An empty key with a non-empty description is a
@@ -130,6 +140,8 @@ pub enum WelcomeEvent {
     OpenSession(Session),
     /// The user asked to auto-update; run this argv after tearing down the TUI.
     RunUpdate(Vec<String>),
+    /// Relaunch an existing session (resume mode) after a skill toggle in Manage.
+    ReopenSession(Session),
 }
 
 /// State of the version check, for visible feedback in the App block.
@@ -157,6 +169,78 @@ pub enum Dialog {
     /// Theme selector; the `usize` is the highlighted theme's index in
     /// [`Theme::ALL`]. Moving previews (and persists) the theme live.
     ThemePicker(usize),
+    /// Install-a-skill dialog: text input + live log stream.
+    SkillInstall(InstallDialog),
+    /// Manage (list/toggle/delete) Bruce-tracked skills.
+    SkillManage(ManageDialog),
+    /// Scrollable preview of a SKILL.md file's raw contents.
+    SkillPreview { lines: Vec<String>, scroll: u16, entry_name: String },
+}
+
+// ─── Install dialog types ─────────────────────────────────────────────────────
+
+/// Which phase the install dialog is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallPhase {
+    /// Waiting for the user to type a command and press Enter.
+    Idle,
+    /// The install runner is live; output is streaming into `log`.
+    Running,
+    /// The runner finished. `ok` = exit code 0.
+    Done { ok: bool },
+}
+
+/// State for the "Install a skill" dialog.
+pub struct InstallDialog {
+    /// The text the user is typing (the install command).
+    pub command: String,
+    /// Background runner spawned when the user presses Enter. `None` = not started.
+    pub runner: Option<InstallRunner>,
+    /// Current lifecycle phase.
+    pub phase: InstallPhase,
+    /// Log lines accumulated from stdout/stderr.
+    pub log: Vec<String>,
+    /// Scroll offset into the log region.
+    pub log_scroll: u16,
+}
+
+impl InstallDialog {
+    fn new() -> Self {
+        Self {
+            command: String::new(),
+            runner: None,
+            phase: InstallPhase::Idle,
+            log: Vec::new(),
+            log_scroll: 0,
+        }
+    }
+}
+
+// ─── Manage dialog types ──────────────────────────────────────────────────────
+
+/// Which sub-mode the manage dialog is in.
+#[derive(Debug, Clone)]
+pub enum ManageMode {
+    /// Browsing the skill list (with optional search filter).
+    Browse,
+    /// Waiting for Y/N confirmation before deleting `target`.
+    ConfirmDelete { target: usize },
+}
+
+/// State for the "Manage skills" dialog.
+pub struct ManageDialog {
+    /// The reconciled (skill, disk-state) pairs, loaded once when the dialog opens.
+    pub entries: Vec<(SkillEntry, SkillState)>,
+    /// Index into `entries` of the currently highlighted row (filtered view).
+    pub selected: usize,
+    /// Current browse/confirm mode.
+    pub mode: ManageMode,
+    /// True when any enable/disable/delete has been done — shows the restart banner.
+    pub restart_needed: bool,
+    /// Text filter that narrows the displayed list.
+    pub filter: String,
+    /// One-line error/status message shown at the bottom of the dialog.
+    pub status_line: String,
 }
 
 /// Which action the [`SessionPicker`] performs on the chosen session.
@@ -265,6 +349,8 @@ pub struct WelcomeState {
     pub border_style: BorderStyle,
     /// Width of each side pane (Settings option).
     pub side_width: SideWidth,
+    /// Selected row within the Skills block.
+    pub skill_selected: usize,
     /// Result of the version check (drives the badge and the App block).
     pub update_status: UpdateStatus,
     /// In-flight background update check; consumed once it finishes.
@@ -275,6 +361,8 @@ pub struct WelcomeState {
     latest_seen: String,
     /// Open dialog, if any. When `Some`, it captures all input.
     pub dialog: Option<Dialog>,
+    /// ManageDialog state stashed while SkillPreview is open so we can pop back.
+    pub pending_manage: Option<ManageDialog>,
 }
 
 impl WelcomeState {
@@ -308,6 +396,7 @@ impl WelcomeState {
             option_selected: 0,
             settings_selected: 0,
             doc_selected: 0,
+            skill_selected: 0,
             name_link: Cell::new(Rect::ZERO),
             theme: config.theme,
             git_enabled: config.git_enabled,
@@ -322,6 +411,7 @@ impl WelcomeState {
             last_update_check: config.last_update_check,
             latest_seen: config.latest_seen,
             dialog: None,
+            pending_manage: None,
         }
     }
 
@@ -408,17 +498,17 @@ impl WelcomeState {
         self.sessions = session::load_for_project(&self.project_path).unwrap_or_default();
     }
 
-    /// Cycle focus across the Options, Settings and Documentation panels.
+    /// Cycle focus across the four panels: Options → Settings → Documentation → Skills → Options.
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
             Focus::Options => Focus::Settings,
             Focus::Settings => Focus::Documentation,
-            Focus::Documentation => Focus::Options,
+            Focus::Documentation => Focus::Skills,
+            Focus::Skills => Focus::Options,
         };
     }
 
-    /// Move the selection up within the focused panel, wrapping around. In the
-    /// Themes panel this cycles the active theme to the previous one.
+    /// Move the selection up within the focused panel, wrapping around.
     pub fn select_prev(&mut self) {
         match self.focus {
             Focus::Options => {
@@ -433,11 +523,14 @@ impl WelcomeState {
                 let n = DOC_LABELS.len();
                 self.doc_selected = (self.doc_selected + n - 1) % n;
             }
+            Focus::Skills => {
+                let n = SKILL_LABELS.len();
+                self.skill_selected = (self.skill_selected + n - 1) % n;
+            }
         }
     }
 
-    /// Move the selection down within the focused panel, wrapping around. In the
-    /// Themes panel this cycles the active theme to the next one.
+    /// Move the selection down within the focused panel, wrapping around.
     pub fn select_next(&mut self) {
         match self.focus {
             Focus::Options => {
@@ -451,6 +544,10 @@ impl WelcomeState {
             Focus::Documentation => {
                 let n = DOC_LABELS.len();
                 self.doc_selected = (self.doc_selected + 1) % n;
+            }
+            Focus::Skills => {
+                let n = SKILL_LABELS.len();
+                self.skill_selected = (self.skill_selected + 1) % n;
             }
         }
     }
@@ -609,6 +706,175 @@ impl WelcomeState {
         self.dialog = Some(Dialog::NewSession(NewSessionDialog::new()));
     }
 
+    /// True when Skills block "Manage skills" row is selected.
+    pub fn on_skills_manage(&self) -> bool {
+        self.focus == Focus::Skills && self.skill_selected == 0
+    }
+
+    /// True when Skills block "Install a skill" row is selected.
+    pub fn on_skills_install(&self) -> bool {
+        self.focus == Focus::Skills && self.skill_selected == 1
+    }
+
+    /// Open the install dialog (Skills → "Install a skill").
+    pub fn open_install_dialog(&mut self) {
+        self.dialog = Some(Dialog::SkillInstall(InstallDialog::new()));
+    }
+
+    /// Open the manage dialog, loading and reconciling the ledger immediately.
+    pub fn open_manage_dialog(&mut self) {
+        let mut ledger = match SkillLedger::load() {
+            Ok(l) => l,
+            Err(e) => {
+                // Silently fall back to an empty ledger if load fails.
+                eprintln!("[bruce] failed to load skill ledger: {e}");
+                return;
+            }
+        };
+        // Reconcile drops any entry whose folder is gone (ADR-5: once per open).
+        let _ = ledger.reconcile();
+        let skills_root = claude_skills_dir().unwrap_or_default();
+        let entries: Vec<(SkillEntry, SkillState)> = ledger
+            .entries()
+            .iter()
+            .map(|e| {
+                let state = skill_state(&skills_root.join(&e.folder_name));
+                (e.clone(), state)
+            })
+            .collect();
+        self.dialog = Some(Dialog::SkillManage(ManageDialog {
+            entries,
+            selected: 0,
+            mode: ManageMode::Browse,
+            restart_needed: false,
+            filter: String::new(),
+            status_line: String::new(),
+        }));
+    }
+
+    /// Poll the in-flight InstallRunner (called from the 50ms timer branch).
+    ///
+    /// When the runner finishes: diffs the skills directory, auto-disables and
+    /// registers any new skills, then transitions the dialog to Done.
+    pub fn tick_install_runner(&mut self) {
+        // Pull the runner out temporarily so we can mutate other fields.
+        let runner_done = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+            if let Some(runner) = &d.runner {
+                runner.done.load(std::sync::atomic::Ordering::SeqCst)
+            } else {
+                false
+            }
+        } else {
+            return;
+        };
+
+        // Drain any new log lines on every tick while running (not just when done).
+        if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+            if let Some(runner) = &d.runner {
+                if let Ok(guard) = runner.log.lock() {
+                    // Copy new lines since last drain.
+                    let new_start = d.log.len();
+                    if guard.len() > new_start {
+                        d.log.extend_from_slice(&guard[new_start..]);
+                    }
+                }
+            }
+        }
+
+        if !runner_done {
+            return;
+        }
+
+        // Runner finished. Read exit_ok and `before` snapshot, then process.
+        let (exit_ok, before) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+            if let Some(runner) = &d.runner {
+                let ok = runner.exit_ok.lock().ok().and_then(|g| *g).unwrap_or(false);
+                (ok, runner.before.clone())
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+
+        if exit_ok {
+            // Diff the directory to find newly installed skill folders.
+            let after = skills_dir_snapshot().unwrap_or_default();
+            let new_folders: Vec<String> = after.difference(&before).cloned().collect();
+            let skills_root = claude_skills_dir().unwrap_or_default();
+            let mut ledger = match SkillLedger::load() {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("[bruce] ledger load failed post-install: {e}");
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.log.push(format!("Warning: could not load ledger: {e}"));
+                        d.log.push("Install succeeded (skill not registered).".to_string());
+                        d.phase = InstallPhase::Done { ok: true };
+                        d.runner = None;
+                    }
+                    return;
+                }
+            };
+
+            let install_cmd = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+                d.command.clone()
+            } else {
+                String::new()
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let mut post_lines: Vec<String> = Vec::new();
+            for folder in &new_folders {
+                let skill_dir = skills_root.join(folder);
+                let skill_md = skill_dir.join("SKILL.md");
+                let skill_md_disabled = skill_dir.join("SKILL.md.disabled");
+
+                if !skill_md.exists() && !skill_md_disabled.exists() {
+                    post_lines.push(format!(
+                        "Warning: {folder} has no SKILL.md — skipped."
+                    ));
+                    continue;
+                }
+
+                // Auto-disable: rename SKILL.md → SKILL.md.disabled.
+                if skill_md.exists() {
+                    if let Err(e) = disable_skill(&skill_dir) {
+                        post_lines.push(format!("Warning: could not disable {folder}: {e}"));
+                    }
+                }
+
+                let (name, description) = parse_frontmatter(&skill_dir);
+                let entry = SkillEntry {
+                    name,
+                    folder_name: folder.clone(),
+                    description,
+                    installed_at: now,
+                    install_command: install_cmd.clone(),
+                };
+                if let Err(e) = ledger.add(entry) {
+                    post_lines.push(format!("Warning: could not register {folder}: {e}"));
+                }
+            }
+            post_lines.push("Install succeeded.".to_string());
+
+            if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                d.log.extend(post_lines);
+                d.phase = InstallPhase::Done { ok: true };
+                d.runner = None;
+            }
+        } else {
+            if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                d.log.push("Install failed.".to_string());
+                d.phase = InstallPhase::Done { ok: false };
+                d.runner = None;
+            }
+        }
+    }
+
     /// Route a key press to the open dialog. No-op if none is open.
     pub fn dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
         match self.dialog {
@@ -656,6 +922,9 @@ impl WelcomeState {
                 }
                 WelcomeEvent::None
             }
+            Some(Dialog::SkillInstall(_)) => self.install_dialog_key(code),
+            Some(Dialog::SkillManage(_)) => self.manage_dialog_key(code),
+            Some(Dialog::SkillPreview { .. }) => self.preview_key(code),
             None => WelcomeEvent::None,
         }
     }
@@ -830,6 +1099,376 @@ impl WelcomeState {
         }
         WelcomeEvent::None
     }
+
+    // ─── Install dialog key handler ────────────────────────────────────────────
+
+    fn install_dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
+        let phase = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+            d.phase.clone()
+        } else {
+            return WelcomeEvent::None;
+        };
+
+        match phase {
+            InstallPhase::Idle => match code {
+                KeyCode::Esc => {
+                    self.dialog = None;
+                }
+                KeyCode::Enter => {
+                    // Snapshot command, validate non-empty, spawn runner.
+                    let cmd = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+                        let trimmed = d.command.trim().to_string();
+                        if trimmed.is_empty() { return WelcomeEvent::None; }
+                        trimmed
+                    } else {
+                        return WelcomeEvent::None;
+                    };
+                    match InstallRunner::spawn(cmd) {
+                        Ok(runner) => {
+                            if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                                d.runner = Some(runner);
+                                d.phase = InstallPhase::Running;
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                                d.log.push(format!("Error: {e}"));
+                                d.phase = InstallPhase::Done { ok: false };
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.command.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.command.pop();
+                    }
+                }
+                _ => {}
+            },
+            InstallPhase::Running => match code {
+                // Cannot escape while running; user must wait.
+                KeyCode::Up => {
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.log_scroll = d.log_scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.log_scroll = d.log_scroll.saturating_add(1);
+                    }
+                }
+                _ => {}
+            },
+            InstallPhase::Done { .. } => match code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.dialog = None;
+                }
+                KeyCode::Up => {
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.log_scroll = d.log_scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+                        d.log_scroll = d.log_scroll.saturating_add(1);
+                    }
+                }
+                _ => {}
+            },
+        }
+        WelcomeEvent::None
+    }
+
+    // ─── Manage dialog key handler ─────────────────────────────────────────────
+
+    fn manage_dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
+        let mode = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            d.mode.clone()
+        } else {
+            return WelcomeEvent::None;
+        };
+
+        match mode {
+            ManageMode::Browse => {
+                let filtered = self.manage_filtered_indices();
+                let n = filtered.len();
+                match code {
+                    KeyCode::Esc => {
+                        self.dialog = None;
+                        return WelcomeEvent::None;
+                    }
+                    KeyCode::Up => {
+                        if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                            if d.selected > 0 { d.selected -= 1; }
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                            if n > 0 { d.selected = (d.selected + 1).min(n - 1); }
+                        }
+                    }
+                    KeyCode::Char(c) if c != 'e' && c != 'E' && c != 'd' && c != 'D'
+                        && c != 'x' && c != 'X' && c != 'r' && c != 'R' => {
+                        // Filter input: accumulate characters.
+                        if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                            d.filter.push(c);
+                            d.selected = 0;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                            d.filter.pop();
+                            d.selected = 0;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        // Enter on a row opens the preview dialog.
+                        let entry_idx = filtered.get(
+                            if let Some(Dialog::SkillManage(d)) = &self.dialog {
+                                d.selected
+                            } else { return WelcomeEvent::None; }
+                        ).copied();
+                        if let Some(idx) = entry_idx {
+                            self.open_skill_preview(idx);
+                        }
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        let sel_idx = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+                            filtered.get(d.selected).copied()
+                        } else { None };
+                        if let Some(idx) = sel_idx {
+                            self.manage_enable(idx);
+                        }
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let sel_idx = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+                            filtered.get(d.selected).copied()
+                        } else { None };
+                        if let Some(idx) = sel_idx {
+                            self.manage_disable(idx);
+                        }
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') => {
+                        let sel_idx = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+                            filtered.get(d.selected).copied()
+                        } else { None };
+                        if let Some(idx) = sel_idx {
+                            if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                                d.mode = ManageMode::ConfirmDelete { target: idx };
+                            }
+                        }
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        // Reopen the current session from the manage dialog.
+                        if let Some(session) = self.sessions.first().cloned() {
+                            self.dialog = None;
+                            return WelcomeEvent::ReopenSession(session);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ManageMode::ConfirmDelete { target } => match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.manage_delete(target);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        d.mode = ManageMode::Browse;
+                    }
+                }
+                _ => {}
+            },
+        }
+        WelcomeEvent::None
+    }
+
+    /// Returns the filtered indices into ManageDialog.entries based on the current filter.
+    fn manage_filtered_indices(&self) -> Vec<usize> {
+        if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            let q = d.filter.trim().to_lowercase();
+            d.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (e, _))| {
+                    q.is_empty()
+                        || e.name.to_lowercase().contains(&q)
+                        || e.description.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn manage_enable(&mut self, idx: usize) {
+        let skill_dir = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            d.entries.get(idx).map(|(e, _)| {
+                claude_skills_dir().unwrap_or_default().join(&e.folder_name)
+            })
+        } else {
+            None
+        };
+        if let Some(dir) = skill_dir {
+            match enable_skill(&dir) {
+                Ok(()) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        if let Some((_, state)) = d.entries.get_mut(idx) {
+                            *state = skill_state(&dir);
+                        }
+                        d.restart_needed = true;
+                        d.status_line.clear();
+                    }
+                }
+                Err(e) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        d.status_line = format!("Error: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn manage_disable(&mut self, idx: usize) {
+        let skill_dir = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            d.entries.get(idx).map(|(e, _)| {
+                claude_skills_dir().unwrap_or_default().join(&e.folder_name)
+            })
+        } else {
+            None
+        };
+        if let Some(dir) = skill_dir {
+            match disable_skill(&dir) {
+                Ok(()) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        if let Some((_, state)) = d.entries.get_mut(idx) {
+                            *state = skill_state(&dir);
+                        }
+                        d.restart_needed = true;
+                        d.status_line.clear();
+                    }
+                }
+                Err(e) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        d.status_line = format!("Error: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn manage_delete(&mut self, idx: usize) {
+        // Take a snapshot of the entry to delete (avoids borrowing self.dialog).
+        let entry_clone = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            d.entries.get(idx).map(|(e, _)| e.clone())
+        } else {
+            None
+        };
+        if let Some(entry) = entry_clone {
+            let mut ledger = match SkillLedger::load() {
+                Ok(l) => l,
+                Err(e) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        d.status_line = format!("Error loading ledger: {e}");
+                        d.mode = ManageMode::Browse;
+                    }
+                    return;
+                }
+            };
+            match delete_skill(&entry, &mut ledger) {
+                Ok(()) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        d.entries.remove(idx);
+                        d.selected = d.selected.min(d.entries.len().saturating_sub(1));
+                        d.mode = ManageMode::Browse;
+                        d.restart_needed = true;
+                        d.status_line.clear();
+                    }
+                }
+                Err(e) => {
+                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                        d.status_line = format!("Error: {e}");
+                        d.mode = ManageMode::Browse;
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── Skill preview key handler ─────────────────────────────────────────────
+
+    fn open_skill_preview(&mut self, idx: usize) {
+        let (entry, state_val) = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            match d.entries.get(idx) {
+                Some(pair) => pair.clone(),
+                None => return,
+            }
+        } else {
+            return;
+        };
+
+        let skill_dir = claude_skills_dir().unwrap_or_default().join(&entry.folder_name);
+        let path = if state_val == SkillState::Disabled {
+            skill_dir.join("SKILL.md.disabled")
+        } else {
+            skill_dir.join("SKILL.md")
+        };
+
+        let lines: Vec<String> = match std::fs::read_to_string(&path) {
+            Ok(content) => content.lines().map(|l| l.to_string()).collect(),
+            Err(e) => vec![format!("Error reading skill file: {e}")],
+        };
+
+        // Stash the current ManageDialog before replacing dialog with preview.
+        if let Some(Dialog::SkillManage(d)) = self.dialog.take() {
+            self.pending_manage = Some(d);
+        }
+        self.dialog = Some(Dialog::SkillPreview {
+            lines,
+            scroll: 0,
+            entry_name: entry.name.clone(),
+        });
+    }
+
+    fn preview_key(&mut self, code: KeyCode) -> WelcomeEvent {
+        match code {
+            KeyCode::Up => {
+                if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
+                    *scroll = scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
+                    *scroll = scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
+                    *scroll = scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
+                    *scroll = scroll.saturating_add(10);
+                }
+            }
+            KeyCode::Esc | KeyCode::Enter => {
+                // Pop back to ManageDialog.
+                self.dialog = None;
+                if let Some(manage) = self.pending_manage.take() {
+                    self.dialog = Some(Dialog::SkillManage(manage));
+                }
+            }
+            _ => {}
+        }
+        WelcomeEvent::None
+    }
 }
 
 /// Draw the full welcome screen into `frame`.
@@ -852,20 +1491,32 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
     ])
     .split(area);
 
-    // One row, three equal blocks: Options, Settings, Documentation.
-    let cols = Layout::horizontal([
-        Constraint::Percentage(34),
-        Constraint::Percentage(33),
-        Constraint::Percentage(33),
+    // 2×2 grid: row 1 = Options | Settings, row 2 = Documentation | Skills.
+    let rows = Layout::vertical([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
     ])
     .split(chunks[4]);
+
+    let top = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(rows[0]);
+
+    let bottom = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(rows[1]);
 
     render_badge(frame, chunks[0], state);
     render_logo(frame, chunks[1], state);
     render_tagline(frame, chunks[2], state);
-    render_options(frame, cols[0], state);
-    render_settings(frame, cols[1], state);
-    render_documentation(frame, cols[2], state);
+    render_options(frame, top[0], state);
+    render_settings(frame, top[1], state);
+    render_documentation(frame, bottom[0], state);
+    render_skills(frame, bottom[1], state);
     render_footer(frame, chunks[5], state);
 
     // Dialogs are modal overlays. Dim everything behind them first so the screen
@@ -880,6 +1531,11 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
         Some(Dialog::UpdateInfo) => render_update_info_dialog(frame, area, &pal, state),
         Some(Dialog::Keybindings(off)) => render_keybindings_dialog(frame, area, &pal, *off),
         Some(Dialog::ThemePicker(idx)) => render_theme_picker_dialog(frame, area, &pal, *idx),
+        Some(Dialog::SkillInstall(d)) => render_install_dialog(frame, area, &pal, d),
+        Some(Dialog::SkillManage(d)) => render_manage_dialog(frame, area, &pal, state, d),
+        Some(Dialog::SkillPreview { lines, scroll, entry_name }) => {
+            render_preview_dialog(frame, area, &pal, lines, *scroll, entry_name)
+        }
         None => {}
     }
 }
@@ -955,6 +1611,298 @@ fn render_documentation(frame: &mut Frame, area: Rect, state: &WelcomeState) {
     let mut list_state = ListState::default();
     list_state.select(focused.then_some(state.doc_selected * 2));
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// The Skills block: "Manage skills" and "Install a skill" rows.
+fn render_skills(frame: &mut Frame, area: Rect, state: &WelcomeState) {
+    let pal = state.theme.palette();
+    let focused = state.focus == Focus::Skills;
+
+    let mut items: Vec<ListItem> = Vec::new();
+    for label in SKILL_LABELS {
+        items.push(ListItem::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+        ))));
+        items.push(ListItem::new(Line::raw("")));
+    }
+
+    let block = panel_block(&pal, " Skills ", focused);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style(&pal));
+
+    let mut list_state = ListState::default();
+    list_state.select(focused.then_some(state.skill_selected * 2));
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Install-a-skill dialog: command input + live log + disclaimer.
+fn render_install_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, d: &InstallDialog) {
+    let area = centered_rect(70, 80, screen);
+    frame.render_widget(Clear, area);
+    let block = dialog_block(pal, " Install a skill ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Layout: disclaimer (1), command input (2), separator (1), log (rest).
+    let sections = Layout::vertical([
+        Constraint::Length(1), // disclaimer
+        Constraint::Length(2), // command input
+        Constraint::Length(1), // separator
+        Constraint::Min(1),    // log region
+    ])
+    .split(inner);
+
+    // Disclaimer — always visible (REQ-2 / Scenario 2-D).
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "  Command runs in your shell — verify before running.",
+            Style::default().fg(pal.accent),
+        )))
+        .style(Style::default().bg(pal.bg)),
+        sections[0],
+    );
+
+    // Command input with cursor.
+    let cursor = if d.phase == InstallPhase::Idle { "▏" } else { "" };
+    let input_lines = vec![
+        Line::from(Span::styled(
+            "  Command",
+            Style::default().fg(pal.dim),
+        )),
+        Line::from(Span::styled(
+            format!("  {}{}", d.command, cursor),
+            Style::default()
+                .fg(pal.bg)
+                .bg(pal.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(input_lines).style(Style::default().bg(pal.bg)),
+        sections[1],
+    );
+
+    // Placeholder hint in Idle + empty.
+    if d.phase == InstallPhase::Idle && d.command.is_empty() {
+        let hint = Paragraph::new(Line::from(Span::styled(
+            "  e.g. npx skills add <name>",
+            Style::default().fg(pal.dim),
+        )))
+        .style(Style::default().bg(pal.bg));
+        // Overlay the hint on the second line of sections[1] (y+1).
+        let hint_area = Rect { y: sections[1].y + 1, height: 1, ..sections[1] };
+        frame.render_widget(hint, hint_area);
+    }
+
+    // Log region.
+    let log_height = sections[3].height as usize;
+    let total = d.log.len();
+    let off = (d.log_scroll as usize).min(total.saturating_sub(log_height));
+    let visible: Vec<Line> = d.log[off..]
+        .iter()
+        .take(log_height)
+        .map(|line| {
+            let color = if line.starts_with("Install succeeded") {
+                pal.accent
+            } else if line.starts_with("Install failed") || line.starts_with("Error") || line.starts_with("Warning") {
+                pal.removed
+            } else {
+                pal.fg
+            };
+            Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().bg(pal.bg)),
+        sections[3],
+    );
+}
+
+/// Manage-skills dialog: filtered list with ●/○/! markers.
+fn render_manage_dialog(
+    frame: &mut Frame,
+    screen: Rect,
+    pal: &Palette,
+    _state: &WelcomeState,
+    d: &ManageDialog,
+) {
+    let area = centered_rect(70, 80, screen);
+    frame.render_widget(Clear, area);
+
+    let title = match &d.mode {
+        ManageMode::Browse => " Manage skills ",
+        ManageMode::ConfirmDelete { .. } => " Confirm delete ",
+    };
+    let block = dialog_block(pal, title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match &d.mode {
+        ManageMode::Browse => {
+            // Layout: filter input (2), restart banner (1 if needed), list (rest), status (1).
+            let banner_h = if d.restart_needed { 1u16 } else { 0 };
+            let sections = Layout::vertical([
+                Constraint::Length(2),        // filter
+                Constraint::Length(banner_h), // restart banner (0 when not needed)
+                Constraint::Min(1),           // skill list
+                Constraint::Length(1),        // status line
+            ])
+            .split(inner);
+
+            // Filter input.
+            let filter_lines = vec![
+                Line::from(Span::styled("  Filter", Style::default().fg(pal.dim))),
+                Line::from(Span::styled(
+                    format!("  {}▏", d.filter),
+                    Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(filter_lines).style(Style::default().bg(pal.bg)),
+                sections[0],
+            );
+
+            // Restart banner.
+            if d.restart_needed && banner_h > 0 {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        "  Restart the Claude session to load changes.",
+                        Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                    )))
+                    .style(Style::default().bg(pal.bg)),
+                    sections[1],
+                );
+            }
+
+            // Filtered skill list.
+            let q = d.filter.trim().to_lowercase();
+            let filtered: Vec<usize> = d
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (e, _))| {
+                    q.is_empty()
+                        || e.name.to_lowercase().contains(&q)
+                        || e.description.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if filtered.is_empty() {
+                let msg = if d.entries.is_empty() {
+                    "  No skills installed yet."
+                } else {
+                    "  No matching skills."
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::styled(msg, Style::default().fg(pal.dim)))
+                        .style(Style::default().bg(pal.bg)),
+                    sections[2],
+                );
+            } else {
+                let items: Vec<ListItem> = filtered
+                    .iter()
+                    .filter_map(|&i| d.entries.get(i))
+                    .map(|(entry, st)| {
+                        let (marker, marker_color) = match st {
+                            SkillState::Enabled => ("●", pal.accent),
+                            SkillState::Disabled => ("○", pal.dim),
+                            SkillState::Broken => ("!", pal.removed),
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                format!(" {marker} "),
+                                Style::default().fg(marker_color),
+                            ),
+                            Span::styled(
+                                format!("{:<20}", entry.name),
+                                Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                entry.description.chars().take(30).collect::<String>(),
+                                Style::default().fg(pal.dim),
+                            ),
+                        ]))
+                    })
+                    .collect();
+
+                let list = List::new(items).highlight_style(highlight_style(pal));
+                let mut list_state = ListState::default();
+                list_state.select(Some(d.selected.min(filtered.len().saturating_sub(1))));
+                frame.render_stateful_widget(list, sections[2], &mut list_state);
+            }
+
+            // Status line.
+            if !d.status_line.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  {}", d.status_line),
+                        Style::default().fg(pal.removed),
+                    )))
+                    .style(Style::default().bg(pal.bg)),
+                    sections[3],
+                );
+            }
+        }
+        ManageMode::ConfirmDelete { target } => {
+            let name = d
+                .entries
+                .get(*target)
+                .map(|(e, _)| e.name.as_str())
+                .unwrap_or("?");
+            let lines = vec![
+                Line::from(Span::styled(
+                    "  Delete this skill?",
+                    Style::default().fg(pal.fg).add_modifier(Modifier::BOLD),
+                )),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    format!("  {name}"),
+                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                )),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "  This removes the skill folder and its ledger entry.",
+                    Style::default().fg(pal.dim),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(pal.bg)),
+                inner,
+            );
+        }
+    }
+}
+
+/// Scrollable raw SKILL.md preview dialog.
+fn render_preview_dialog(
+    frame: &mut Frame,
+    screen: Rect,
+    pal: &Palette,
+    lines: &[String],
+    scroll: u16,
+    entry_name: &str,
+) {
+    let area = centered_rect(74, 85, screen);
+    frame.render_widget(Clear, area);
+    let title = format!(" {} — SKILL.md ", entry_name);
+    let block = dialog_block(pal, &title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let height = inner.height as usize;
+    let off = (scroll as usize).min(lines.len().saturating_sub(height));
+    let visible: Vec<Line> = lines[off..]
+        .iter()
+        .take(height)
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(pal.fg))))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(visible).style(Style::default().bg(pal.bg)),
+        inner,
+    );
 }
 
 /// Draw the keybindings reference: a scrollable, sectioned list of every key.
@@ -1378,6 +2326,56 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
             Span::styled(" preview   ", Style::default().fg(pal.dim)),
             Span::styled("Enter/Esc", Style::default().fg(pal.accent)),
             Span::styled(" done", Style::default().fg(pal.dim)),
+        ]),
+        Some(Dialog::SkillInstall(d)) => match d.phase {
+            InstallPhase::Idle => Line::from(vec![
+                Span::styled("  type command   ", Style::default().fg(pal.dim)),
+                Span::styled("Enter", Style::default().fg(pal.accent)),
+                Span::styled(" run   ", Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" cancel", Style::default().fg(pal.dim)),
+            ]),
+            InstallPhase::Running => Line::from(vec![
+                Span::styled("  ↑↓", Style::default().fg(pal.accent)),
+                Span::styled(" scroll log   ", Style::default().fg(pal.dim)),
+                Span::styled("waiting for install…", Style::default().fg(pal.dim)),
+            ]),
+            InstallPhase::Done { .. } => Line::from(vec![
+                Span::styled("  ↑↓", Style::default().fg(pal.accent)),
+                Span::styled(" scroll   ", Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" close", Style::default().fg(pal.dim)),
+            ]),
+        },
+        Some(Dialog::SkillManage(d)) => match &d.mode {
+            ManageMode::Browse => Line::from(vec![
+                Span::styled("  type", Style::default().fg(pal.accent)),
+                Span::styled(" filter   ", Style::default().fg(pal.dim)),
+                Span::styled("E", Style::default().fg(pal.accent)),
+                Span::styled(" enable   ", Style::default().fg(pal.dim)),
+                Span::styled("D", Style::default().fg(pal.accent)),
+                Span::styled(" disable   ", Style::default().fg(pal.dim)),
+                Span::styled("X", Style::default().fg(pal.accent)),
+                Span::styled(" delete   ", Style::default().fg(pal.dim)),
+                Span::styled("Enter", Style::default().fg(pal.accent)),
+                Span::styled(" preview   ", Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" close", Style::default().fg(pal.dim)),
+            ]),
+            ManageMode::ConfirmDelete { .. } => Line::from(vec![
+                Span::styled("  Y", Style::default().fg(pal.accent)),
+                Span::styled(" delete   ", Style::default().fg(pal.dim)),
+                Span::styled("N", Style::default().fg(pal.accent)),
+                Span::styled("/", Style::default().fg(pal.dim)),
+                Span::styled("Esc", Style::default().fg(pal.accent)),
+                Span::styled(" cancel", Style::default().fg(pal.dim)),
+            ]),
+        },
+        Some(Dialog::SkillPreview { .. }) => Line::from(vec![
+            Span::styled("  ↑↓/PgUp/PgDn", Style::default().fg(pal.accent)),
+            Span::styled(" scroll   ", Style::default().fg(pal.dim)),
+            Span::styled("Esc", Style::default().fg(pal.accent)),
+            Span::styled(" back to list", Style::default().fg(pal.dim)),
         ]),
         None => Line::from(vec![
             Span::styled("  ↑↓", Style::default().fg(pal.accent)),
