@@ -786,10 +786,10 @@ impl WelcomeState {
         }
 
         // Runner finished. Read exit_ok and `before` snapshot, then process.
-        let (exit_ok, before) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+        let (exit_code, before) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
             if let Some(runner) = &d.runner {
-                let ok = runner.exit_ok.lock().ok().and_then(|g| *g).unwrap_or(false);
-                (ok, runner.before.clone())
+                let code = runner.exit_code.lock().ok().and_then(|g| *g).unwrap_or(-1);
+                (code, runner.before.clone())
             } else {
                 return;
             }
@@ -797,7 +797,7 @@ impl WelcomeState {
             return;
         };
 
-        if exit_ok {
+        if exit_code == 0 {
             // Diff the directory to find newly installed skill folders.
             let after = skills_dir_snapshot().unwrap_or_default();
             let new_folders: Vec<String> = after.difference(&before).cloned().collect();
@@ -868,7 +868,7 @@ impl WelcomeState {
             }
         } else {
             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                d.log.push("Install failed.".to_string());
+                d.log.push(format!("Install failed (exit {exit_code})."));
                 d.phase = InstallPhase::Done { ok: false };
                 d.runner = None;
             }

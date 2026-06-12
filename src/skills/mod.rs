@@ -332,9 +332,10 @@ pub struct InstallRunner {
     /// Set to `true` by the wait-thread after the child exits and all reader
     /// threads have joined.
     pub done: Arc<AtomicBool>,
-    /// Exit success flag. `None` = still in flight; `Some(true)` = exit 0;
-    /// `Some(false)` = non-zero exit.
-    pub exit_ok: Arc<Mutex<Option<bool>>>,
+    /// Exit code of the finished child. `None` = still in flight; `Some(0)` =
+    /// success; `Some(n)` = failed with code `n` (or `-1` when there is no code,
+    /// e.g. the child was killed by a signal).
+    pub exit_code: Arc<Mutex<Option<i32>>>,
     /// Directory snapshot taken immediately before the child was spawned.
     /// Used to diff against the after-snapshot when `done` becomes true.
     pub before: HashSet<String>,
@@ -346,7 +347,7 @@ impl InstallRunner {
     /// Three threads are started:
     /// 1. stdout-reader — pushes lines to `log`
     /// 2. stderr-reader — pushes lines to `log`
-    /// 3. wait-thread — joins readers, calls `child.wait()`, writes `exit_ok`,
+    /// 3. wait-thread — joins readers, calls `child.wait()`, writes `exit_code`,
     ///    sets `done = true`
     ///
     /// The `before` snapshot is taken inside this function, before the child
@@ -357,7 +358,7 @@ impl InstallRunner {
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));
-        let exit_ok: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
 
         // Dispatch through the platform shell (ADR-1: handles .cmd shims,
         // pipes, builtins transparently on all platforms).
@@ -412,15 +413,17 @@ impl InstallRunner {
 
         // Thread 3 — wait-thread: joins readers then waits on the child.
         let done_t = Arc::clone(&done);
-        let exit_ok_t = Arc::clone(&exit_ok);
+        let exit_code_t = Arc::clone(&exit_code);
         std::thread::spawn(move || {
             // Wait for both readers to drain before checking exit status.
             let _ = stdout_handle.join();
             let _ = stderr_handle.join();
 
-            let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-            if let Ok(mut guard) = exit_ok_t.lock() {
-                *guard = Some(ok);
+            // `code()` is `None` when the child was terminated by a signal
+            // (Unix); report -1 there so the UI still has a number to show.
+            let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            if let Ok(mut guard) = exit_code_t.lock() {
+                *guard = Some(code);
             }
             done_t.store(true, Ordering::SeqCst);
         });
@@ -428,7 +431,7 @@ impl InstallRunner {
         Ok(Self {
             log,
             done,
-            exit_ok,
+            exit_code,
             before,
         })
     }
