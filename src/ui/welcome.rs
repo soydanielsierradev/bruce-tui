@@ -208,6 +208,10 @@ pub struct InstallDialog {
     /// Post-install summary (success or failure message). Shown in the log
     /// region after the PTY exits and `pty` is set back to `None`.
     pub summary: Option<String>,
+    /// Last (rows, cols) the PTY was resized to, so render only resizes on a
+    /// real change. Resizing rebuilds the vt100 parser (clearing the screen),
+    /// so resizing every frame would blank the live output.
+    pub last_pty_size: Cell<(u16, u16)>,
 }
 
 impl InstallDialog {
@@ -219,6 +223,7 @@ impl InstallDialog {
             phase: InstallPhase::Idle,
             spawn_error: None,
             summary: None,
+            last_pty_size: Cell::new((24, 80)),
         }
     }
 }
@@ -1767,10 +1772,13 @@ fn render_install_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, d: &Ins
 
     match &d.pty {
         Some(pty) => {
-            // Resize PTY to the actual dialog rect each frame so it reflows
-            // when the terminal is resized. Guard against zero dimensions.
-            if log_rect.height > 0 && log_rect.width > 0 {
-                pty.resize(log_rect.height, log_rect.width);
+            // Resize the PTY to the dialog rect ONLY when it actually changes.
+            // resize() rebuilds the vt100 parser (clearing the screen), so doing
+            // it every frame would wipe the live menu/output before it's seen.
+            let size = (log_rect.height, log_rect.width);
+            if size.0 > 0 && size.1 > 0 && d.last_pty_size.get() != size {
+                pty.resize(size.0, size.1);
+                d.last_pty_size.set(size);
             }
             if let Some(parser) = pty.lock_parser() {
                 let screen_data = parser.screen();
