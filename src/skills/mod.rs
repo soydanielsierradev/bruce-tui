@@ -165,11 +165,6 @@ pub fn dir_skill_names(dir: &Path) -> Result<HashSet<String>> {
     }
 }
 
-/// Snapshot the immediate child directory names under `~/.claude/skills/`.
-pub fn skills_dir_snapshot() -> Result<HashSet<String>> {
-    dir_skill_names(&claude_skills_dir()?)
-}
-
 /// The skill roots Bruce watches for newly installed skills: `~/.claude/skills`
 /// (where Claude reads) and `~/.agents/skills` (where `npx skills` and similar
 /// tools install). Roots that can't be resolved are skipped.
