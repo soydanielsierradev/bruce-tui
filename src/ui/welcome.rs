@@ -22,8 +22,8 @@ use crate::config::{Config, claude_skills_dir};
 use crate::session::{self, Session};
 use crate::skills::{
     InstallRunner, SkillEntry, SkillLedger, SkillState,
-    delete_skill, disable_skill, enable_skill, parse_frontmatter, skill_state,
-    skills_dir_snapshot,
+    delete_skill, dir_skill_names, disable_skill, enable_skill, parse_frontmatter,
+    relocate_into_claude, skill_state,
 };
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 use crate::update;
@@ -798,10 +798,18 @@ impl WelcomeState {
         };
 
         if exit_code == 0 {
-            // Diff the directory to find newly installed skill folders.
-            let after = skills_dir_snapshot().unwrap_or_default();
-            let new_folders: Vec<String> = after.difference(&before).cloned().collect();
-            let skills_root = claude_skills_dir().unwrap_or_default();
+            // Find new skill folders across every watched root. npx skills and
+            // similar tools install into ~/.agents/skills, not ~/.claude/skills,
+            // so we diff each root and trace a new skill to where it landed.
+            let mut new_skills: Vec<(PathBuf, String)> = Vec::new();
+            for (root, before_set) in &before {
+                let after = dir_skill_names(root).unwrap_or_default();
+                for folder in after.difference(before_set) {
+                    new_skills.push((root.join(folder), folder.clone()));
+                }
+            }
+
+            let claude_root = claude_skills_dir().unwrap_or_default();
             let mut ledger = match SkillLedger::load() {
                 Ok(l) => l,
                 Err(e) => {
@@ -828,15 +836,29 @@ impl WelcomeState {
                 .unwrap_or(0);
 
             let mut post_lines: Vec<String> = Vec::new();
-            for folder in &new_folders {
-                let skill_dir = skills_root.join(folder);
+            let mut registered = 0usize;
+            for (src_dir, folder) in &new_skills {
+                // Bring it into ~/.claude/skills if the command dropped it
+                // elsewhere (e.g. ~/.agents/skills) — the only dir Claude reads.
+                let skill_dir = if src_dir.starts_with(&claude_root) {
+                    src_dir.clone()
+                } else {
+                    match relocate_into_claude(src_dir, folder) {
+                        Ok(dest) => {
+                            post_lines.push(format!("Moved {folder} into ~/.claude/skills."));
+                            dest
+                        }
+                        Err(e) => {
+                            post_lines.push(format!("Warning: could not move {folder}: {e}"));
+                            continue;
+                        }
+                    }
+                };
+
                 let skill_md = skill_dir.join("SKILL.md");
                 let skill_md_disabled = skill_dir.join("SKILL.md.disabled");
-
                 if !skill_md.exists() && !skill_md_disabled.exists() {
-                    post_lines.push(format!(
-                        "Warning: {folder} has no SKILL.md — skipped."
-                    ));
+                    post_lines.push(format!("Warning: {folder} has no SKILL.md — skipped."));
                     continue;
                 }
 
@@ -857,9 +879,36 @@ impl WelcomeState {
                 };
                 if let Err(e) = ledger.add(entry) {
                     post_lines.push(format!("Warning: could not register {folder}: {e}"));
+                } else {
+                    registered += 1;
                 }
             }
-            post_lines.push("Install succeeded.".to_string());
+
+            if registered > 0 {
+                // Persist the ledger so the Manage dialog (which reads from disk)
+                // shows the freshly installed, disabled skills.
+                if let Err(e) = ledger.save() {
+                    post_lines.push(format!("Warning: could not save the skills ledger: {e}"));
+                }
+                post_lines.push(format!(
+                    "Install succeeded — {registered} skill(s) added, disabled by default."
+                ));
+            } else if new_skills.is_empty() {
+                // Exit 0 but nothing new in any watched root — be honest.
+                post_lines.push(
+                    "Command finished (exit 0) but no new skill appeared in ~/.claude/skills or ~/.agents/skills."
+                        .to_string(),
+                );
+                post_lines.push(
+                    "Nothing was registered — check the command actually installs a skill (npx skills needs -y)."
+                        .to_string(),
+                );
+            } else {
+                post_lines.push(
+                    "Command finished, but the new skill(s) could not be registered — see the warnings above."
+                        .to_string(),
+                );
+            }
 
             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
                 d.log.extend(post_lines);

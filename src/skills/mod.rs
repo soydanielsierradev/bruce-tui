@@ -18,7 +18,7 @@ use std::{fs, io};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{bruce_dir, claude_skills_dir};
+use crate::config::{agents_skills_dir, bruce_dir, claude_skills_dir};
 
 // ─── Domain types ────────────────────────────────────────────────────────────
 
@@ -143,9 +143,8 @@ impl SkillLedger {
 ///   normal pre-install state and must not surface an error (REQ-8 / Scenario 8-A).
 /// - Only directories are included; files are ignored.
 /// - No recursion; `~/.claude/plugins/` is never accessed.
-pub fn skills_dir_snapshot() -> Result<HashSet<String>> {
-    let dir = claude_skills_dir()?;
-    match fs::read_dir(&dir) {
+pub fn dir_skill_names(dir: &Path) -> Result<HashSet<String>> {
+    match fs::read_dir(dir) {
         Ok(entries) => {
             let mut set = HashSet::new();
             for entry in entries {
@@ -167,6 +166,51 @@ pub fn skills_dir_snapshot() -> Result<HashSet<String>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(HashSet::new()),
         Err(e) => Err(e).context("reading skills directory"),
     }
+}
+
+/// Snapshot the immediate child directory names under `~/.claude/skills/`.
+pub fn skills_dir_snapshot() -> Result<HashSet<String>> {
+    dir_skill_names(&claude_skills_dir()?)
+}
+
+/// The skill roots Bruce watches for newly installed skills: `~/.claude/skills`
+/// (where Claude reads) and `~/.agents/skills` (where `npx skills` and similar
+/// tools install). Roots that can't be resolved are skipped.
+pub fn skill_roots() -> Vec<PathBuf> {
+    [claude_skills_dir(), agents_skills_dir()]
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .collect()
+}
+
+/// Snapshot the top-level folder names of every watched root, paired with the
+/// root, so an install can be diffed per-root and a new skill traced back to the
+/// directory it landed in.
+pub fn snapshot_roots() -> Vec<(PathBuf, HashSet<String>)> {
+    skill_roots()
+        .into_iter()
+        .map(|root| {
+            let names = dir_skill_names(&root).unwrap_or_default();
+            (root, names)
+        })
+        .collect()
+}
+
+/// Move a skill folder `src` into `~/.claude/skills/<folder>` — where Claude
+/// actually reads skills — and return the destination. Used to bridge tools
+/// (e.g. `npx skills`) that install into `~/.agents/skills` and never symlink
+/// into `~/.claude/skills`. Errors if the destination already exists, or if the
+/// move fails (e.g. across filesystems).
+pub fn relocate_into_claude(src: &Path, folder: &str) -> Result<PathBuf> {
+    let dest = claude_skills_dir()?.join(folder);
+    if dest.exists() {
+        return Err(anyhow!("a skill named {folder} already exists in ~/.claude/skills"));
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).context("creating ~/.claude/skills")?;
+    }
+    fs::rename(src, &dest).with_context(|| format!("moving {folder} into ~/.claude/skills"))?;
+    Ok(dest)
 }
 
 // ─── Frontmatter parser ───────────────────────────────────────────────────────
@@ -336,9 +380,10 @@ pub struct InstallRunner {
     /// success; `Some(n)` = failed with code `n` (or `-1` when there is no code,
     /// e.g. the child was killed by a signal).
     pub exit_code: Arc<Mutex<Option<i32>>>,
-    /// Directory snapshot taken immediately before the child was spawned.
-    /// Used to diff against the after-snapshot when `done` becomes true.
-    pub before: HashSet<String>,
+    /// Per-root folder snapshot taken immediately before the child was spawned
+    /// (`~/.claude/skills` and `~/.agents/skills`). Diffed against the after
+    /// snapshot when `done` becomes true to find newly installed skills.
+    pub before: Vec<(PathBuf, HashSet<String>)>,
 }
 
 /// Clean one raw output line for display in the install log.
@@ -404,8 +449,9 @@ impl InstallRunner {
     /// The `before` snapshot is taken inside this function, before the child
     /// starts, to guarantee pre-install state (ADR-3).
     pub fn spawn(command: String) -> Result<Self> {
-        // Snapshot BEFORE the child is started (ADR-3).
-        let before = skills_dir_snapshot().unwrap_or_default();
+        // Snapshot every watched root BEFORE the child is started (ADR-3), so a
+        // skill landing in ~/.agents/skills (npx skills) is detected too.
+        let before = snapshot_roots();
 
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));

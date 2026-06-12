@@ -125,15 +125,25 @@ fn config_base() -> Result<PathBuf> {
     Ok(home.join(".config"))
 }
 
-/// Resolve the Claude CLI skills directory: `~/.claude/skills`.
-///
-/// Uses `HOME` (Unix/macOS) or `USERPROFILE` (Windows) — no platform-exclusive
-/// APIs, no `dirs` crate (REQ-8, REQ-9).
-pub fn claude_skills_dir() -> Result<PathBuf> {
-    let home = env_path("HOME")
+/// Resolve the user's home directory via `HOME` (Unix/macOS) or `USERPROFILE`
+/// (Windows) — no platform-exclusive APIs, no `dirs` crate (REQ-8, REQ-9).
+pub fn home_dir() -> Result<PathBuf> {
+    env_path("HOME")
         .or_else(|| env_path("USERPROFILE"))
-        .context("no HOME or USERPROFILE set; cannot locate ~/.claude/skills")?;
-    Ok(home.join(".claude").join("skills"))
+        .context("no HOME or USERPROFILE set; cannot locate the home directory")
+}
+
+/// Resolve the Claude CLI skills directory: `~/.claude/skills` — the only place
+/// Claude reads skills from.
+pub fn claude_skills_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude").join("skills"))
+}
+
+/// Resolve the cross-agent skills directory: `~/.agents/skills`. Tools like
+/// `npx skills` install here (and notoriously fail to symlink into
+/// `~/.claude/skills`), so Bruce watches it and relocates new skills.
+pub fn agents_skills_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".agents").join("skills"))
 }
 
 /// Read an environment variable as a non-empty path.
