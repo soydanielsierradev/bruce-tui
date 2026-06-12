@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use crate::ui::theme::Palette;
 
 /// How to launch the child process inside the PTY.
 ///
@@ -41,6 +45,9 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// through the conversation. Bounded so a long session can't grow unbounded.
 const SCROLLBACK_LINES: usize = 10_000;
 
+/// Scrollback lines for install dialog PTY — smaller cap since it's short-lived.
+const INSTALL_SCROLLBACK: usize = 200;
+
 /// After this long without any PTY output we treat the child as idle (waiting
 /// for input) and show its cursor; while output is still streaming we keep the
 /// cursor hidden so it doesn't visibly fly around the pane mid-response.
@@ -54,14 +61,20 @@ pub struct PtySession {
     writer: SharedWriter,
     /// Master side, kept to resize the PTY.
     master: Box<dyn MasterPty + Send>,
-    /// The child process, killed on drop.
-    child: Box<dyn Child + Send + Sync>,
+    /// The child process, shared with the reader thread (for try_wait on EOF)
+    /// and Drop (for kill). Was `Box<dyn Child>` before, now Arc<Mutex<>> so
+    /// the reader thread can call try_wait after EOF without moving ownership.
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     /// When the reader thread last received any output, to tell a streaming
     /// response apart from an idle prompt (see [`PtySession::output_idle`]).
     last_output: Arc<Mutex<Instant>>,
     /// Set once the child has produced its first byte of output, so the loading
     /// transition knows Claude has started painting (see [`PtySession::has_output`]).
     got_output: Arc<AtomicBool>,
+    /// Set by the reader thread after EOF; the install dialog polls this.
+    exited: Arc<AtomicBool>,
+    /// Exit code written by the reader thread after the child exits.
+    exit_code: Arc<Mutex<Option<i32>>>,
     /// Reader thread handle; dropping it detaches the thread.
     _reader: JoinHandle<()>,
 }
@@ -78,9 +91,13 @@ impl PtySession {
             pixel_height: 0,
         })?;
 
-        let child = pair.slave.spawn_command(spawn_command(opts))?;
+        let child_raw = pair.slave.spawn_command(spawn_command(opts))?;
         // The slave handle isn't needed once the child owns it.
         drop(pair.slave);
+
+        let child: Arc<Mutex<Box<dyn Child + Send + Sync>>> =
+            Arc::new(Mutex::new(child_raw));
+        let child_for_exit = Arc::clone(&child);
 
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
@@ -92,6 +109,10 @@ impl PtySession {
         let last_output_for_thread = Arc::clone(&last_output);
         let got_output = Arc::new(AtomicBool::new(false));
         let got_output_for_thread = Arc::clone(&got_output);
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_thread = Arc::clone(&exited);
+        let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let exit_code_for_thread = Arc::clone(&exit_code);
 
         let reader_handle = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -116,6 +137,18 @@ impl PtySession {
                     }
                 }
             }
+            // Child exited (EOF). Read its exit code via try_wait; fall back to
+            // -1 if the wait fails or the child was killed by a signal (no code).
+            let code = child_for_exit
+                .lock()
+                .ok()
+                .and_then(|mut c| c.try_wait().ok().flatten())
+                .map(|s| s.exit_code() as i32)
+                .unwrap_or(-1);
+            if let Ok(mut g) = exit_code_for_thread.lock() {
+                *g = Some(code);
+            }
+            exited_for_thread.store(true, Ordering::SeqCst);
         });
 
         Ok(Self {
@@ -125,6 +158,108 @@ impl PtySession {
             child,
             last_output,
             got_output,
+            exited,
+            exit_code,
+            _reader: reader_handle,
+        })
+    }
+
+    /// Spawn an arbitrary command in a new PTY sized `rows`x`cols`.
+    ///
+    /// Unlike [`PtySession::new`], this does NOT read `BRUCE_CMD` and does NOT
+    /// add CI/NO_COLOR env vars — the caller controls what runs. Used by the
+    /// install dialog to give interactive installers (e.g. `npx skills add`) a
+    /// real TTY so they can render ANSI menus and accept keyboard input.
+    pub fn new_command(
+        rows: u16,
+        cols: u16,
+        program: &str,
+        args: &[&str],
+        cwd: Option<PathBuf>,
+    ) -> Result<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        // Propagate parent env so PATH resolution works.
+        for (key, value) in std::env::vars() {
+            cmd.env(key, value);
+        }
+        cmd.env("TERM", "xterm-256color");
+        let cwd = cwd.or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        }
+
+        let child_raw = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+
+        let child: Arc<Mutex<Box<dyn Child + Send + Sync>>> =
+            Arc::new(Mutex::new(child_raw));
+        let child_for_exit = Arc::clone(&child);
+
+        let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let mut reader = pair.master.try_clone_reader()?;
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, INSTALL_SCROLLBACK)));
+        let parser_for_thread = Arc::clone(&parser);
+        let writer_for_thread = Arc::clone(&writer);
+        let last_output = Arc::new(Mutex::new(Instant::now()));
+        let last_output_for_thread = Arc::clone(&last_output);
+        let got_output = Arc::new(AtomicBool::new(false));
+        let got_output_for_thread = Arc::clone(&got_output);
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_thread = Arc::clone(&exited);
+        let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let exit_code_for_thread = Arc::clone(&exit_code);
+
+        let reader_handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        if let Ok(mut parser) = parser_for_thread.lock() {
+                            parser.process(chunk);
+                        }
+                        got_output_for_thread.store(true, Ordering::Relaxed);
+                        if let Ok(mut t) = last_output_for_thread.lock() {
+                            *t = Instant::now();
+                        }
+                        respond_to_queries(chunk, &parser_for_thread, &writer_for_thread);
+                    }
+                }
+            }
+            let code = child_for_exit
+                .lock()
+                .ok()
+                .and_then(|mut c| c.try_wait().ok().flatten())
+                .map(|s| s.exit_code() as i32)
+                .unwrap_or(-1);
+            if let Ok(mut g) = exit_code_for_thread.lock() {
+                *g = Some(code);
+            }
+            exited_for_thread.store(true, Ordering::SeqCst);
+        });
+
+        Ok(Self {
+            parser,
+            writer,
+            master: pair.master,
+            child,
+            last_output,
+            got_output,
+            exited,
+            exit_code,
             _reader: reader_handle,
         })
     }
@@ -207,12 +342,35 @@ impl PtySession {
     pub fn has_output(&self) -> bool {
         self.got_output.load(Ordering::Relaxed)
     }
+
+    /// Returns the child's exit code once it has exited, `None` if still running.
+    ///
+    /// The reader thread sets this after EOF; the install dialog polls it each tick
+    /// to detect command completion without blocking the UI.
+    pub fn exit_status(&self) -> Option<i32> {
+        if self.exited.load(Ordering::SeqCst) {
+            self.exit_code.lock().ok().and_then(|g| *g)
+        } else {
+            None
+        }
+    }
+
+    /// Kill the child process best-effort (does not block).
+    ///
+    /// Used by the Esc handler in the install dialog to cancel a running install.
+    pub fn kill(&self) {
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+        }
+    }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
         // Best-effort: stop the child so it doesn't outlive the workspace.
-        let _ = self.child.kill();
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+        }
     }
 }
 
@@ -251,6 +409,67 @@ fn respond_to_queries(chunk: &[u8], parser: &Arc<Mutex<vt100::Parser>>, writer: 
             let _ = writer.flush();
         }
     }
+}
+
+/// Map a vt100 colour to a ratatui colour. The terminal *default* colour
+/// resolves to `fallback` (the theme's fg or bg) so embedded output shares the
+/// workspace background instead of falling back to the host terminal.
+pub fn conv_color(color: vt100::Color, fallback: Color) -> Color {
+    match color {
+        vt100::Color::Default => fallback,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Convert the emulated screen into one styled line per row.
+///
+/// Cells that use the terminal *default* colour resolve to the active theme's
+/// `fg`/`bg` (not `Color::Reset`), so the embedded child blends into the rest
+/// of the workspace instead of showing the host terminal's own background.
+/// Colours the child picks explicitly (diff green/red, accents) pass through
+/// untouched — they carry meaning we must not override.
+pub fn pty_screen_lines<'a>(screen: &vt100::Screen, pal: &Palette) -> Vec<Line<'a>> {
+    let (rows, cols) = screen.size();
+    let mut lines = Vec::with_capacity(rows as usize);
+    for row in 0..rows {
+        let mut spans = Vec::with_capacity(cols as usize);
+        for col in 0..cols {
+            let (text, style) = match screen.cell(row, col) {
+                Some(cell) => {
+                    let raw = cell.contents();
+                    let content = if raw.is_empty() {
+                        " ".to_string()
+                    } else {
+                        raw.to_string()
+                    };
+                    let mut style = Style::default()
+                        .fg(conv_color(cell.fgcolor(), pal.fg))
+                        .bg(conv_color(cell.bgcolor(), pal.bg));
+                    if cell.bold() {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if cell.italic() {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    if cell.underline() {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    if cell.inverse() {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    (content, style)
+                }
+                None => (
+                    " ".to_string(),
+                    Style::default().fg(pal.fg).bg(pal.bg),
+                ),
+            };
+            spans.push(Span::styled(text, style));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// The command run inside the PTY: Claude Code, launched per `opts`.
