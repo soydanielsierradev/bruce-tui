@@ -378,7 +378,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                 Screen::Workspace(ws) if ws.focus == Panel::Claude => ws.send_paste(&text),
                 Screen::Welcome if welcome.dialog.is_some() => {
                     for c in text.chars().filter(|c| !c.is_control()) {
-                        welcome.dialog_key(KeyCode::Char(c));
+                        let synthetic = KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
+                        welcome.dialog_key(&synthetic);
                     }
                 }
                 _ => {}
@@ -408,7 +409,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                 // and Esc — so nothing leaks to the underlying navigation. A
                 // confirmed new-session form comes back as an event to act on.
                 if welcome.dialog.is_some() {
-                    match welcome.dialog_key(key.code) {
+                    match welcome.dialog_key(&key) {
                         WelcomeEvent::RunUpdate(argv) => {
                             // Tear down the TUI and run the update from `run`.
                             pending_update = Some(argv);

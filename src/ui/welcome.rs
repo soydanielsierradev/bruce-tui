@@ -6,10 +6,11 @@
 //! be replaced by real persisted sessions once the `session` module lands.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
@@ -19,13 +20,15 @@ use ratatui::{
 };
 
 use crate::config::{Config, claude_skills_dir};
+use crate::pty::PtySession;
 use crate::session::{self, Session};
 use crate::skills::{
-    InstallRunner, SkillEntry, SkillLedger, SkillState,
+    SkillEntry, SkillLedger, SkillState,
     delete_skill, dir_skill_names, disable_skill, enable_skill, parse_frontmatter,
-    relocate_into_claude, skill_state,
+    relocate_into_claude, skill_state, snapshot_roots,
 };
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
+use crate::ui::workspace::encode_key;
 use crate::update;
 
 /// Re-check for a new release at most this often (seconds): once a day.
@@ -194,24 +197,28 @@ pub enum InstallPhase {
 pub struct InstallDialog {
     /// The text the user is typing (the install command).
     pub command: String,
-    /// Background runner spawned when the user presses Enter. `None` = not started.
-    pub runner: Option<InstallRunner>,
+    /// Live PTY backing the running install. `None` when idle or done.
+    pub pty: Option<PtySession>,
+    /// Per-root folder snapshot taken before PTY spawn (for post-install diff).
+    pub before: Vec<(PathBuf, HashSet<String>)>,
     /// Current lifecycle phase.
     pub phase: InstallPhase,
-    /// Log lines accumulated from stdout/stderr.
-    pub log: Vec<String>,
-    /// Scroll offset into the log region.
-    pub log_scroll: u16,
+    /// Set when PTY spawn fails; shown in the log region in Done{ok:false} state.
+    pub spawn_error: Option<String>,
+    /// Post-install summary (success or failure message). Shown in the log
+    /// region after the PTY exits and `pty` is set back to `None`.
+    pub summary: Option<String>,
 }
 
 impl InstallDialog {
     fn new() -> Self {
         Self {
             command: String::new(),
-            runner: None,
+            pty: None,
+            before: Vec::new(),
             phase: InstallPhase::Idle,
-            log: Vec::new(),
-            log_scroll: 0,
+            spawn_error: None,
+            summary: None,
         }
     }
 }
@@ -752,50 +759,43 @@ impl WelcomeState {
         }));
     }
 
-    /// Poll the in-flight InstallRunner (called from the 50ms timer branch).
+    /// Poll the running PTY install for exit (called from the 50ms timer branch).
     ///
-    /// When the runner finishes: diffs the skills directory, auto-disables and
+    /// When the PTY exits: diffs the skills directory, auto-disables and
     /// registers any new skills, then transitions the dialog to Done.
     pub fn tick_install_runner(&mut self) {
-        // Pull the runner out temporarily so we can mutate other fields.
-        let runner_done = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
-            if let Some(runner) = &d.runner {
-                runner.done.load(std::sync::atomic::Ordering::SeqCst)
-            } else {
-                false
-            }
+        // Check PTY exit without mutating dialog yet.
+        let pty_exited = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+            d.pty.as_ref().and_then(|p| p.exit_status()).is_some()
         } else {
             return;
         };
 
-        // Drain any new log lines on every tick while running (not just when done).
-        if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-            if let Some(runner) = &d.runner {
-                if let Ok(guard) = runner.log.lock() {
-                    // Copy new lines since last drain.
-                    let new_start = d.log.len();
-                    if guard.len() > new_start {
-                        d.log.extend_from_slice(&guard[new_start..]);
-                    }
-                }
-            }
-        }
+        // Guard against re-firing post-install if already in Done.
+        let already_done = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+            matches!(d.phase, InstallPhase::Done { .. })
+        } else {
+            return;
+        };
 
-        if !runner_done {
+        if already_done || !pty_exited {
             return;
         }
 
-        // Runner finished. Read exit_ok and `before` snapshot, then process.
+        // Read exit code and before snapshot.
         let (exit_code, before) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
-            if let Some(runner) = &d.runner {
-                let code = runner.exit_code.lock().ok().and_then(|g| *g).unwrap_or(-1);
-                (code, runner.before.clone())
-            } else {
-                return;
-            }
+            let code = d.pty.as_ref()
+                .and_then(|p| p.exit_status())
+                .unwrap_or(-1);
+            (code, d.before.clone())
         } else {
             return;
         };
+
+        // Drop PTY handle before post-install work.
+        if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
+            d.pty = None;
+        }
 
         if exit_code == 0 {
             // Find new skill folders across every watched root. npx skills and
@@ -815,10 +815,10 @@ impl WelcomeState {
                 Err(e) => {
                     eprintln!("[bruce] ledger load failed post-install: {e}");
                     if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                        d.log.push(format!("Warning: could not load ledger: {e}"));
-                        d.log.push("Install succeeded (skill not registered).".to_string());
+                        d.summary = Some(format!(
+                            "Warning: could not load ledger: {e}\nInstall succeeded (skill not registered)."
+                        ));
                         d.phase = InstallPhase::Done { ok: true };
-                        d.runner = None;
                     }
                     return;
                 }
@@ -911,21 +911,24 @@ impl WelcomeState {
             }
 
             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                d.log.extend(post_lines);
+                d.summary = Some(post_lines.join("\n"));
                 d.phase = InstallPhase::Done { ok: true };
-                d.runner = None;
             }
         } else {
             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                d.log.push(format!("Install failed (exit {exit_code})."));
+                d.summary = Some(format!("Install failed (exit {exit_code})."));
                 d.phase = InstallPhase::Done { ok: false };
-                d.runner = None;
             }
         }
     }
 
     /// Route a key press to the open dialog. No-op if none is open.
-    pub fn dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
+    ///
+    /// The signature accepts a full `&KeyEvent` so the install dialog can
+    /// receive modifiers (e.g. Ctrl+C) for PTY stdin forwarding. All other
+    /// dialogs extract `key.code` and remain behaviorally unchanged.
+    pub fn dialog_key(&mut self, key: &KeyEvent) -> WelcomeEvent {
+        let code = key.code;
         match self.dialog {
             Some(Dialog::NewSession(_)) => self.new_session_key(code),
             Some(Dialog::Picker(_)) => self.picker_key(code),
@@ -971,7 +974,7 @@ impl WelcomeState {
                 }
                 WelcomeEvent::None
             }
-            Some(Dialog::SkillInstall(_)) => self.install_dialog_key(code),
+            Some(Dialog::SkillInstall(_)) => self.install_dialog_key(key),
             Some(Dialog::SkillManage(_)) => self.manage_dialog_key(code),
             Some(Dialog::SkillPreview { .. }) => self.preview_key(code),
             None => WelcomeEvent::None,
@@ -1151,7 +1154,8 @@ impl WelcomeState {
 
     // ─── Install dialog key handler ────────────────────────────────────────────
 
-    fn install_dialog_key(&mut self, code: KeyCode) -> WelcomeEvent {
+    fn install_dialog_key(&mut self, key: &KeyEvent) -> WelcomeEvent {
+        let code = key.code;
         let phase = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
             d.phase.clone()
         } else {
@@ -1164,7 +1168,7 @@ impl WelcomeState {
                     self.dialog = None;
                 }
                 KeyCode::Enter => {
-                    // Snapshot command, validate non-empty, spawn runner.
+                    // Snapshot command, validate non-empty, then spawn PTY.
                     let cmd = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
                         let trimmed = d.command.trim().to_string();
                         if trimmed.is_empty() { return WelcomeEvent::None; }
@@ -1172,16 +1176,27 @@ impl WelcomeState {
                     } else {
                         return WelcomeEvent::None;
                     };
-                    match InstallRunner::spawn(cmd) {
-                        Ok(runner) => {
+
+                    // Snapshot watched roots BEFORE spawn (ADR-3).
+                    let before = snapshot_roots();
+
+                    // Platform shell dispatch — handles .cmd shims and builtins.
+                    #[cfg(windows)]
+                    let (program, args_vec) = ("cmd", vec!["/C", cmd.as_str()]);
+                    #[cfg(not(windows))]
+                    let (program, args_vec) = ("sh", vec!["-c", cmd.as_str()]);
+
+                    match PtySession::new_command(24, 80, program, &args_vec, None) {
+                        Ok(pty) => {
                             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                                d.runner = Some(runner);
+                                d.pty = Some(pty);
+                                d.before = before;
                                 d.phase = InstallPhase::Running;
                             }
                         }
                         Err(e) => {
                             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                                d.log.push(format!("Error: {e}"));
+                                d.spawn_error = Some(format!("Error: {e}"));
                                 d.phase = InstallPhase::Done { ok: false };
                             }
                         }
@@ -1200,32 +1215,35 @@ impl WelcomeState {
                 _ => {}
             },
             InstallPhase::Running => match code {
-                // Cannot escape while running; user must wait.
-                KeyCode::Up => {
+                KeyCode::Esc => {
+                    // Kill the child and cancel the install.
                     if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                        d.log_scroll = d.log_scroll.saturating_sub(1);
+                        if let Some(pty) = &d.pty {
+                            pty.kill();
+                        }
+                        d.pty = None;
+                        d.phase = InstallPhase::Done { ok: false };
+                        d.summary = Some("Canceled.".to_string());
                     }
                 }
-                KeyCode::Down => {
-                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                        d.log_scroll = d.log_scroll.saturating_add(1);
+                _ => {
+                    // Forward all other keys to the PTY stdin.
+                    if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+                        if let Some(pty) = &d.pty {
+                            let app_cursor = pty
+                                .lock_parser()
+                                .map(|p| p.screen().application_cursor())
+                                .unwrap_or(false);
+                            if let Some(bytes) = encode_key(key, app_cursor) {
+                                pty.send(&bytes);
+                            }
+                        }
                     }
                 }
-                _ => {}
             },
             InstallPhase::Done { .. } => match code {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.dialog = None;
-                }
-                KeyCode::Up => {
-                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                        d.log_scroll = d.log_scroll.saturating_sub(1);
-                    }
-                }
-                KeyCode::Down => {
-                    if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
-                        d.log_scroll = d.log_scroll.saturating_add(1);
-                    }
                 }
                 _ => {}
             },
@@ -1694,16 +1712,16 @@ fn render_install_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, d: &Ins
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Layout: disclaimer (1), command input (2), separator (1), log (rest).
+    // Layout: disclaimer (1), command input (2), PTY/log region (rest).
+    // The separator row was removed to give the PTY screen an extra line.
     let sections = Layout::vertical([
         Constraint::Length(1), // disclaimer
         Constraint::Length(2), // command input
-        Constraint::Length(1), // separator
-        Constraint::Min(1),    // log region
+        Constraint::Min(1),    // PTY / status region
     ])
     .split(inner);
 
-    // Disclaimer — always visible (REQ-2 / Scenario 2-D).
+    // Disclaimer — always visible.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "  Command runs in your shell — verify before running.",
@@ -1740,33 +1758,56 @@ fn render_install_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, d: &Ins
             Style::default().fg(pal.dim),
         )))
         .style(Style::default().bg(pal.bg));
-        // Overlay the hint on the second line of sections[1] (y+1).
         let hint_area = Rect { y: sections[1].y + 1, height: 1, ..sections[1] };
         frame.render_widget(hint, hint_area);
     }
 
-    // Log region.
-    let log_height = sections[3].height as usize;
-    let total = d.log.len();
-    let off = (d.log_scroll as usize).min(total.saturating_sub(log_height));
-    let visible: Vec<Line> = d.log[off..]
-        .iter()
-        .take(log_height)
-        .map(|line| {
-            let color = if line.starts_with("Install succeeded") {
-                pal.accent
-            } else if line.starts_with("Install failed") || line.starts_with("Error") || line.starts_with("Warning") {
-                pal.removed
-            } else {
-                pal.fg
-            };
-            Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(visible).style(Style::default().bg(pal.bg)),
-        sections[3],
-    );
+    // PTY / status region (sections[2]).
+    let log_rect = sections[2];
+
+    match &d.pty {
+        Some(pty) => {
+            // Resize PTY to the actual dialog rect each frame so it reflows
+            // when the terminal is resized. Guard against zero dimensions.
+            if log_rect.height > 0 && log_rect.width > 0 {
+                pty.resize(log_rect.height, log_rect.width);
+            }
+            if let Some(parser) = pty.lock_parser() {
+                let screen_data = parser.screen();
+                frame.render_widget(
+                    Paragraph::new(crate::pty::pty_screen_lines(screen_data, pal))
+                        .style(Style::default().bg(pal.bg)),
+                    log_rect,
+                );
+            }
+        }
+        None => {
+            // Idle (no PTY yet), Done after spawn_error, or Done with summary.
+            let text = d.summary.as_deref().or(d.spawn_error.as_deref());
+            if let Some(msg) = text {
+                let lines: Vec<Line> = msg.lines().map(|line| {
+                    let color = if line.starts_with("Install succeeded") {
+                        pal.accent
+                    } else if line.starts_with("Install failed")
+                        || line.starts_with("Error")
+                        || line.starts_with("Warning")
+                    {
+                        pal.removed
+                    } else {
+                        pal.fg
+                    };
+                    Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(color),
+                    ))
+                }).collect();
+                frame.render_widget(
+                    Paragraph::new(lines).style(Style::default().bg(pal.bg)),
+                    log_rect,
+                );
+            }
+        }
+    }
 }
 
 /// Manage-skills dialog: filtered list with ●/○/! markers.
