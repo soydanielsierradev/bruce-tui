@@ -125,8 +125,19 @@ fn config_base() -> Result<PathBuf> {
     Ok(home.join(".config"))
 }
 
+/// Resolve the Claude CLI skills directory: `~/.claude/skills`.
+///
+/// Uses `HOME` (Unix/macOS) or `USERPROFILE` (Windows) — no platform-exclusive
+/// APIs, no `dirs` crate (REQ-8, REQ-9).
+pub fn claude_skills_dir() -> Result<PathBuf> {
+    let home = env_path("HOME")
+        .or_else(|| env_path("USERPROFILE"))
+        .context("no HOME or USERPROFILE set; cannot locate ~/.claude/skills")?;
+    Ok(home.join(".claude").join("skills"))
+}
+
 /// Read an environment variable as a non-empty path.
-fn env_path(key: &str) -> Option<PathBuf> {
+pub(crate) fn env_path(key: &str) -> Option<PathBuf> {
     match std::env::var(key) {
         Ok(v) if !v.trim().is_empty() => Some(PathBuf::from(v)),
         _ => None,

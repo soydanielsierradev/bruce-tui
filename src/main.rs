@@ -8,6 +8,7 @@ mod config;
 mod panels;
 mod pty;
 mod session;
+mod skills;
 mod ui;
 mod update;
 
