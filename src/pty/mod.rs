@@ -57,6 +57,10 @@ const OUTPUT_IDLE: Duration = Duration::from_millis(200);
 pub struct PtySession {
     /// The emulated terminal, shared with the reader thread.
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Scrollback cap for the emulator, kept so a resize (which rebuilds the
+    /// parser) preserves it: large for the Claude pane, small for the
+    /// short-lived install dialog.
+    scrollback_cap: usize,
     /// Write half of the PTY: keystrokes and query replies go here.
     writer: SharedWriter,
     /// Master side, kept to resize the PTY.
@@ -102,7 +106,8 @@ impl PtySession {
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let scrollback_cap = SCROLLBACK_LINES;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_cap)));
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
         let last_output = Arc::new(Mutex::new(Instant::now()));
@@ -160,6 +165,7 @@ impl PtySession {
             got_output,
             exited,
             exit_code,
+            scrollback_cap,
             _reader: reader_handle,
         })
     }
@@ -209,7 +215,8 @@ impl PtySession {
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, INSTALL_SCROLLBACK)));
+        let scrollback_cap = INSTALL_SCROLLBACK;
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_cap)));
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
         let last_output = Arc::new(Mutex::new(Instant::now()));
@@ -260,6 +267,7 @@ impl PtySession {
             got_output,
             exited,
             exit_code,
+            scrollback_cap,
             _reader: reader_handle,
         })
     }
@@ -289,7 +297,7 @@ impl PtySession {
             pixel_height: 0,
         });
         if let Ok(mut parser) = self.parser.lock() {
-            *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            *parser = vt100::Parser::new(rows, cols, self.scrollback_cap);
         }
     }
 
