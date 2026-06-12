@@ -363,6 +363,30 @@ impl PtySession {
         }
     }
 
+    /// Actively check whether the child has exited, returning its code once it
+    /// has. Unlike [`exit_status`], this does NOT wait for the reader thread's
+    /// EOF — on Windows ConPTY the master read can stay pending long after the
+    /// child exits, so relying on EOF alone would leave a finished install stuck
+    /// in the Running state. Asks the child directly via `try_wait` and caches
+    /// the result so later calls (and the reader thread) agree.
+    pub fn poll_exit(&self) -> Option<i32> {
+        if let Some(code) = self.exit_status() {
+            return Some(code);
+        }
+        let mut child = self.child.lock().ok()?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.exit_code() as i32;
+                self.exited.store(true, Ordering::SeqCst);
+                if let Ok(mut g) = self.exit_code.lock() {
+                    *g = Some(code);
+                }
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+
     /// Kill the child process best-effort (does not block).
     ///
     /// Used by the Esc handler in the install dialog to cancel a running install.

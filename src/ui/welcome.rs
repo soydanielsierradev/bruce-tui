@@ -771,7 +771,7 @@ impl WelcomeState {
     pub fn tick_install_runner(&mut self) {
         // Check PTY exit without mutating dialog yet.
         let pty_exited = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
-            d.pty.as_ref().and_then(|p| p.exit_status()).is_some()
+            d.pty.as_ref().and_then(|p| p.poll_exit()).is_some()
         } else {
             return;
         };
@@ -790,7 +790,7 @@ impl WelcomeState {
         // Read exit code and before snapshot.
         let (exit_code, before) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
             let code = d.pty.as_ref()
-                .and_then(|p| p.exit_status())
+                .and_then(|p| p.poll_exit())
                 .unwrap_or(-1);
             (code, d.before.clone())
         } else {
