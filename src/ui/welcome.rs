@@ -176,8 +176,10 @@ pub enum Dialog {
     SkillInstall(InstallDialog),
     /// Manage (list/toggle/delete) Bruce-tracked skills.
     SkillManage(ManageDialog),
-    /// Scrollable preview of a SKILL.md file's raw contents.
-    SkillPreview { lines: Vec<String>, scroll: u16, entry_name: String },
+    /// Scrollable preview of a SKILL.md file's raw contents. `max_scroll` is the
+    /// largest valid scroll offset; the renderer computes it (it depends on the
+    /// wrapped line count and dialog height) so the key handler can clamp.
+    SkillPreview { lines: Vec<String>, scroll: u16, entry_name: String, max_scroll: Cell<u16> },
 }
 
 // ─── Install dialog types ─────────────────────────────────────────────────────
@@ -1531,10 +1533,19 @@ impl WelcomeState {
             lines,
             scroll: 0,
             entry_name: entry.name.clone(),
+            max_scroll: Cell::new(0),
         });
     }
 
     fn preview_key(&mut self, code: KeyCode) -> WelcomeEvent {
+        // How far down the content can scroll, set by the last render. Clamping
+        // to it stops the offset inflating past the end (which would make the
+        // following Up/PageUp presses appear to do nothing).
+        let max = if let Some(Dialog::SkillPreview { max_scroll, .. }) = &self.dialog {
+            max_scroll.get()
+        } else {
+            0
+        };
         match code {
             KeyCode::Up => {
                 if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
@@ -1543,7 +1554,7 @@ impl WelcomeState {
             }
             KeyCode::Down => {
                 if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
-                    *scroll = scroll.saturating_add(1);
+                    *scroll = scroll.saturating_add(1).min(max);
                 }
             }
             KeyCode::PageUp => {
@@ -1553,7 +1564,7 @@ impl WelcomeState {
             }
             KeyCode::PageDown => {
                 if let Some(Dialog::SkillPreview { scroll, .. }) = &mut self.dialog {
-                    *scroll = scroll.saturating_add(10);
+                    *scroll = scroll.saturating_add(10).min(max);
                 }
             }
             KeyCode::Esc | KeyCode::Enter => {
@@ -1631,8 +1642,8 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
         Some(Dialog::ThemePicker(idx)) => render_theme_picker_dialog(frame, area, &pal, *idx),
         Some(Dialog::SkillInstall(d)) => render_install_dialog(frame, area, &pal, d),
         Some(Dialog::SkillManage(d)) => render_manage_dialog(frame, area, &pal, state, d),
-        Some(Dialog::SkillPreview { lines, scroll, entry_name }) => {
-            render_preview_dialog(frame, area, &pal, lines, *scroll, entry_name)
+        Some(Dialog::SkillPreview { lines, scroll, entry_name, max_scroll }) => {
+            render_preview_dialog(frame, area, &pal, lines, *scroll, entry_name, max_scroll)
         }
         None => {}
     }
@@ -2051,6 +2062,7 @@ fn render_preview_dialog(
     lines: &[String],
     scroll: u16,
     entry_name: &str,
+    max_scroll: &Cell<u16>,
 ) {
     let area = centered_rect(74, 85, screen);
     frame.render_widget(Clear, area);
@@ -2064,7 +2076,10 @@ fn render_preview_dialog(
     let wrapped: Vec<String> = lines.iter().flat_map(|l| wrap_line(l, width)).collect();
 
     let height = inner.height as usize;
-    let off = (scroll as usize).min(wrapped.len().saturating_sub(height));
+    // Publish the largest valid offset so the key handler can clamp to it.
+    let max = wrapped.len().saturating_sub(height);
+    max_scroll.set(max as u16);
+    let off = (scroll as usize).min(max);
     let visible: Vec<Line> = wrapped[off..]
         .iter()
         .take(height)
