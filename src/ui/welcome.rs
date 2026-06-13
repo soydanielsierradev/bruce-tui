@@ -179,7 +179,16 @@ pub enum Dialog {
     /// Scrollable preview of a SKILL.md file's raw contents. `max_scroll` is the
     /// largest valid scroll offset; the renderer computes it (it depends on the
     /// wrapped line count and dialog height) so the key handler can clamp.
-    SkillPreview { lines: Vec<String>, scroll: u16, entry_name: String, max_scroll: Cell<u16> },
+    /// `description`/`folder_name` back the header and the enable/disable
+    /// shortcuts available from the preview.
+    SkillPreview {
+        lines: Vec<String>,
+        scroll: u16,
+        entry_name: String,
+        description: String,
+        folder_name: String,
+        max_scroll: Cell<u16>,
+    },
 }
 
 // ─── Install dialog types ─────────────────────────────────────────────────────
@@ -1533,6 +1542,8 @@ impl WelcomeState {
             lines,
             scroll: 0,
             entry_name: entry.name.clone(),
+            description: entry.description.clone(),
+            folder_name: entry.folder_name.clone(),
             max_scroll: Cell::new(0),
         });
     }
@@ -1567,6 +1578,8 @@ impl WelcomeState {
                     *scroll = scroll.saturating_add(10).min(max);
                 }
             }
+            KeyCode::Char('e') | KeyCode::Char('E') => self.preview_set_enabled(true),
+            KeyCode::Char('d') | KeyCode::Char('D') => self.preview_set_enabled(false),
             KeyCode::Esc | KeyCode::Enter => {
                 // Pop back to ManageDialog.
                 self.dialog = None;
@@ -1577,6 +1590,30 @@ impl WelcomeState {
             _ => {}
         }
         WelcomeEvent::None
+    }
+
+    /// Enable or disable the skill being previewed, and keep the stashed Manage
+    /// list's marker in sync so it's correct when the user pops back.
+    fn preview_set_enabled(&mut self, enable: bool) {
+        let folder = if let Some(Dialog::SkillPreview { folder_name, .. }) = &self.dialog {
+            folder_name.clone()
+        } else {
+            return;
+        };
+        let dir = claude_skills_dir().unwrap_or_default().join(&folder);
+        let result = if enable { enable_skill(&dir) } else { disable_skill(&dir) };
+        if result.is_err() {
+            return;
+        }
+        // Reflect the new on-disk state in the stashed Manage list + flag restart.
+        if let Some(manage) = self.pending_manage.as_mut() {
+            for (entry, state) in manage.entries.iter_mut() {
+                if entry.folder_name == folder {
+                    *state = skill_state(&dir);
+                }
+            }
+            manage.restart_needed = true;
+        }
     }
 }
 
@@ -1642,8 +1679,8 @@ pub fn render(frame: &mut Frame, state: &WelcomeState) {
         Some(Dialog::ThemePicker(idx)) => render_theme_picker_dialog(frame, area, &pal, *idx),
         Some(Dialog::SkillInstall(d)) => render_install_dialog(frame, area, &pal, d),
         Some(Dialog::SkillManage(d)) => render_manage_dialog(frame, area, &pal, state, d),
-        Some(Dialog::SkillPreview { lines, scroll, entry_name, max_scroll }) => {
-            render_preview_dialog(frame, area, &pal, lines, *scroll, entry_name, max_scroll)
+        Some(Dialog::SkillPreview { lines, scroll, entry_name, description, max_scroll, .. }) => {
+            render_preview_dialog(frame, area, &pal, lines, *scroll, entry_name, description, max_scroll)
         }
         None => {}
     }
@@ -2062,6 +2099,7 @@ fn render_preview_dialog(
     lines: &[String],
     scroll: u16,
     entry_name: &str,
+    description: &str,
     max_scroll: &Cell<u16>,
 ) {
     let area = centered_rect(74, 85, screen);
@@ -2070,24 +2108,52 @@ fn render_preview_dialog(
     let block = dialog_block(pal, &title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
 
-    // Word-wrap to the dialog width so long lines aren't cut off at the edge.
     let width = inner.width as usize;
-    let wrapped: Vec<String> = lines.iter().flat_map(|l| wrap_line(l, width)).collect();
 
-    let height = inner.height as usize;
+    // Header: the skill name and its description, word-wrapped, with a rule.
+    let mut header: Vec<Line> = Vec::new();
+    header.push(Line::from(Span::styled(
+        entry_name.to_string(),
+        Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+    )));
+    for dl in wrap_line(description, width) {
+        header.push(Line::from(Span::styled(dl, Style::default().fg(pal.dim))));
+    }
+    header.push(Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(pal.dim),
+    )));
+    let header_h = (header.len() as u16).min(inner.height);
+    let header_rect = Rect { height: header_h, ..inner };
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().bg(pal.bg)),
+        header_rect,
+    );
+
+    // Content: the SKILL.md body, word-wrapped, scrollable below the header.
+    let content_rect = Rect {
+        y: inner.y + header_h,
+        height: inner.height - header_h,
+        ..inner
+    };
+    let wrapped: Vec<String> = lines.iter().flat_map(|l| wrap_line(l, width)).collect();
+    let view_h = content_rect.height as usize;
     // Publish the largest valid offset so the key handler can clamp to it.
-    let max = wrapped.len().saturating_sub(height);
+    let max = wrapped.len().saturating_sub(view_h);
     max_scroll.set(max as u16);
     let off = (scroll as usize).min(max);
     let visible: Vec<Line> = wrapped[off..]
         .iter()
-        .take(height)
+        .take(view_h)
         .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(pal.fg))))
         .collect();
     frame.render_widget(
         Paragraph::new(visible).style(Style::default().bg(pal.bg)),
-        inner,
+        content_rect,
     );
 }
 
@@ -2560,6 +2626,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
         Some(Dialog::SkillPreview { .. }) => Line::from(vec![
             Span::styled("  ↑↓/PgUp/PgDn", Style::default().fg(pal.accent)),
             Span::styled(" scroll   ", Style::default().fg(pal.dim)),
+            Span::styled("E", Style::default().fg(pal.accent)),
+            Span::styled(" enable   ", Style::default().fg(pal.dim)),
+            Span::styled("D", Style::default().fg(pal.accent)),
+            Span::styled(" disable   ", Style::default().fg(pal.dim)),
             Span::styled("Esc", Style::default().fg(pal.accent)),
             Span::styled(" back to list", Style::default().fg(pal.dim)),
         ]),
