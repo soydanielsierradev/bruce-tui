@@ -2003,6 +2003,47 @@ fn render_manage_dialog(
 }
 
 /// Scrollable raw SKILL.md preview dialog.
+/// Word-wrap one logical line to `width` columns, returning the visual lines.
+/// A word longer than `width` is hard-split so nothing is ever cut off-screen.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    let mut push_word = |word: &str, out: &mut Vec<String>, cur: &mut String, cur_len: &mut usize| {
+        let wlen = word.chars().count();
+        if *cur_len > 0 && *cur_len + 1 + wlen > width {
+            out.push(std::mem::take(cur));
+            *cur_len = 0;
+        }
+        if wlen > width {
+            // Word doesn't fit on a line by itself: hard-split it.
+            for ch in word.chars() {
+                if *cur_len == width {
+                    out.push(std::mem::take(cur));
+                    *cur_len = 0;
+                }
+                cur.push(ch);
+                *cur_len += 1;
+            }
+        } else {
+            if *cur_len > 0 {
+                cur.push(' ');
+                *cur_len += 1;
+            }
+            cur.push_str(word);
+            *cur_len += wlen;
+        }
+    };
+    for word in line.split(' ') {
+        push_word(word, &mut out, &mut cur, &mut cur_len);
+    }
+    out.push(cur);
+    out
+}
+
 fn render_preview_dialog(
     frame: &mut Frame,
     screen: Rect,
@@ -2018,9 +2059,13 @@ fn render_preview_dialog(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Word-wrap to the dialog width so long lines aren't cut off at the edge.
+    let width = inner.width as usize;
+    let wrapped: Vec<String> = lines.iter().flat_map(|l| wrap_line(l, width)).collect();
+
     let height = inner.height as usize;
-    let off = (scroll as usize).min(lines.len().saturating_sub(height));
-    let visible: Vec<Line> = lines[off..]
+    let off = (scroll as usize).min(wrapped.len().saturating_sub(height));
+    let visible: Vec<Line> = wrapped[off..]
         .iter()
         .take(height)
         .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(pal.fg))))
