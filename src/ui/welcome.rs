@@ -25,7 +25,7 @@ use crate::session::{self, Session};
 use crate::skills::{
     SkillEntry, SkillLedger, SkillState,
     delete_skill, dir_skill_names, disable_skill, enable_skill, parse_frontmatter,
-    relocate_into_claude, skill_state, snapshot_roots,
+    relocate_into_claude, skill_state, skill_touched_since, snapshot_roots,
 };
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 use crate::ui::workspace::encode_key;
@@ -212,6 +212,9 @@ pub struct InstallDialog {
     /// real change. Resizing rebuilds the vt100 parser (clearing the screen),
     /// so resizing every frame would blank the live output.
     pub last_pty_size: Cell<(u16, u16)>,
+    /// When the install command was spawned. Used to detect a skill the install
+    /// (re)wrote even if its folder already existed, by comparing SKILL.md mtime.
+    pub spawn_at: std::time::SystemTime,
 }
 
 impl InstallDialog {
@@ -224,6 +227,7 @@ impl InstallDialog {
             spawn_error: None,
             summary: None,
             last_pty_size: Cell::new((24, 80)),
+            spawn_at: std::time::SystemTime::UNIX_EPOCH,
         }
     }
 }
@@ -788,11 +792,11 @@ impl WelcomeState {
         }
 
         // Read exit code and before snapshot.
-        let (exit_code, before) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
+        let (exit_code, before, spawn_at) = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
             let code = d.pty.as_ref()
                 .and_then(|p| p.poll_exit())
                 .unwrap_or(-1);
-            (code, d.before.clone())
+            (code, d.before.clone(), d.spawn_at)
         } else {
             return;
         };
@@ -803,17 +807,6 @@ impl WelcomeState {
         }
 
         if exit_code == 0 {
-            // Find new skill folders across every watched root. npx skills and
-            // similar tools install into ~/.agents/skills, not ~/.claude/skills,
-            // so we diff each root and trace a new skill to where it landed.
-            let mut new_skills: Vec<(PathBuf, String)> = Vec::new();
-            for (root, before_set) in &before {
-                let after = dir_skill_names(root).unwrap_or_default();
-                for folder in after.difference(before_set) {
-                    new_skills.push((root.join(folder), folder.clone()));
-                }
-            }
-
             let claude_root = claude_skills_dir().unwrap_or_default();
             let mut ledger = match SkillLedger::load() {
                 Ok(l) => l,
@@ -828,6 +821,29 @@ impl WelcomeState {
                     return;
                 }
             };
+            let ledgered: HashSet<String> =
+                ledger.entries().iter().map(|e| e.folder_name.clone()).collect();
+
+            // Detect the skill(s) the command installed across every watched root
+            // (npx skills installs into ~/.agents/skills, not ~/.claude/skills): a
+            // brand-new folder, OR an existing folder whose SKILL.md was rewritten
+            // during this run (so a re-install of an already-present skill still
+            // counts). Skip anything Bruce already manages.
+            let mut new_skills: Vec<(PathBuf, String)> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for (root, before_set) in &before {
+                let after = dir_skill_names(root).unwrap_or_default();
+                for folder in &after {
+                    if ledgered.contains(folder) || seen.contains(folder) {
+                        continue;
+                    }
+                    let dir = root.join(folder);
+                    if !before_set.contains(folder) || skill_touched_since(&dir, spawn_at) {
+                        seen.insert(folder.clone());
+                        new_skills.push((dir, folder.clone()));
+                    }
+                }
+            }
 
             let install_cmd = if let Some(Dialog::SkillInstall(d)) = &self.dialog {
                 d.command.clone()
@@ -841,7 +857,7 @@ impl WelcomeState {
                 .unwrap_or(0);
 
             let mut post_lines: Vec<String> = Vec::new();
-            let mut registered = 0usize;
+            let mut registered_names: Vec<String> = Vec::new();
             for (src_dir, folder) in &new_skills {
                 // Bring it into ~/.claude/skills if the command dropped it
                 // elsewhere (e.g. ~/.agents/skills) — the only dir Claude reads.
@@ -875,6 +891,7 @@ impl WelcomeState {
                 }
 
                 let (name, description) = parse_frontmatter(&skill_dir);
+                let display = name.clone();
                 let entry = SkillEntry {
                     name,
                     folder_name: folder.clone(),
@@ -885,18 +902,23 @@ impl WelcomeState {
                 if let Err(e) = ledger.add(entry) {
                     post_lines.push(format!("Warning: could not register {folder}: {e}"));
                 } else {
-                    registered += 1;
+                    registered_names.push(display);
                 }
             }
 
-            if registered > 0 {
+            if !registered_names.is_empty() {
                 // Persist the ledger so the Manage dialog (which reads from disk)
                 // shows the freshly installed, disabled skills.
                 if let Err(e) = ledger.save() {
                     post_lines.push(format!("Warning: could not save the skills ledger: {e}"));
                 }
+                let names = registered_names
+                    .iter()
+                    .map(|n| format!("\"{n}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 post_lines.push(format!(
-                    "Install succeeded — {registered} skill(s) added, disabled by default."
+                    "Bruce installed {names} — disabled by default. Enable it in Manage."
                 ));
             } else if new_skills.is_empty() {
                 // Exit 0 but nothing new in any watched root — be honest.
@@ -1182,8 +1204,11 @@ impl WelcomeState {
                         return WelcomeEvent::None;
                     };
 
-                    // Snapshot watched roots BEFORE spawn (ADR-3).
+                    // Snapshot watched roots BEFORE spawn (ADR-3), and record the
+                    // spawn time so an install that rewrites an already-present
+                    // skill is still detected (via SKILL.md mtime).
                     let before = snapshot_roots();
+                    let spawn_at = std::time::SystemTime::now();
 
                     // Platform shell dispatch — handles .cmd shims and builtins.
                     #[cfg(windows)]
@@ -1196,6 +1221,7 @@ impl WelcomeState {
                             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
                                 d.pty = Some(pty);
                                 d.before = before;
+                                d.spawn_at = spawn_at;
                                 d.phase = InstallPhase::Running;
                             }
                         }
@@ -1794,7 +1820,9 @@ fn render_install_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, d: &Ins
             let text = d.summary.as_deref().or(d.spawn_error.as_deref());
             if let Some(msg) = text {
                 let lines: Vec<Line> = msg.lines().map(|line| {
-                    let color = if line.starts_with("Install succeeded") {
+                    let color = if line.starts_with("Install succeeded")
+                        || line.starts_with("Bruce installed")
+                    {
                         pal.accent
                     } else if line.starts_with("Install failed")
                         || line.starts_with("Error")

@@ -188,6 +188,23 @@ pub fn snapshot_roots() -> Vec<(PathBuf, HashSet<String>)> {
         .collect()
 }
 
+/// True if the skill's `SKILL.md` (or `SKILL.md.disabled`) was modified at or
+/// after `since` — i.e. the install just wrote it. Lets an install be detected
+/// even when the skill folder already existed before the run (so the
+/// before/after folder diff alone would miss it).
+pub fn skill_touched_since(skill_dir: &Path, since: std::time::SystemTime) -> bool {
+    for name in ["SKILL.md", "SKILL.md.disabled"] {
+        if let Ok(meta) = fs::metadata(skill_dir.join(name)) {
+            if let Ok(modified) = meta.modified() {
+                if modified >= since {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Move a skill folder `src` into `~/.claude/skills/<folder>` — where Claude
 /// actually reads skills — and return the destination. Used to bridge tools
 /// (e.g. `npx skills`) that install into `~/.agents/skills` and never symlink
