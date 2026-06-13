@@ -1895,6 +1895,16 @@ fn render_install_dialog(frame: &mut Frame, screen: Rect, pal: &Palette, d: &Ins
 }
 
 /// Manage-skills dialog: filtered list with ●/○/! markers.
+/// Build a one-line "key label" command footer for the bottom of a modal.
+fn modal_hint_line(pal: &Palette, hints: &[(&str, &str)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    for (key, label) in hints {
+        spans.push(Span::styled((*key).to_string(), Style::default().fg(pal.accent)));
+        spans.push(Span::styled(format!(" {label}   "), Style::default().fg(pal.dim)));
+    }
+    Line::from(spans)
+}
+
 fn render_manage_dialog(
     frame: &mut Frame,
     screen: Rect,
@@ -1915,13 +1925,15 @@ fn render_manage_dialog(
 
     match &d.mode {
         ManageMode::Browse => {
-            // Layout: filter input (2), restart banner (1 if needed), list (rest), status (1).
+            // Layout: filter (2), restart banner (1 if needed), list (rest),
+            // status (1), command footer (1).
             let banner_h = if d.restart_needed { 1u16 } else { 0 };
             let sections = Layout::vertical([
                 Constraint::Length(2),        // filter
                 Constraint::Length(banner_h), // restart banner (0 when not needed)
                 Constraint::Min(1),           // skill list
                 Constraint::Length(1),        // status line
+                Constraint::Length(1),        // command footer
             ])
             .split(inner);
 
@@ -2019,6 +2031,24 @@ fn render_manage_dialog(
                     sections[3],
                 );
             }
+
+            // Command footer, inside the modal.
+            frame.render_widget(
+                Paragraph::new(modal_hint_line(
+                    pal,
+                    &[
+                        ("↑↓", "select"),
+                        ("E", "enable"),
+                        ("D", "disable"),
+                        ("X", "delete"),
+                        ("Enter", "preview"),
+                        ("R", "reopen"),
+                        ("Esc", "close"),
+                    ],
+                ))
+                .style(Style::default().bg(pal.bg)),
+                sections[4],
+            );
         }
         ManageMode::ConfirmDelete { target } => {
             let name = d
@@ -2042,10 +2072,24 @@ fn render_manage_dialog(
                     Style::default().fg(pal.dim),
                 )),
             ];
+            let footer_h: u16 = if inner.height > 0 { 1 } else { 0 };
+            let body = Rect { height: inner.height.saturating_sub(footer_h), ..inner };
             frame.render_widget(
                 Paragraph::new(lines).style(Style::default().bg(pal.bg)),
-                inner,
+                body,
             );
+            if footer_h > 0 {
+                let footer_rect = Rect {
+                    y: inner.y + inner.height - footer_h,
+                    height: footer_h,
+                    ..inner
+                };
+                frame.render_widget(
+                    Paragraph::new(modal_hint_line(pal, &[("Y", "delete"), ("N/Esc", "cancel")]))
+                        .style(Style::default().bg(pal.bg)),
+                    footer_rect,
+                );
+            }
         }
     }
 }
@@ -2134,10 +2178,12 @@ fn render_preview_dialog(
         header_rect,
     );
 
-    // Content: the SKILL.md body, word-wrapped, scrollable below the header.
+    // Reserve the bottom row for the command footer; the body scrolls between
+    // the header and it.
+    let footer_h: u16 = if inner.height > header_h { 1 } else { 0 };
     let content_rect = Rect {
         y: inner.y + header_h,
-        height: inner.height - header_h,
+        height: inner.height.saturating_sub(header_h).saturating_sub(footer_h),
         ..inner
     };
     let wrapped: Vec<String> = lines.iter().flat_map(|l| wrap_line(l, width)).collect();
@@ -2155,6 +2201,28 @@ fn render_preview_dialog(
         Paragraph::new(visible).style(Style::default().bg(pal.bg)),
         content_rect,
     );
+
+    // Command footer, inside the modal.
+    if footer_h > 0 {
+        let footer_rect = Rect {
+            y: inner.y + inner.height - footer_h,
+            height: footer_h,
+            ..inner
+        };
+        frame.render_widget(
+            Paragraph::new(modal_hint_line(
+                pal,
+                &[
+                    ("↑↓/PgUp/PgDn", "scroll"),
+                    ("E", "enable"),
+                    ("D", "disable"),
+                    ("Esc", "back"),
+                ],
+            ))
+            .style(Style::default().bg(pal.bg)),
+            footer_rect,
+        );
+    }
 }
 
 /// Draw the keybindings reference: a scrollable, sectioned list of every key.
@@ -2599,40 +2667,9 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &WelcomeState) {
                 Span::styled(" close", Style::default().fg(pal.dim)),
             ]),
         },
-        Some(Dialog::SkillManage(d)) => match &d.mode {
-            ManageMode::Browse => Line::from(vec![
-                Span::styled("  type", Style::default().fg(pal.accent)),
-                Span::styled(" filter   ", Style::default().fg(pal.dim)),
-                Span::styled("E", Style::default().fg(pal.accent)),
-                Span::styled(" enable   ", Style::default().fg(pal.dim)),
-                Span::styled("D", Style::default().fg(pal.accent)),
-                Span::styled(" disable   ", Style::default().fg(pal.dim)),
-                Span::styled("X", Style::default().fg(pal.accent)),
-                Span::styled(" delete   ", Style::default().fg(pal.dim)),
-                Span::styled("Enter", Style::default().fg(pal.accent)),
-                Span::styled(" preview   ", Style::default().fg(pal.dim)),
-                Span::styled("Esc", Style::default().fg(pal.accent)),
-                Span::styled(" close", Style::default().fg(pal.dim)),
-            ]),
-            ManageMode::ConfirmDelete { .. } => Line::from(vec![
-                Span::styled("  Y", Style::default().fg(pal.accent)),
-                Span::styled(" delete   ", Style::default().fg(pal.dim)),
-                Span::styled("N", Style::default().fg(pal.accent)),
-                Span::styled("/", Style::default().fg(pal.dim)),
-                Span::styled("Esc", Style::default().fg(pal.accent)),
-                Span::styled(" cancel", Style::default().fg(pal.dim)),
-            ]),
-        },
-        Some(Dialog::SkillPreview { .. }) => Line::from(vec![
-            Span::styled("  ↑↓/PgUp/PgDn", Style::default().fg(pal.accent)),
-            Span::styled(" scroll   ", Style::default().fg(pal.dim)),
-            Span::styled("E", Style::default().fg(pal.accent)),
-            Span::styled(" enable   ", Style::default().fg(pal.dim)),
-            Span::styled("D", Style::default().fg(pal.accent)),
-            Span::styled(" disable   ", Style::default().fg(pal.dim)),
-            Span::styled("Esc", Style::default().fg(pal.accent)),
-            Span::styled(" back to list", Style::default().fg(pal.dim)),
-        ]),
+        // Manage and Preview show their command hints inside the modal itself.
+        Some(Dialog::SkillManage(_)) => Line::raw(""),
+        Some(Dialog::SkillPreview { .. }) => Line::raw(""),
         None => Line::from(vec![
             Span::styled("  ↑↓", Style::default().fg(pal.accent)),
             Span::styled(" select   ", Style::default().fg(pal.dim)),
