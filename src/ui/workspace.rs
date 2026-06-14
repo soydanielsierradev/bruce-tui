@@ -765,8 +765,8 @@ fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bo
     section_header(&mut lines, pal, "session", width);
     metric_row_str(&mut lines, pal, width, "duration", &fmt_duration(m.duration_secs()), pal.added);
     metric_row(&mut lines, pal, width, "files", m.files_edited, pal.modified);
-    metric_row_str(&mut lines, pal, width, "lines +", &format!("+{}", m.lines_added), pal.added);
-    metric_row_str(&mut lines, pal, width, "lines −", &format!("−{}", m.lines_removed), pal.removed);
+    metric_row_str(&mut lines, pal, width, "lines written", &m.lines_added.to_string(), pal.added);
+    metric_row_str(&mut lines, pal, width, "lines removed", &m.lines_removed.to_string(), pal.removed);
 
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(pal.bg)),
