@@ -1,0 +1,14 @@
+pkgbase = bruce-bin
+	pkgdesc = Terminal workspace for Claude Code
+	pkgver = 0.14.0
+	pkgrel = 1
+	url = https://github.com/soydanielsierradev/bruce-tui
+	arch = x86_64
+	license = MIT
+	optdepends = claude-code: the Claude CLI Bruce runs inside its workspace
+	provides = bruce
+	conflicts = bruce
+	source = bruce-bin-0.14.0.tar.gz::https://github.com/soydanielsierradev/bruce-tui/releases/download/v0.14.0/bruce-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums = 9f537615039e0ce7d93bea66dccd3a57f91f06761d44a1f60c078234170dc833
+
+pkgname = bruce-bin
