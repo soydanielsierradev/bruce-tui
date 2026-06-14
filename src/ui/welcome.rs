@@ -2104,7 +2104,7 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut cur_len = 0usize;
-    let mut push_word = |word: &str, out: &mut Vec<String>, cur: &mut String, cur_len: &mut usize| {
+    let push_word = |word: &str, out: &mut Vec<String>, cur: &mut String, cur_len: &mut usize| {
         let wlen = word.chars().count();
         if *cur_len > 0 && *cur_len + 1 + wlen > width {
             out.push(std::mem::take(cur));
