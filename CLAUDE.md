@@ -129,13 +129,10 @@ Hecho:
 - [x] Release `v0.9.0` publicado (Latest) con los 4 binarios
 - [x] Tap Homebrew publicado: repo `soydanielsierradev/homebrew-bruce`
       (fórmula en `Formula/bruce.rb`) → `brew install soydanielsierradev/bruce/bruce`
+- [x] Arch cubierto por `install.sh` (baja el binario glibc) y
+      `cargo install --git`.
 
 Pendiente:
-- [ ] Publicar el paquete AUR `bruce-bin`: `PKGBUILD` + `.SRCINFO` ya están
-      listos a 0.14.0 en `packaging/aur/` (sha256 del tarball linux-gnu real).
-      Falta SOLO la cuenta de AUR + SSH key y el push a
-      `ssh://aur@aur.archlinux.org/bruce-bin.git` (copiar ambos con fin de línea
-      LF, no CRLF).
 - [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
       (deprecación de Node 20, no bloqueante hasta ~sep 2026)
 
@@ -154,8 +151,6 @@ Pendiente:
    plantilla de abajo y aplicalas con
    `gh release edit vX.Y.Z --notes-file <archivo>`. Un patch chico sin
    novedades visibles igual lleva notas breves: no te saltees este paso (le pasó a v0.11.1 y quedó sin cuerpo hasta que se corrigió a mano).
-6. AUR sigue siendo manual: actualizar `pkgver` + `sha256sums` en
-   `packaging/aur/PKGBUILD`.
 
 ### Plantilla de notas de release
 Van en **inglés** (como todos los releases anteriores). Bullets con lead-in

@@ -66,8 +66,8 @@ and tells you if that directory isn't on your `PATH`.
 
 ### Arch Linux
 
-AUR support is planned for a future release. For now, use the install script
-above or `cargo install --git`.
+The Linux install script above works on Arch (it ships a glibc binary), or
+build from source with `cargo install --git`.
 
 ### Windows
 
