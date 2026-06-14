@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use notify::{RecursiveMode, Watcher};
 
@@ -44,7 +44,9 @@ pub struct Metrics {
     pub lines_added: u64,
     /// Approximate lines removed by Edit/MultiEdit inputs.
     pub lines_removed: u64,
-    /// Tokens live in the context window now (the last turn's input + cache).
+    /// Tokens live in the context window now: the last turn's `input +
+    /// cache_read` — what the model actually saw. `cache_write` is excluded
+    /// (those tokens are written to the cache for FUTURE turns, not consumed now).
     pub context: u64,
     /// Model id of the most recent assistant turn (e.g. `claude-opus-4-8`).
     pub model: String,
@@ -98,7 +100,9 @@ impl Metrics {
 }
 
 /// List prices in USD per 1M tokens `(input, output, cache_write, cache_read)`,
-/// by model family. Approximate; defaults to Sonnet pricing for unknown models.
+/// by model family. APPROXIMATE and hard-coded (list prices as of 2026-06);
+/// they drift as model families change, so the cost pane is labelled "est." and
+/// should be read as a rough estimate. Defaults to Sonnet pricing for unknowns.
 fn model_prices(model: &str) -> (f64, f64, f64, f64) {
     let m = model.to_lowercase();
     if m.contains("opus") {
@@ -230,8 +234,11 @@ pub fn parse_transcript(path: &Path) -> Metrics {
                     metrics.cache_write += cache_write;
                     metrics.cache_read += cache_read;
                     metrics.turns += 1;
-                    // The most recent turn defines the live context size.
-                    metrics.context = input + cache_read + cache_write;
+                    // The most recent turn defines the live context size: what
+                    // the model actually saw (input + cache_read). cache_write is
+                    // tokens written to the cache for FUTURE turns, not consumed
+                    // now, so including it would inflate the % window gauge.
+                    metrics.context = input + cache_read;
                 }
             }
         }
@@ -373,12 +380,17 @@ impl MetricsWatcher {
 
         let metrics_for_thread = Arc::clone(&metrics);
         let thread = std::thread::spawn(move || {
-            // Each event means Claude touched the directory; re-read the newest
-            // transcript and replace the totals. Errors just skip that tick.
-            for event in rx {
-                if event.is_err() {
+            // Claude emits several filesystem events per assistant message, and
+            // re-parsing the whole transcript on each one is wasteful. Coalesce a
+            // burst: on the first event wait a short quiet window, drain whatever
+            // else queued, then re-parse exactly once. The channel closing (the
+            // watcher dropped on Drop) ends the loop.
+            while let Ok(first) = rx.recv() {
+                if first.is_err() {
                     continue;
                 }
+                std::thread::sleep(Duration::from_millis(250));
+                while rx.try_recv().is_ok() {}
                 if let Some(file) = newest_transcript(&dir) {
                     let fresh = parse_transcript(&file);
                     if let Ok(mut current) = metrics_for_thread.lock() {
@@ -467,8 +479,24 @@ mod tests {
         assert_eq!(m.files_edited, 2); // a.rs, b.rs
         assert_eq!(m.lines_added, 6); // Write 3 + Edit new 3
         assert_eq!(m.lines_removed, 2); // Edit old 2
-        assert_eq!(m.context, 280); // m2: 200 + 80 + 0
+        assert_eq!(m.context, 280); // m2: input 200 + cache_read 80
         assert_eq!(m.model, "claude-opus-4-8");
+    }
+
+    /// The live context is `input + cache_read` only — `cache_write` (tokens
+    /// written to the cache for future turns) must NOT inflate it.
+    #[test]
+    fn context_excludes_cache_write() {
+        let mut file = tempfile();
+        let line = concat!(
+            r#"{"type":"assistant","timestamp":"2026-06-05T11:00:00.000Z","message":"#,
+            r#"{"id":"c1","model":"claude-opus-4-8","content":[{"type":"text","text":"x"}],"#,
+            r#""usage":{"input_tokens":100,"output_tokens":10,"#,
+            r#""cache_creation_input_tokens":999,"cache_read_input_tokens":20}}}"#,
+        );
+        file.write_all(line.as_bytes()).unwrap();
+        let m = parse_transcript(&file.path);
+        assert_eq!(m.context, 120); // 100 input + 20 cache_read; 999 cache_write excluded
     }
 
     /// Duration is the span between first and last timestamps.
