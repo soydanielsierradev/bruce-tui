@@ -77,6 +77,19 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
       sin bordes (Git/Metrics enmarcados), cursor oculto mientras streamea,
       MCP activos en métricas. Navegación Ctrl+1/2/3 (+Tab), scroll
       Shift+PageUp/Down. Tokyo Night: `modified` en cyan.
+- [x] Paso 16 (v0.14.0): gestor de skills. Bloque Skills en la welcome
+      (Manage + Install). Install corre el comando en un **PTY interactivo**
+      (reusa el pipeline del panel Claude: responde prompts tipo "which
+      agent?", output en vivo, navegable con flechas); al terminar
+      **auto-desactiva** la skill (rename `SKILL.md` → `SKILL.md.disabled`) y la
+      registra en un ledger (`<config>/bruce/skills.json`); puente
+      `~/.agents/skills` → `~/.claude/skills` (donde Claude lee). Detección por
+      carpeta nueva O `SKILL.md` modificado durante el install (mtime). Manage:
+      lista solo lo instalado por Bruce, preview del `SKILL.md` con header
+      (name+description) y word-wrap navegable, enable/disable/delete, comandos
+      dentro del modal. Fix: paste multilínea en el panel Claude entra como un
+      solo mensaje (bracketed paste en Unix; coalescing de teclas en Windows,
+      donde crossterm no emite `Event::Paste`). Labels de métricas en inglés.
 
 ## Commits
 - Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
@@ -93,7 +106,7 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
   hace minor).
 - Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
   del cambio (la versión se muestra en la welcome screen).
-  Versión actual: 0.13.0.
+  Versión actual: 0.14.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
@@ -118,7 +131,11 @@ Hecho:
       (fórmula en `Formula/bruce.rb`) → `brew install soydanielsierradev/bruce/bruce`
 
 Pendiente:
-- [ ] Publicar el paquete AUR `bruce-bin` (repo AUR + cuenta/SSH)
+- [ ] Publicar el paquete AUR `bruce-bin`: `PKGBUILD` + `.SRCINFO` ya están
+      listos a 0.14.0 en `packaging/aur/` (sha256 del tarball linux-gnu real).
+      Falta SOLO la cuenta de AUR + SSH key y el push a
+      `ssh://aur@aur.archlinux.org/bruce-bin.git` (copiar ambos con fin de línea
+      LF, no CRLF).
 - [ ] Actualizar `actions/checkout` y `action-gh-release` a Node 24
       (deprecación de Node 20, no bloqueante hasta ~sep 2026)
 
