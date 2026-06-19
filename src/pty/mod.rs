@@ -571,7 +571,7 @@ pub fn claude_missing() -> bool {
 /// Pure lookup (no process spawned). On Windows it also tries the `PATHEXT`
 /// extensions (so a `claude.cmd`/`claude.exe` shim is found); on Unix it checks
 /// for the bare name.
-fn on_path(program: &str) -> bool {
+pub fn on_path(program: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };

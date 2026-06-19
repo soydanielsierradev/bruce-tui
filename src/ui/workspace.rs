@@ -15,9 +15,10 @@ use ratatui::{
 };
 
 use crate::config::Config;
+use crate::panels::files::FileManager;
 use crate::panels::git::{self, GitView};
 use crate::panels::metrics;
-use crate::pty::{PtySession, SpawnOptions, TERMINAL_SCROLLBACK};
+use crate::pty::{self, PtySession, SpawnOptions, TERMINAL_SCROLLBACK};
 use crate::session::Session;
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 
@@ -69,6 +70,12 @@ pub struct WorkspaceState {
     /// overlay is shown only while it boots and never again.
     claude_awake: Cell<bool>,
 
+    // ── File Manager pane (Slice 3) ─────────────────────────────────────────
+    /// Background-walked file list for the top-right pane.
+    pub file_manager: FileManager,
+    /// Error/status message shown at the bottom of the file manager pane, e.g.
+    /// "Editor not found on PATH". Cleared the next time the user opens a file.
+    pub file_manager_status: Option<String>,
     // ── Terminal pane (Slice 2) ──────────────────────────────────────────────
     /// Shell PTY; `None` until the pane receives focus for the first time.
     /// Spawned lazily to avoid running two ConPTY instances simultaneously on
@@ -108,6 +115,29 @@ fn default_shell() -> String {
     }
 }
 
+/// Resolve the editor to use for opening files.
+///
+/// Priority: `$BRUCE_EDITOR` → `code` → `code-insiders` → `None`.
+///
+/// Returns `(command, is_vscode)`. `is_vscode` is `true` for `code`/`code-insiders`
+/// so the caller can append `--goto file:line` instead of just the file path.
+fn editor_command() -> Option<(String, bool)> {
+    // Explicit override wins everything.
+    if let Ok(editor) = std::env::var("BRUCE_EDITOR") {
+        if !editor.is_empty() {
+            return Some((editor, false));
+        }
+    }
+    // VS Code family: check with on_path which handles `.cmd` on Windows.
+    if pty::on_path("code") {
+        return Some(("code".to_string(), true));
+    }
+    if pty::on_path("code-insiders") {
+        return Some(("code-insiders".to_string(), true));
+    }
+    None
+}
+
 impl WorkspaceState {
     /// Open a workspace running `session`, inheriting the welcome theme and the
     /// chosen optional-panel configuration.
@@ -143,6 +173,10 @@ impl WorkspaceState {
             Err(e) => (None, Some(e.to_string())),
         };
 
+        // Start the background walk for the file manager immediately so the
+        // file list is populated by the time the user first focuses that pane.
+        let cwd_fm = session.project_path.clone();
+
         Self {
             session,
             theme,
@@ -161,6 +195,9 @@ impl WorkspaceState {
             last_git_refresh: Instant::now(),
             opened_at: Instant::now(),
             claude_awake: Cell::new(false),
+            // File manager: background walk starts immediately.
+            file_manager: FileManager::new(cwd_fm),
+            file_manager_status: None,
             // Terminal PTY is spawned lazily on first focus (Ctrl+4 / Tab to
             // the Terminal pane). This avoids running two ConPTY instances on
             // Windows simultaneously before we've confirmed that works.
@@ -189,6 +226,8 @@ impl WorkspaceState {
                 }
             }
         }
+        // Trigger background refresh of the file list on its 30-second cadence.
+        self.file_manager.tick();
     }
 
     /// Respawn the shell PTY after the previous one has exited.
@@ -382,6 +421,11 @@ impl WorkspaceState {
             if panel == Panel::Terminal {
                 self.ensure_terminal();
             }
+            // Trigger a file list refresh when the user explicitly focuses the
+            // FileManager pane so they see up-to-date results immediately.
+            if panel == Panel::FileManager {
+                self.file_manager.refresh();
+            }
         }
     }
 
@@ -403,6 +447,57 @@ impl WorkspaceState {
         self.focus = panels[(i + panels.len() - 1) % panels.len()];
         if self.focus == Panel::Terminal {
             self.ensure_terminal();
+        }
+    }
+
+    /// Move the file manager selection up by one row.
+    pub fn fm_prev(&mut self) {
+        self.file_manager.select_prev();
+    }
+
+    /// Move the file manager selection down by one row.
+    pub fn fm_next(&mut self) {
+        self.file_manager.select_next();
+    }
+
+    /// Toggle dotfile visibility in the file manager and re-walk.
+    pub fn fm_toggle_hidden(&mut self) {
+        self.file_manager.toggle_hidden();
+    }
+
+    /// Open the selected file in the editor. Uses `$BRUCE_EDITOR` if set,
+    /// otherwise falls back to `code` or `code-insiders` on the PATH.
+    ///
+    /// For VS Code the file is opened with `--goto <abs>:1` so it focuses
+    /// the file immediately. For other editors just `arg(abs_path)` is used.
+    /// If no editor is found the error is surfaced as `file_manager_status`.
+    pub fn fm_open_selected(&mut self) {
+        self.file_manager_status = None;
+
+        let Some(abs_path) = self.file_manager.selected_abs_path() else {
+            return;
+        };
+
+        match editor_command() {
+            Some((editor, is_vscode)) => {
+                let mut cmd = std::process::Command::new(&editor);
+                if is_vscode {
+                    cmd.arg(&self.session.project_path);
+                    cmd.arg("--goto");
+                    cmd.arg(format!("{}:1", abs_path.display()));
+                } else {
+                    cmd.arg(&abs_path);
+                }
+                // Spawn detached — the editor runs independently of Bruce.
+                if let Err(e) = cmd.spawn() {
+                    self.file_manager_status =
+                        Some(format!("Failed to open editor: {e}"));
+                }
+            }
+            None => {
+                self.file_manager_status =
+                    Some("No editor found. Set $BRUCE_EDITOR or install 'code'.".to_string());
+            }
         }
     }
 
@@ -481,7 +576,7 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
         match panel {
             Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git, state.border_style.border_type()),
             Panel::Claude => render_claude_pane(frame, *col, &pal, focused, state),
-            Panel::FileManager => render_file_manager_pane(frame, *col, &pal, focused, state.border_style.border_type()),
+            Panel::FileManager => render_file_manager_pane(frame, *col, &pal, focused, state),
             // Terminal is rendered in rows[2]; not part of the top_row split.
             Panel::Terminal => {}
         }
@@ -829,12 +924,109 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
     );
 }
 
-/// Render the File Manager pane. Slice 1 placeholder — real content lands in Slice 3.
-fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, border_type: BorderType) {
+/// Render the File Manager pane: a scrollable list of project-relative file paths.
+///
+/// - The selected row is highlighted in accent colour.
+/// - A dim status line at the very bottom shows error messages (e.g. editor
+///   not found) or the dotfile toggle hint.
+/// - The list scrolls to keep the selection in view; `clamp_scroll` is called
+///   here (the only place with the real visible height) so `selected` and
+///   `scroll_offset` are always consistent.
+fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
+    let border_type = state.border_style.border_type();
     let block = pane_block(pal, " Files ", focused, true, border_type);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    simple_body(frame, inner, pal, " File manager (coming soon)");
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Reserve the bottom row for the status / hint line.
+    let list_height = inner.height.saturating_sub(1) as usize;
+    let status_y = inner.y + inner.height.saturating_sub(1);
+
+    // Render list ─────────────────────────────────────────────────────────────
+    // Safety: we hold the Arc<Mutex> immutably for the duration of render, which
+    // is always fast (no I/O). The walk thread only locks when it writes the
+    // result, which is also quick (a single swap).
+    let fm = &state.file_manager;
+    // clamp_scroll requires &mut self, but render only has &WorkspaceState.
+    // We work around this by computing the scroll window inline, read-only.
+    let file_count = fm.file_count();
+
+    // Compute the visible window without mutating (render is called with &).
+    let selected = fm.selected.min(file_count.saturating_sub(1));
+    let scroll = if selected < fm.scroll_offset {
+        selected
+    } else {
+        let bottom = fm.scroll_offset + list_height;
+        if list_height > 0 && selected >= bottom {
+            selected + 1 - list_height
+        } else {
+            fm.scroll_offset
+        }
+    };
+
+    if let Ok(guard) = fm.files.lock() {
+        let visible = guard.iter().skip(scroll).take(list_height);
+        for (i, path) in visible.enumerate() {
+            let abs_idx = scroll + i;
+            let is_selected = abs_idx == selected;
+            let display = path.display().to_string();
+            let y = inner.y + i as u16;
+            if y >= inner.y + list_height as u16 {
+                break;
+            }
+            let style = if is_selected {
+                Style::default()
+                    .fg(pal.bg)
+                    .bg(pal.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(pal.fg)
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {display}"),
+                    style,
+                )))
+                .style(Style::default().bg(pal.bg)),
+                Rect { x: inner.x, y, width: inner.width, height: 1 },
+            );
+        }
+        if file_count == 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " Scanning files…",
+                    Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+                )))
+                .style(Style::default().bg(pal.bg)),
+                Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+            );
+        }
+    }
+
+    // Status / hint line ───────────────────────────────────────────────────────
+    let hint_text = if let Some(status) = &state.file_manager_status {
+        status.as_str().to_string()
+    } else if focused {
+        let hidden_hint = if fm.show_hidden { "·  hide" } else { "·  show" };
+        format!(" ↑↓ navigate  Enter open  . {hidden_hint} dotfiles")
+    } else {
+        String::new()
+    };
+
+    if !hint_text.is_empty() && status_y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint_text,
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: status_y, width: inner.width, height: 1 },
+        );
+    }
 }
 
 /// Render the Terminal pane: the embedded shell's emulated screen.

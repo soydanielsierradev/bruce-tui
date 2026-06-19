@@ -571,10 +571,26 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         // is stashed for the next iteration.
                         pending = forward_typing(ws, key)?;
                     }
+                } else if ws.focus == Panel::FileManager {
+                    // File Manager pane has focus: navigate the file list.
+                    // Up/Down move the selection; Enter opens in editor; `.`
+                    // toggles dotfile visibility. Ctrl+1/2/3/4 already handled
+                    // above via the `pane` branch.
+                    match key.code {
+                        KeyCode::Up => ws.fm_prev(),
+                        KeyCode::Down => ws.fm_next(),
+                        KeyCode::Enter => ws.fm_open_selected(),
+                        KeyCode::Char('.') => ws.fm_toggle_hidden(),
+                        KeyCode::Char('q') | KeyCode::Char('Q') => quit = true,
+                        KeyCode::Esc => transition = Some(Screen::Welcome),
+                        KeyCode::Tab => ws.focus_next(),
+                        KeyCode::BackTab => ws.focus_prev(),
+                        KeyCode::Char('g') if ctrl => ws.toggle_git(),
+                        _ => {}
+                    }
                 } else {
-                    // A non-PTY pane (Git, FileManager) has focus: navigate Bruce.
-                    // The Terminal pane before first-spawn also lands here; Tab
-                    // will trigger spawn via focus_next → ensure_terminal.
+                    // A non-PTY pane (Git) has focus, or the Terminal pane before
+                    // first-spawn. Tab triggers spawn via focus_next → ensure_terminal.
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => quit = true,
                         KeyCode::Esc => transition = Some(Screen::Welcome),
