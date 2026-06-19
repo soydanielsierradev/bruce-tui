@@ -1,24 +1,19 @@
-//! Token-usage metrics read from Claude Code's session transcript.
+//! Session token totals read from Claude Code's transcript.
 //!
 //! Claude writes a JSON-lines transcript per session under
-//! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. [`parse_transcript`]
-//! turns it into [`Metrics`].
+//! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Bruce reads it only to
+//! record a session's cumulative token total (shown in the welcome session
+//! list) — the live metrics pane was replaced by the File Manager.
 //!
-//! Transcript shape (important for correct counting): **one line per content
-//! block**, not per message. A single assistant turn spans several lines
-//! (thinking, text, tool_use…), each repeating the same `message.id` and the
-//! same `message.usage`. So token usage is summed once per unique id, while
-//! tool-use blocks are counted per line (each is its own block).
+//! Transcript shape: **one line per content block**, not per message. A single
+//! assistant turn spans several lines, each repeating the same `message.id` and
+//! `message.usage`, so token usage is summed once per unique id.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
-/// Claude's context-window size, used for the "% ventana" gauge.
-pub const CONTEXT_LIMIT: u64 = 200_000;
-
-/// Cumulative usage + activity for one Claude session.
+/// Cumulative token usage for one Claude session.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Metrics {
     /// Fresh (uncached) input tokens summed across assistant turns.
@@ -29,83 +24,12 @@ pub struct Metrics {
     pub cache_write: u64,
     /// Tokens served from the prompt cache (`cache_read_input_tokens`).
     pub cache_read: u64,
-    /// Assistant turns (unique message ids).
-    pub turns: u64,
-    /// Tool-use blocks across the session.
-    pub tool_calls: u64,
-    /// Distinct files touched by Write/Edit/MultiEdit.
-    pub files_edited: u64,
-    /// Approximate lines added by Write/Edit/MultiEdit inputs.
-    pub lines_added: u64,
-    /// Approximate lines removed by Edit/MultiEdit inputs.
-    pub lines_removed: u64,
-    /// Tokens live in the context window now: the last turn's `input +
-    /// cache_read` — what the model actually saw. `cache_write` is excluded
-    /// (those tokens are written to the cache for FUTURE turns, not consumed now).
-    pub context: u64,
-    /// Model id of the most recent assistant turn (e.g. `claude-opus-4-8`).
-    pub model: String,
-    /// Epoch-second timestamp of the first and last transcript entries.
-    pub first_ts: Option<i64>,
-    pub last_ts: Option<i64>,
-    /// MCP servers exercised this session, derived from `mcp__<server>__<tool>`
-    /// tool-call names. Distinct and sorted for a stable display.
-    pub mcp_servers: Vec<String>,
 }
 
 impl Metrics {
     /// Every token the session touched, cached or not.
     pub fn total(&self) -> u64 {
         self.input + self.output + self.cache_write + self.cache_read
-    }
-
-    /// Share of input-side tokens served from cache, as a whole percent.
-    pub fn cache_hit_pct(&self) -> u64 {
-        let denom = self.input + self.cache_read + self.cache_write;
-        if denom == 0 {
-            0
-        } else {
-            self.cache_read * 100 / denom
-        }
-    }
-
-    /// Context-window fill as a whole percent (clamped to 100).
-    pub fn context_pct(&self) -> u64 {
-        (self.context * 100 / CONTEXT_LIMIT).min(100)
-    }
-
-    /// Session wall-clock duration in seconds (0 until two timestamps exist).
-    pub fn duration_secs(&self) -> i64 {
-        match (self.first_ts, self.last_ts) {
-            (Some(a), Some(b)) => (b - a).max(0),
-            _ => 0,
-        }
-    }
-
-    /// Estimated USD cost from list prices for the model family. This is an
-    /// approximation: prices are hard-coded and change over time.
-    pub fn cost_usd(&self) -> f64 {
-        let (pin, pout, pcw, pcr) = model_prices(&self.model);
-        (self.input as f64 * pin
-            + self.output as f64 * pout
-            + self.cache_write as f64 * pcw
-            + self.cache_read as f64 * pcr)
-            / 1_000_000.0
-    }
-}
-
-/// List prices in USD per 1M tokens `(input, output, cache_write, cache_read)`,
-/// by model family. APPROXIMATE and hard-coded (list prices as of 2026-06);
-/// they drift as model families change, so the cost pane is labelled "est." and
-/// should be read as a rough estimate. Defaults to Sonnet pricing for unknowns.
-fn model_prices(model: &str) -> (f64, f64, f64, f64) {
-    let m = model.to_lowercase();
-    if m.contains("opus") {
-        (15.0, 75.0, 18.75, 1.5)
-    } else if m.contains("haiku") {
-        (1.0, 5.0, 1.25, 0.1)
-    } else {
-        (3.0, 15.0, 3.75, 0.3)
     }
 }
 
@@ -118,24 +42,6 @@ pub fn transcript_dir(project_path: &Path) -> Option<PathBuf> {
             .join("projects")
             .join(encode_project(project_path)),
     )
-}
-
-/// The newest `*.jsonl` in `dir` (Claude's currently active session), if any.
-pub fn newest_transcript(dir: &Path) -> Option<PathBuf> {
-    let mut newest: Option<(SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, path));
-        }
-    }
-    newest.map(|(_, path)| path)
 }
 
 /// Fork a session's transcript: copy `<old_id>.jsonl` to `<new_id>.jsonl`,
@@ -165,8 +71,8 @@ pub fn fork_transcript(project_path: &Path, old_id: &str, new_id: &str) -> std::
 /// Total tokens recorded for a specific session's transcript, if it exists.
 ///
 /// Because Bruce launches `claude --session-id <id>`, the transcript file is
-/// named `<id>.jsonl` — so we can target the exact session rather than guessing
-/// the newest file. Returns `None` if the home dir is unknown or no transcript
+/// named `<id>.jsonl` — so we target the exact session rather than guessing the
+/// newest file. Returns `None` if the home dir is unknown or no transcript
 /// exists yet (a session closed before Claude wrote anything).
 pub fn session_total_tokens(project_path: &Path, session_id: &str) -> Option<u64> {
     let path = transcript_dir(project_path)?.join(format!("{session_id}.jsonl"));
@@ -176,7 +82,7 @@ pub fn session_total_tokens(project_path: &Path, session_id: &str) -> Option<u64
     Some(parse_transcript(&path).total())
 }
 
-/// Parse a transcript into [`Metrics`]. Malformed lines are skipped, never fatal.
+/// Sum a transcript's token usage. Malformed lines are skipped, never fatal.
 pub fn parse_transcript(path: &Path) -> Metrics {
     let Ok(content) = fs::read_to_string(path) else {
         return Metrics::default();
@@ -184,24 +90,11 @@ pub fn parse_transcript(path: &Path) -> Metrics {
 
     let mut metrics = Metrics::default();
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut files: HashSet<String> = HashSet::new();
-    let mut mcp: HashSet<String> = HashSet::new();
 
     for line in content.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-
-        // Every entry carries a timestamp; track the session span.
-        let line_ts = value
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .and_then(parse_iso_epoch);
-        if let Some(ts) = line_ts {
-            metrics.first_ts = Some(metrics.first_ts.map_or(ts, |f| f.min(ts)));
-            metrics.last_ts = Some(metrics.last_ts.map_or(ts, |l| l.max(ts)));
-        }
-
         if value.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
@@ -209,132 +102,20 @@ pub fn parse_transcript(path: &Path) -> Metrics {
             continue;
         };
 
-        if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
-            metrics.model = model.to_string();
-        }
-
         // Token usage is repeated on every line of a turn: count once per id.
         if let Some(id) = message.get("id").and_then(|i| i.as_str()) {
             if seen_ids.insert(id.to_string()) {
                 if let Some(usage) = message.get("usage") {
-                    let field =
-                        |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-                    let input = field("input_tokens");
-                    let output = field("output_tokens");
-                    let cache_write = field("cache_creation_input_tokens");
-                    let cache_read = field("cache_read_input_tokens");
-
-                    metrics.input += input;
-                    metrics.output += output;
-                    metrics.cache_write += cache_write;
-                    metrics.cache_read += cache_read;
-                    metrics.turns += 1;
-                    // The most recent turn defines the live context size: what
-                    // the model actually saw (input + cache_read). cache_write is
-                    // tokens written to the cache for FUTURE turns, not consumed
-                    // now, so including it would inflate the % window gauge.
-                    metrics.context = input + cache_read;
-                }
-            }
-        }
-
-        // Tool-use blocks live one-per-line, so count them on every line.
-        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
-            for block in blocks {
-                if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                    continue;
-                }
-                metrics.tool_calls += 1;
-                count_edit(block, &mut metrics, &mut files);
-                if let Some(server) = mcp_server(block) {
-                    mcp.insert(server);
+                    let field = |key: &str| usage.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+                    metrics.input += field("input_tokens");
+                    metrics.output += field("output_tokens");
+                    metrics.cache_write += field("cache_creation_input_tokens");
+                    metrics.cache_read += field("cache_read_input_tokens");
                 }
             }
         }
     }
-
-    metrics.files_edited = files.len() as u64;
-    let mut mcp_servers: Vec<String> = mcp.into_iter().collect();
-    mcp_servers.sort();
-    metrics.mcp_servers = mcp_servers;
     metrics
-}
-
-/// The MCP server name from a tool-use block whose tool is named
-/// `mcp__<server>__<tool>`, or `None` for built-in tools. Claude prefixes every
-/// MCP tool this way, so the segment between `mcp__` and the next `__` is the
-/// server that handled the call.
-fn mcp_server(block: &serde_json::Value) -> Option<String> {
-    let name = block.get("name").and_then(|n| n.as_str())?;
-    let server = name.strip_prefix("mcp__")?.split("__").next()?;
-    (!server.is_empty()).then(|| server.to_string())
-}
-
-/// Account a Write/Edit/MultiEdit tool call: record the file and approximate
-/// the lines it adds/removes. Other tools are ignored.
-fn count_edit(block: &serde_json::Value, metrics: &mut Metrics, files: &mut HashSet<String>) {
-    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let Some(input) = block.get("input") else {
-        return;
-    };
-    let str_field = |v: &serde_json::Value, key: &str| {
-        v.get(key).and_then(|x| x.as_str()).map(str::to_string)
-    };
-
-    if let Some(path) = str_field(input, "file_path") {
-        files.insert(path);
-    }
-
-    match name {
-        "Write" => {
-            metrics.lines_added += line_count(input.get("content").and_then(|c| c.as_str()));
-        }
-        "Edit" => {
-            metrics.lines_added += line_count(input.get("new_string").and_then(|c| c.as_str()));
-            metrics.lines_removed += line_count(input.get("old_string").and_then(|c| c.as_str()));
-        }
-        "MultiEdit" => {
-            if let Some(edits) = input.get("edits").and_then(|e| e.as_array()) {
-                for edit in edits {
-                    metrics.lines_added +=
-                        line_count(edit.get("new_string").and_then(|c| c.as_str()));
-                    metrics.lines_removed +=
-                        line_count(edit.get("old_string").and_then(|c| c.as_str()));
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Number of lines in an optional string (0 if absent or empty).
-fn line_count(text: Option<&str>) -> u64 {
-    match text {
-        Some(t) if !t.is_empty() => t.lines().count() as u64,
-        _ => 0,
-    }
-}
-
-/// Parse an ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS…Z`) to epoch seconds.
-/// Avoids a date-crate dependency; the transcript's format is fixed.
-fn parse_iso_epoch(s: &str) -> Option<i64> {
-    if s.len() < 19 {
-        return None;
-    }
-    let num = |range: std::ops::Range<usize>| s.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (hour, min, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec)
-}
-
-/// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 /// Encode an absolute project path the way Claude names its transcript folder:
@@ -343,7 +124,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// punctuation — Claude Code changed its encoding to dash those out, so a path
 /// like `…/Proyectos Personales/…` maps to `…-Proyectos-Personales-…`. Keeping
 /// the space here pointed the watcher at a directory Claude never writes to,
-/// which silently zeroed out the metrics pane.
+/// which silently zeroed out the old metrics pane.
 fn encode_project(path: &Path) -> String {
     path.to_string_lossy()
         .chars()
@@ -362,17 +143,18 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     /// A transcript matching the real format: one line per content block, the
     /// turn's id and usage repeated across its lines (here, m1's two lines).
     const SAMPLE: &str = concat!(
-        r#"{"type":"assistant","timestamp":"2026-06-05T11:00:00.000Z","message":{"id":"m1","model":"claude-opus-4-8","content":[{"type":"thinking","thinking":"x"}],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":50,"cache_read_input_tokens":5}}}"#,
+        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":50,"cache_read_input_tokens":5}}}"#,
         "\n",
-        r#"{"type":"assistant","timestamp":"2026-06-05T11:00:01.000Z","message":{"id":"m1","model":"claude-opus-4-8","content":[{"type":"tool_use","name":"Write","input":{"file_path":"a.rs","content":"l1\nl2\nl3"}}],"usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":50,"cache_read_input_tokens":5}}}"#,
+        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":50,"cache_read_input_tokens":5}}}"#,
         "\n",
-        r#"{"type":"user","timestamp":"2026-06-05T11:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result"}]}}"#,
+        r#"{"type":"user","message":{"role":"user"}}"#,
         "\n",
-        r#"{"type":"assistant","timestamp":"2026-06-05T11:05:00.000Z","message":{"id":"m2","model":"claude-opus-4-8","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"b.rs","old_string":"x\ny","new_string":"x\ny\nz"}}],"usage":{"input_tokens":200,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":80}}}"#,
+        r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":200,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":80}}}"#,
     );
 
     fn parse_sample() -> Metrics {
@@ -381,49 +163,16 @@ mod tests {
         parse_transcript(&file.path)
     }
 
-    /// Usage is summed once per unique message id even though m1 spans two lines.
+    /// Token usage is summed once per unique message id even though m1 spans two
+    /// lines, and the cumulative total is every stream added up.
     #[test]
     fn dedupes_usage_by_id() {
         let m = parse_sample();
-        assert_eq!(m.turns, 2);
         assert_eq!(m.input, 300);
         assert_eq!(m.output, 30);
         assert_eq!(m.cache_write, 50);
         assert_eq!(m.cache_read, 85);
-    }
-
-    /// Tool-use blocks are counted per line, and the last turn sets the context.
-    #[test]
-    fn counts_tools_files_and_context() {
-        let m = parse_sample();
-        assert_eq!(m.tool_calls, 2); // Write + Edit
-        assert_eq!(m.files_edited, 2); // a.rs, b.rs
-        assert_eq!(m.lines_added, 6); // Write 3 + Edit new 3
-        assert_eq!(m.lines_removed, 2); // Edit old 2
-        assert_eq!(m.context, 280); // m2: input 200 + cache_read 80
-        assert_eq!(m.model, "claude-opus-4-8");
-    }
-
-    /// The live context is `input + cache_read` only — `cache_write` (tokens
-    /// written to the cache for future turns) must NOT inflate it.
-    #[test]
-    fn context_excludes_cache_write() {
-        let mut file = tempfile();
-        let line = concat!(
-            r#"{"type":"assistant","timestamp":"2026-06-05T11:00:00.000Z","message":"#,
-            r#"{"id":"c1","model":"claude-opus-4-8","content":[{"type":"text","text":"x"}],"#,
-            r#""usage":{"input_tokens":100,"output_tokens":10,"#,
-            r#""cache_creation_input_tokens":999,"cache_read_input_tokens":20}}}"#,
-        );
-        file.write_all(line.as_bytes()).unwrap();
-        let m = parse_transcript(&file.path);
-        assert_eq!(m.context, 120); // 100 input + 20 cache_read; 999 cache_write excluded
-    }
-
-    /// Duration is the span between first and last timestamps.
-    #[test]
-    fn computes_duration() {
-        assert_eq!(parse_sample().duration_secs(), 300);
+        assert_eq!(m.total(), 465);
     }
 
     /// The transcript folder name must match Claude's encoding exactly: every
@@ -436,23 +185,6 @@ mod tests {
             encode_project(path),
             "C--Users-DANIEL-Desktop-Proyectos-Personales-bruce-tui"
         );
-    }
-
-    /// MCP tool calls (`mcp__<server>__<tool>`) yield the server name; built-in
-    /// tools yield nothing.
-    #[test]
-    fn extracts_mcp_server_name() {
-        let mcp = serde_json::json!({"type":"tool_use","name":"mcp__plugin_engram_engram__mem_save"});
-        assert_eq!(mcp_server(&mcp).as_deref(), Some("plugin_engram_engram"));
-        let builtin = serde_json::json!({"type":"tool_use","name":"Write"});
-        assert_eq!(mcp_server(&builtin), None);
-    }
-
-    #[test]
-    fn iso_epoch_is_monotonic() {
-        let a = parse_iso_epoch("2026-06-05T11:00:00.000Z").unwrap();
-        let b = parse_iso_epoch("2026-06-05T11:05:00.000Z").unwrap();
-        assert_eq!(b - a, 300);
     }
 
     /// Minimal temp file (avoids a dev-dependency); cleaned up on drop.
