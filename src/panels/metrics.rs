@@ -2,7 +2,7 @@
 //!
 //! Claude writes a JSON-lines transcript per session under
 //! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. [`parse_transcript`]
-//! turns it into [`Metrics`]; [`MetricsWatcher`] keeps that live.
+//! turns it into [`Metrics`].
 //!
 //! Transcript shape (important for correct counting): **one line per content
 //! block**, not per message. A single assistant turn spans several lines
@@ -13,12 +13,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
-
-use notify::{RecursiveMode, Watcher};
+use std::time::SystemTime;
 
 /// Claude's context-window size, used for the "% ventana" gauge.
 pub const CONTEXT_LIMIT: u64 = 200_000;
@@ -340,80 +335,6 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
-}
-
-/// A live view of the active session's metrics, refreshed by a file watcher.
-///
-/// Holds the `notify` watcher and a worker thread that re-parses the newest
-/// transcript whenever Claude writes to the project's transcript directory.
-/// Shared state is an `Arc<Mutex<_>>`, per the project's threading rule; the
-/// watcher and thread are dropped (and stop) with this struct.
-pub struct MetricsWatcher {
-    /// Latest parsed metrics, updated by the worker thread.
-    metrics: Arc<Mutex<Metrics>>,
-    /// Kept alive so the OS watch stays registered; dropping it ends watching.
-    _watcher: notify::RecommendedWatcher,
-    /// Worker thread handle; the channel closing ends its loop.
-    _thread: JoinHandle<()>,
-}
-
-impl MetricsWatcher {
-    /// Start watching `project_path`'s transcript directory for token usage.
-    ///
-    /// Seeds with the current totals, then refreshes on every filesystem event.
-    /// Returns `None` if the home directory or the watch can't be established.
-    pub fn new(project_path: &Path) -> Option<Self> {
-        let dir = transcript_dir(project_path)?;
-        // Claude may not have created the directory yet (it spawns alongside the
-        // watcher). Create it so the watch registers and catches the first write.
-        let _ = fs::create_dir_all(&dir);
-
-        let seed = newest_transcript(&dir)
-            .map(|file| parse_transcript(&file))
-            .unwrap_or_default();
-        let metrics = Arc::new(Mutex::new(seed));
-
-        let (tx, rx) = mpsc::channel();
-        let mut watcher =
-            notify::recommended_watcher(move |res| { let _ = tx.send(res); }).ok()?;
-        watcher.watch(&dir, RecursiveMode::NonRecursive).ok()?;
-
-        let metrics_for_thread = Arc::clone(&metrics);
-        let thread = std::thread::spawn(move || {
-            // Claude emits several filesystem events per assistant message, and
-            // re-parsing the whole transcript on each one is wasteful. Coalesce a
-            // burst: on the first event wait a short quiet window, drain whatever
-            // else queued, then re-parse exactly once. The channel closing (the
-            // watcher dropped on Drop) ends the loop.
-            while let Ok(first) = rx.recv() {
-                if first.is_err() {
-                    continue;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-                while rx.try_recv().is_ok() {}
-                if let Some(file) = newest_transcript(&dir) {
-                    let fresh = parse_transcript(&file);
-                    if let Ok(mut current) = metrics_for_thread.lock() {
-                        *current = fresh;
-                    }
-                }
-            }
-        });
-
-        Some(Self {
-            metrics,
-            _watcher: watcher,
-            _thread: thread,
-        })
-    }
-
-    /// A copy of the latest metrics (cheap; the struct is small and `Clone`).
-    pub fn snapshot(&self) -> Metrics {
-        self.metrics
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default()
-    }
 }
 
 /// Encode an absolute project path the way Claude names its transcript folder:

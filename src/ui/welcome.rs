@@ -99,22 +99,22 @@ const KEYBINDINGS: &[(&str, &str)] = &[
     ("Y / N", "Confirm / cancel a delete"),
     ("Esc", "Close the picker"),
     ("", ""),
-    ("Workspace — side pane focused (Git / Metrics)", ""),
-    ("Ctrl+1 / Ctrl+2 / Ctrl+3", "Focus Git / Claude / Metrics"),
+    ("Workspace — side pane focused (Git / File Manager)", ""),
+    ("Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4", "Focus Git / Claude / File Mgr / Terminal"),
     ("Tab / Shift+Tab", "Cycle panes"),
-    ("Ctrl+g / Ctrl+m", "Toggle the Git / Metrics pane"),
+    ("Ctrl+g", "Toggle the Git pane"),
     ("Shift+PgUp / Shift+PgDn", "Scroll Claude’s history"),
     ("Esc", "Back to the welcome screen"),
     ("q / Q", "Quit Bruce"),
     ("", ""),
     ("Workspace — Claude focused", ""),
     ("type", "Send keystrokes to Claude"),
-    ("Ctrl+1 / Ctrl+2 / Ctrl+3", "Focus Git / Claude / Metrics"),
+    ("Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4", "Focus Git / Claude / File Mgr / Terminal"),
     ("Shift+PgUp / Shift+PgDn", "Scroll Claude’s history"),
     ("Ctrl+b", "Leader — then one of:"),
     ("Ctrl+b  b", "Back to the welcome screen"),
     ("Ctrl+b  Tab", "Switch pane"),
-    ("Ctrl+b  g / m", "Toggle the Git / Metrics pane"),
+    ("Ctrl+b  g", "Toggle the Git pane"),
     ("Ctrl+b  q", "Quit Bruce"),
 ];
 
@@ -364,8 +364,6 @@ pub struct WelcomeState {
     /// Whether new/opened sessions start with the Git panel shown. Restored
     /// from preferences and updated when the user toggles it in a workspace.
     pub git_enabled: bool,
-    /// Whether new/opened sessions start with the Metrics panel shown.
-    pub metrics_enabled: bool,
     /// Repaint the terminal fg/bg to match the theme via OSC (Settings toggle).
     pub sync_colors: bool,
     /// Show the workspace footer hint bar (Settings block toggle).
@@ -427,7 +425,6 @@ impl WelcomeState {
             name_link: Cell::new(Rect::ZERO),
             theme: config.theme,
             git_enabled: config.git_enabled,
-            metrics_enabled: config.metrics_enabled,
             sync_colors: config.sync_colors,
             show_footer: config.show_footer,
             show_title: config.show_title,
@@ -506,7 +503,6 @@ impl WelcomeState {
         let _ = Config {
             theme: self.theme,
             git_enabled: self.git_enabled,
-            metrics_enabled: self.metrics_enabled,
             last_update_check: self.last_update_check,
             latest_seen: self.latest_seen.clone(),
             sync_colors: self.sync_colors,

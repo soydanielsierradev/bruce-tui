@@ -78,7 +78,6 @@ fn open_session_loading(
         resume,
         welcome.theme,
         welcome.git_enabled,
-        welcome.metrics_enabled,
         welcome.show_footer,
         welcome.show_title,
         welcome.border_style,
@@ -515,13 +514,14 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                 // the other. The plain keys still reach Claude.
                 let scroll_mod = ctrl || key.modifiers.contains(KeyModifiers::SHIFT);
 
-                // Ctrl+1/2/3 jump straight to a pane from anywhere — even while
-                // Claude has focus — so switching never needs the leader chord.
+                // Ctrl+1/2/3/4 jump straight to a pane from anywhere — even
+                // while Claude has focus — so switching never needs the leader chord.
                 let pane = ctrl
                     .then(|| match key.code {
                         KeyCode::Char('1') => Some(Panel::Git),
                         KeyCode::Char('2') => Some(Panel::Claude),
-                        KeyCode::Char('3') => Some(Panel::Metrics),
+                        KeyCode::Char('3') => Some(Panel::FileManager),
+                        KeyCode::Char('4') => Some(Panel::Terminal),
                         _ => None,
                     })
                     .flatten();
@@ -537,7 +537,6 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                             KeyCode::Tab => ws.focus_next(),
                             KeyCode::BackTab => ws.focus_prev(),
                             KeyCode::Char('g') => ws.toggle_git(),
-                            KeyCode::Char('m') => ws.toggle_metrics(),
                             KeyCode::Char('q') => quit = true,
                             _ => {} // unknown command: swallow it
                         }
@@ -564,7 +563,6 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         KeyCode::Tab => ws.focus_next(),
                         KeyCode::BackTab => ws.focus_prev(),
                         KeyCode::Char('g') if ctrl => ws.toggle_git(),
-                        KeyCode::Char('m') if ctrl => ws.toggle_metrics(),
                         KeyCode::PageUp if scroll_mod => ws.scroll_up(),
                         KeyCode::PageDown if scroll_mod => ws.scroll_down(),
                         _ => {}
@@ -580,7 +578,6 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
             if let Screen::Workspace(ws) = &mut screen {
                 ws.persist_metrics();
                 welcome.git_enabled = ws.git_enabled;
-                welcome.metrics_enabled = ws.metrics_enabled;
                 welcome.persist_config();
             }
         }

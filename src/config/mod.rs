@@ -23,9 +23,8 @@ pub struct Config {
     /// Last active color theme.
     pub theme: Theme,
     /// Whether the Git panel is shown.
+    #[serde(default = "default_true")]
     pub git_enabled: bool,
-    /// Whether the Metrics panel is shown.
-    pub metrics_enabled: bool,
     /// Unix-epoch seconds of the last update check (0 = never). Throttles the
     /// network check to roughly once a day.
     #[serde(default)]
@@ -64,7 +63,6 @@ impl Default for Config {
         Self {
             theme: Theme::Hacker,
             git_enabled: true,
-            metrics_enabled: true,
             last_update_check: 0,
             latest_seen: String::new(),
             sync_colors: true,

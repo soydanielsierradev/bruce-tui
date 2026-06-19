@@ -1,8 +1,6 @@
-//! The 3-pane workspace: Git (left), Claude Code (center) and Metrics (right).
-//!
-//! Step 3 ships a *static* layout with placeholder content and panel focus.
-//! Real wiring lands later: git2 (step 4), the embedded PTY (step 5) and the
-//! token-metrics file watcher (step 6).
+//! The workspace: Git (left), Claude Code (center), File Manager (right), and
+//! a full-width Terminal below. Metrics have been replaced by the File Manager;
+//! the Terminal pane is a second PTY wired in Slice 2.
 
 use std::cell::Cell;
 use std::time::{Duration, Instant};
@@ -18,7 +16,7 @@ use ratatui::{
 
 use crate::config::Config;
 use crate::panels::git::{self, GitView};
-use crate::panels::metrics::{self, MetricsWatcher};
+use crate::panels::metrics;
 use crate::pty::{PtySession, SpawnOptions};
 use crate::session::Session;
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
@@ -28,7 +26,10 @@ use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 pub enum Panel {
     Git,
     Claude,
-    Metrics,
+    /// File manager pane (top-right, always present). Full implementation in Slice 3.
+    FileManager,
+    /// Terminal pane (full-width, below top row). Full implementation in Slice 2.
+    Terminal,
 }
 
 /// State backing the workspace screen.
@@ -42,8 +43,6 @@ pub struct WorkspaceState {
     pub focus: Panel,
     /// Whether the Git pane is shown. The Claude pane is always shown.
     pub git_enabled: bool,
-    /// Whether the Metrics pane is shown.
-    pub metrics_enabled: bool,
     /// Show the bottom hint bar (Settings → Footer hints).
     pub show_footer: bool,
     /// Show the top title bar (Settings → Title bar).
@@ -58,9 +57,6 @@ pub struct WorkspaceState {
     pub pty: Option<PtySession>,
     /// Why the PTY couldn't start, if it didn't.
     pub pty_error: Option<String>,
-    /// Live token-usage watcher backing the Metrics pane (`None` if it couldn't
-    /// start — e.g. no home directory).
-    pub metrics: Option<MetricsWatcher>,
     /// `true` after Ctrl+b, waiting for the leader command key.
     pub leader_pending: bool,
     /// Last size the PTY was synced to, to avoid resizing every frame.
@@ -92,7 +88,6 @@ impl WorkspaceState {
         resume: bool,
         theme: Theme,
         git_enabled: bool,
-        metrics_enabled: bool,
         show_footer: bool,
         show_title: bool,
         border_style: BorderStyle,
@@ -100,8 +95,6 @@ impl WorkspaceState {
     ) -> Self {
         let cwd = session.project_path.clone();
         let git = git::load(&cwd);
-        // Watch Claude's transcript for this project to surface live token usage.
-        let metrics = MetricsWatcher::new(&cwd);
 
         // Pin the conversation to the session id so it can be resumed later.
         let flag = if resume { "--resume" } else { "--session-id" };
@@ -123,7 +116,6 @@ impl WorkspaceState {
             // Center pane (Claude) is where the user works, so focus it first.
             focus: Panel::Claude,
             git_enabled,
-            metrics_enabled,
             show_footer,
             show_title,
             border_style,
@@ -131,7 +123,6 @@ impl WorkspaceState {
             git,
             pty,
             pty_error,
-            metrics,
             leader_pending: false,
             last_pty_size: Cell::new((24, 80)),
             last_git_refresh: Instant::now(),
@@ -245,16 +236,17 @@ impl WorkspaceState {
         }
     }
 
-    /// Enabled panes in left-to-right order. Claude is always present.
+    /// Enabled panes in traversal order. Claude is always present; FileManager
+    /// is always present in the top row; Terminal is always in the Tab cycle
+    /// (it gains real content in Slice 2).
     fn enabled_panels(&self) -> Vec<Panel> {
-        let mut panels = Vec::with_capacity(3);
+        let mut panels = Vec::with_capacity(4);
         if self.git_enabled {
             panels.push(Panel::Git);
         }
         panels.push(Panel::Claude);
-        if self.metrics_enabled {
-            panels.push(Panel::Metrics);
-        }
+        panels.push(Panel::FileManager);
+        panels.push(Panel::Terminal);
         panels
     }
 
@@ -291,15 +283,6 @@ impl WorkspaceState {
         self.persist_panels();
     }
 
-    /// Toggle the Metrics pane. If it was focused while being hidden, focus Claude.
-    pub fn toggle_metrics(&mut self) {
-        self.metrics_enabled = !self.metrics_enabled;
-        if !self.metrics_enabled && self.focus == Panel::Metrics {
-            self.focus = Panel::Claude;
-        }
-        self.persist_panels();
-    }
-
     /// Save the panel-visibility choice to disk *immediately*, so it survives
     /// even when the terminal is closed without a clean quit (which kills the
     /// process before the exit-time save runs). Loads the existing config first
@@ -308,7 +291,6 @@ impl WorkspaceState {
     fn persist_panels(&self) {
         let mut config = Config::load();
         config.git_enabled = self.git_enabled;
-        config.metrics_enabled = self.metrics_enabled;
         let _ = config.save();
     }
 }
@@ -321,14 +303,17 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
     // Paint the whole background first.
     frame.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
-    // Vertical sections: title bar, the three panes, footer. The title and
-    // footer rows collapse to zero height when hidden (Settings → Title bar /
-    // Footer hints), giving those lines back to the panes.
+    // Outer vertical layout:
+    //   [0] title bar   (0 or 1 row)
+    //   [1] top_row     (Git? | Claude | FileManager)
+    //   [2] terminal_row (Length(0) until Slice 2 wires the second PTY)
+    //   [3] footer bar  (0 or 1 row)
     let title_height = if state.show_title { 1 } else { 0 };
     let footer_height = if state.show_footer { 1 } else { 0 };
     let rows = Layout::vertical([
         Constraint::Length(title_height),  // title bar
-        Constraint::Min(3),                // panes
+        Constraint::Min(3),                // top_row: Git? + Claude + FileManager
+        Constraint::Length(0),             // terminal_row: placeholder (Slice 2)
         Constraint::Length(footer_height), // footer hints
     ])
     .split(area);
@@ -337,40 +322,42 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
         render_title(frame, rows[0], state, &pal);
     }
 
-    // Columns adapt to which panes are enabled: each side pane takes the
-    // configured width (Settings → Side width), Claude absorbs the rest.
+    // Horizontal columns within top_row:
+    //   Git (optional, side%) | Claude (remainder) | FileManager (always, side%)
+    // side_panes counts only toggleable side panes (Git); FileManager always
+    // takes its own `side` slice.
     let side = state.side_width.percent();
-    let side_panes = state.git_enabled as u16 + state.metrics_enabled as u16;
-    let claude_width = 100 - side * side_panes;
+    let side_panes = state.git_enabled as u16;
+    let claude_width = 100 - side * side_panes - side;
 
     let mut constraints = Vec::with_capacity(3);
-    let mut order = Vec::with_capacity(3);
+    let mut order: Vec<Panel> = Vec::with_capacity(3);
     if state.git_enabled {
         constraints.push(Constraint::Percentage(side));
         order.push(Panel::Git);
     }
     constraints.push(Constraint::Percentage(claude_width));
     order.push(Panel::Claude);
-    if state.metrics_enabled {
-        constraints.push(Constraint::Percentage(side));
-        order.push(Panel::Metrics);
-    }
+    // FileManager is always present in the top row.
+    constraints.push(Constraint::Percentage(side));
+    order.push(Panel::FileManager);
 
     let cols = Layout::horizontal(constraints).split(rows[1]);
     for (col, panel) in cols.iter().zip(order) {
         let focused = state.focus == panel;
-        // Only the side panes (Git, Metrics) are framed; the Claude pane stays
-        // borderless so the embedded terminal blends in, keeping the same spacing
-        // via padding.
         match panel {
             Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git, state.border_style.border_type()),
             Panel::Claude => render_claude_pane(frame, *col, &pal, focused, state),
-            Panel::Metrics => render_metrics_pane(frame, *col, &pal, focused, state),
+            Panel::FileManager => render_file_manager_pane(frame, *col, &pal, focused, state.border_style.border_type()),
+            // Terminal is rendered in rows[2]; not part of the top_row split.
+            Panel::Terminal => {}
         }
     }
 
+    // terminal_row is Length(0) in this slice — nothing to render yet.
+
     if state.show_footer {
-        render_footer(frame, rows[2], &pal, state);
+        render_footer(frame, rows[3], &pal, state);
     }
 }
 
@@ -706,138 +693,12 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
     );
 }
 
-/// Render the Metrics pane: live token usage parsed from Claude's transcript.
-fn render_metrics_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
-    let block = pane_block(pal, " Metrics ", focused, true, state.border_style.border_type());
+/// Render the File Manager pane. Slice 1 placeholder — real content lands in Slice 3.
+fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, border_type: BorderType) {
+    let block = pane_block(pal, " Files ", focused, true, border_type);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let Some(watcher) = &state.metrics else {
-        return simple_body(frame, inner, pal, "Token metrics unavailable.");
-    };
-    let m = watcher.snapshot();
-    let width = inner.width as usize;
-    let mut lines: Vec<Line> = Vec::new();
-
-    // ── tokens · session ──
-    section_header(&mut lines, pal, "tokens · session", width);
-    big_number(&mut lines, &fmt_count(m.total()), pal.accent);
-    lines.push(dim_line(pal, &format!(" {} turns", m.turns)));
-    lines.push(Line::raw(""));
-
-    // ── active context window ──
-    section_header(&mut lines, pal, "active context", width);
-    big_number(&mut lines, &fmt_count(m.context), pal.modified);
-    let ctx_pct = m.context_pct();
-    bar_line(&mut lines, pal, width, ctx_pct, pal.modified);
-    metric_row_str(&mut lines, pal, width, "% window", &format!("{ctx_pct}%"), pal.modified);
-    lines.push(Line::raw(""));
-
-    // ── breakdown ──
-    section_header(&mut lines, pal, "breakdown", width);
-    metric_row(&mut lines, pal, width, "input", m.input, pal.fg);
-    metric_row(&mut lines, pal, width, "output", m.output, pal.added);
-    metric_row_str(&mut lines, pal, width, "cache hits", &format!("{}%", m.cache_hit_pct()), pal.renamed);
-    metric_row(&mut lines, pal, width, "tool calls", m.tool_calls, pal.accent);
-    lines.push(Line::raw(""));
-
-    // ── estimated cost (approximate: hard-coded list prices) ──
-    section_header(&mut lines, pal, "cost · est.", width);
-    big_number(&mut lines, &format!("${:.2}", m.cost_usd()), pal.renamed);
-    lines.push(dim_line(pal, &format!(" {}", model_short(&m.model))));
-    lines.push(Line::raw(""));
-
-    // ── active MCP servers (those exercised this session) ──
-    section_header(&mut lines, pal, "mcp · active", width);
-    if m.mcp_servers.is_empty() {
-        lines.push(dim_line(pal, " —"));
-    } else {
-        for server in &m.mcp_servers {
-            lines.push(Line::from(vec![
-                Span::styled(" ● ", Style::default().fg(pal.added)),
-                Span::styled(server.clone(), Style::default().fg(pal.fg)),
-            ]));
-        }
-    }
-    lines.push(Line::raw(""));
-
-    // ── current session ──
-    section_header(&mut lines, pal, "session", width);
-    metric_row_str(&mut lines, pal, width, "duration", &fmt_duration(m.duration_secs()), pal.added);
-    metric_row(&mut lines, pal, width, "files", m.files_edited, pal.modified);
-    metric_row_str(&mut lines, pal, width, "lines written", &m.lines_added.to_string(), pal.added);
-    metric_row_str(&mut lines, pal, width, "lines removed", &m.lines_removed.to_string(), pal.removed);
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(pal.bg)),
-        inner,
-    );
-}
-
-/// Push a right-aligned "label … value" row, the value formatted compactly.
-fn metric_row<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, label: &str, value: u64, color: Color) {
-    let value = fmt_count(value);
-    let pad = width.saturating_sub(1 + label.len() + value.len());
-    lines.push(Line::from(vec![
-        Span::styled(format!(" {label}"), Style::default().fg(pal.dim)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(value, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-    ]));
-}
-
-/// Push a right-aligned "label … value" row where the value is a ready string.
-fn metric_row_str<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, label: &str, value: &str, color: Color) {
-    let pad = width.saturating_sub(1 + label.chars().count() + value.chars().count());
-    lines.push(Line::from(vec![
-        Span::styled(format!(" {label}"), Style::default().fg(pal.dim)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(value.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-    ]));
-}
-
-/// Push a prominent (bold, coloured) headline number.
-fn big_number<'a>(lines: &mut Vec<Line<'a>>, text: &str, color: Color) {
-    lines.push(Line::from(Span::styled(
-        format!(" {text}"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )));
-}
-
-/// Push a horizontal fill bar: `filled` blocks coloured, the rest dim.
-fn bar_line<'a>(lines: &mut Vec<Line<'a>>, pal: &Palette, width: usize, pct: u64, color: Color) {
-    let cells = width.saturating_sub(2);
-    let filled = (cells as u64 * pct / 100) as usize;
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled("█".repeat(filled), Style::default().fg(color)),
-        Span::styled("░".repeat(cells.saturating_sub(filled)), Style::default().fg(pal.dim)),
-    ]));
-}
-
-/// Human-friendly elapsed time: `2h 5m`, `5m 12s`, `42s`.
-fn fmt_duration(secs: i64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h {m}m")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// Drop the `claude-` prefix from a model id for a compact label.
-fn model_short(model: &str) -> String {
-    model.strip_prefix("claude-").unwrap_or(model).to_string()
-}
-
-/// Compact human count: 1234 -> "1.2k", 1500000 -> "1.5M".
-fn fmt_count(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
-    }
+    simple_body(frame, inner, pal, " File manager (coming soon)");
 }
 
 /// Top title bar: app name + the open session's name.
@@ -874,8 +735,6 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
             txt(" switch   "),
             key("g"),
             txt(" git   "),
-            key("m"),
-            txt(" metrics   "),
             key("q"),
             txt(" quit"),
         ])
@@ -883,24 +742,22 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
         // Typing flows to Claude; control keys stay on Ctrl-chords.
         Line::from(vec![
             txt("  typing → Claude    "),
-            key("Ctrl+1/2/3"),
+            key("Ctrl+1/2/3/4"),
             txt(" panes    "),
             key("Shift+PgUp/PgDn"),
             txt(" scroll    "),
             key("Ctrl+b"),
-            txt(" leader (Tab/b/g/m/q)"),
+            txt(" leader (Tab/b/g/q)"),
         ])
     } else {
         // Side pane focused: direct navigation.
         Line::from(vec![
-            key("  Ctrl+1/2/3"),
+            key("  Ctrl+1/2/3/4"),
             txt(" / "),
             key("Tab"),
             txt(" panes   "),
             key("^g"),
             txt(" git   "),
-            key("^m"),
-            txt(" metrics   "),
             key("Esc"),
             txt(" back   "),
             key("Q"),
