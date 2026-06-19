@@ -369,12 +369,17 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
             continue;
         }
         // A paste arrives as one event (bracketed paste). In the workspace it
-        // goes straight to Claude as a bracketed paste so multi-line code lands
-        // as a single insert; in a welcome text field we replay its printable
-        // characters so pasting a name/query still works.
+        // goes straight to the focused PTY pane (Claude or Terminal) as a
+        // bracketed paste so multi-line code lands as a single insert; in a
+        // welcome text field we replay its printable characters so pasting a
+        // name/query still works.
         if let Event::Paste(text) = evt {
             match &mut screen {
-                Screen::Workspace(ws) if ws.focus == Panel::Claude => ws.send_paste(&text),
+                Screen::Workspace(ws)
+                    if ws.focus == Panel::Claude || ws.focus == Panel::Terminal =>
+                {
+                    ws.send_paste(&text)
+                }
                 Screen::Welcome if welcome.dialog.is_some() => {
                     for c in text.chars().filter(|c| !c.is_control()) {
                         let synthetic = KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
@@ -526,10 +531,21 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                     })
                     .flatten();
 
+                // A PTY pane (Claude or Terminal) has focus: typing goes to the shell.
+                let pty_focused = (ws.focus == Panel::Claude && ws.pty.is_some())
+                    || (ws.focus == Panel::Terminal && ws.terminal.is_some());
+
                 if let Some(panel) = pane {
                     ws.focus_panel(panel);
-                } else if ws.focus == Panel::Claude && ws.pty.is_some() {
-                    if ws.leader_pending {
+                } else if pty_focused {
+                    // Enter on a dead terminal shell respawns it instead of
+                    // sending the keystroke to a no-longer-running process.
+                    if ws.focus == Panel::Terminal
+                        && ws.terminal_exit_code.is_some()
+                        && key.code == KeyCode::Enter
+                    {
+                        ws.respawn_terminal();
+                    } else if ws.leader_pending {
                         // Second key of the Ctrl+b chord: a Bruce command.
                         ws.leader_pending = false;
                         match key.code {
@@ -537,6 +553,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                             KeyCode::Tab => ws.focus_next(),
                             KeyCode::BackTab => ws.focus_prev(),
                             KeyCode::Char('g') => ws.toggle_git(),
+                            KeyCode::Char('t') => ws.toggle_terminal(),
                             KeyCode::Char('q') => quit = true,
                             _ => {} // unknown command: swallow it
                         }
@@ -547,16 +564,17 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                     } else if ctrl && matches!(key.code, KeyCode::Char('b')) {
                         ws.leader_pending = true;
                     } else {
-                        // Everything else is the user typing into Claude. Coalesce
-                        // any burst queued behind this key so a multi-line paste
-                        // lands as one bracketed insert rather than a message per
-                        // line (the Windows path, where crossterm can't surface
-                        // bracketed paste). Any event read past the burst is
-                        // stashed for the next iteration.
+                        // Everything else is the user typing into the focused PTY.
+                        // Coalesce any burst so a multi-line paste lands as one
+                        // bracketed insert (Windows path where crossterm doesn't
+                        // surface bracketed paste). Any event read past the burst
+                        // is stashed for the next iteration.
                         pending = forward_typing(ws, key)?;
                     }
                 } else {
-                    // A side pane has focus: navigate Bruce directly.
+                    // A non-PTY pane (Git, FileManager) has focus: navigate Bruce.
+                    // The Terminal pane before first-spawn also lands here; Tab
+                    // will trigger spawn via focus_next → ensure_terminal.
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => quit = true,
                         KeyCode::Esc => transition = Some(Screen::Welcome),

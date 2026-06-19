@@ -1223,7 +1223,7 @@ impl WelcomeState {
                     #[cfg(not(windows))]
                     let (program, args_vec) = ("sh", vec!["-c", cmd.as_str()]);
 
-                    match PtySession::new_command(24, 80, program, &args_vec, None) {
+                    match PtySession::new_command(24, 80, program, &args_vec, None, crate::pty::INSTALL_SCROLLBACK) {
                         Ok(pty) => {
                             if let Some(Dialog::SkillInstall(d)) = &mut self.dialog {
                                 d.pty = Some(pty);

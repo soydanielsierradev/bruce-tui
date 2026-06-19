@@ -17,7 +17,7 @@ use ratatui::{
 use crate::config::Config;
 use crate::panels::git::{self, GitView};
 use crate::panels::metrics;
-use crate::pty::{PtySession, SpawnOptions};
+use crate::pty::{PtySession, SpawnOptions, TERMINAL_SCROLLBACK};
 use crate::session::Session;
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 
@@ -59,7 +59,7 @@ pub struct WorkspaceState {
     pub pty_error: Option<String>,
     /// `true` after Ctrl+b, waiting for the leader command key.
     pub leader_pending: bool,
-    /// Last size the PTY was synced to, to avoid resizing every frame.
+    /// Last size the Claude PTY was synced to, to avoid resizing every frame.
     last_pty_size: Cell<(u16, u16)>,
     /// When the Git pane was last reloaded, to throttle the refresh poll.
     last_git_refresh: Instant,
@@ -68,12 +68,45 @@ pub struct WorkspaceState {
     /// Latches `true` once Claude has finished its initial paint, so the waking
     /// overlay is shown only while it boots and never again.
     claude_awake: Cell<bool>,
+
+    // ── Terminal pane (Slice 2) ──────────────────────────────────────────────
+    /// Shell PTY; `None` until the pane receives focus for the first time.
+    /// Spawned lazily to avoid running two ConPTY instances simultaneously on
+    /// Windows before we have confirmed that works (two-PTY smoke-test gate).
+    pub terminal: Option<PtySession>,
+    /// Why the terminal PTY couldn't start, if it didn't.
+    pub terminal_error: Option<String>,
+    /// Whether the terminal pane is visible. Defaults to true; not persisted
+    /// (always starts enabled; user can hide with `Ctrl+b t`).
+    pub terminal_enabled: bool,
+    /// Last size the terminal PTY was synced to.
+    last_term_size: Cell<(u16, u16)>,
+    /// Exit code of the shell if it has exited, `None` while running.
+    /// Set by `tick()`; the renderer shows a "Press Enter to restart" hint.
+    pub terminal_exit_code: Option<i32>,
+    // ─────────────────────────────────────────────────────────────────────────
 }
 
 /// How often the Git pane is re-read from disk. Claude (or the user) changes the
 /// repo while a session runs, so the snapshot must refresh; once a second keeps
 /// it current without re-running git status every frame.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Height of the terminal pane in rows when it is visible.
+const TERMINAL_ROWS: u16 = 12;
+
+/// Detect the user's preferred shell. On Windows: `%COMSPEC%` or `cmd.exe`.
+/// On Unix/macOS: `$SHELL` or `/bin/sh`.
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    }
+}
 
 impl WorkspaceState {
     /// Open a workspace running `session`, inheriting the welcome theme and the
@@ -128,17 +161,45 @@ impl WorkspaceState {
             last_git_refresh: Instant::now(),
             opened_at: Instant::now(),
             claude_awake: Cell::new(false),
+            // Terminal PTY is spawned lazily on first focus (Ctrl+4 / Tab to
+            // the Terminal pane). This avoids running two ConPTY instances on
+            // Windows simultaneously before we've confirmed that works.
+            terminal: None,
+            terminal_error: None,
+            terminal_enabled: true,
+            last_term_size: Cell::new((TERMINAL_ROWS, 80)),
+            terminal_exit_code: None,
         }
     }
 
     /// Per-frame upkeep. Reloads the Git pane at most once per
     /// [`GIT_REFRESH_INTERVAL`] so commits/edits made during the session (by
     /// Claude or the user) show up without re-running git status every frame.
+    /// Also polls the terminal PTY for exit so the UI can offer a respawn.
     pub fn tick(&mut self) {
         if self.last_git_refresh.elapsed() >= GIT_REFRESH_INTERVAL {
             self.git = git::load(&self.session.project_path);
             self.last_git_refresh = Instant::now();
         }
+        // Poll for terminal shell exit so render_terminal_pane can show a hint.
+        if self.terminal_exit_code.is_none() {
+            if let Some(pty) = &self.terminal {
+                if let Some(code) = pty.poll_exit() {
+                    self.terminal_exit_code = Some(code);
+                }
+            }
+        }
+    }
+
+    /// Respawn the shell PTY after the previous one has exited.
+    ///
+    /// Called when the user presses Enter in the Terminal pane after the shell
+    /// exits. Drops the old PTY, clears the exit flag, and spawns a fresh one.
+    pub fn respawn_terminal(&mut self) {
+        self.terminal = None;
+        self.terminal_exit_code = None;
+        self.terminal_error = None;
+        self.ensure_terminal();
     }
 
     /// Persist this session's soft metrics to disk. Call when leaving the
@@ -164,9 +225,45 @@ impl WorkspaceState {
         self.pty.as_ref().map_or(true, |p| p.has_output())
     }
 
-    /// Forward a key event to the embedded process (no-op without a PTY).
+    /// Return the PTY that currently has keyboard focus:
+    /// - `Panel::Claude`   → the Claude PTY
+    /// - `Panel::Terminal` → the shell PTY
+    /// - anything else     → `None` (Git/FileManager don't have a PTY)
+    fn focused_pty(&self) -> Option<&PtySession> {
+        match self.focus {
+            Panel::Claude => self.pty.as_ref(),
+            Panel::Terminal => self.terminal.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Spawn the shell PTY for the Terminal pane if it hasn't been spawned yet.
+    ///
+    /// Called on first focus of the Terminal pane (lazy spawn). Returns `true`
+    /// when the PTY is available (either just spawned or already running).
+    pub fn ensure_terminal(&mut self) -> bool {
+        if self.terminal.is_some() {
+            return true;
+        }
+        let shell = default_shell();
+        let cwd = self.session.project_path.clone();
+        let (rows, cols) = self.last_term_size.get();
+        match PtySession::new_command(rows, cols, &shell, &[], Some(cwd), TERMINAL_SCROLLBACK) {
+            Ok(pty) => {
+                self.terminal = Some(pty);
+                self.terminal_error = None;
+                true
+            }
+            Err(e) => {
+                self.terminal_error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Forward a key event to the focused PTY (no-op without a PTY).
     pub fn send_key(&self, key: &KeyEvent) {
-        if let Some(pty) = self.pty.as_ref() {
+        if let Some(pty) = self.focused_pty() {
             // Cursor/nav keys are encoded differently depending on the child's
             // cursor-key mode (DECCKM): full TUIs like Claude switch it on and
             // then expect SS3 (ESC O x) instead of CSI (ESC [ x).
@@ -183,14 +280,11 @@ impl WorkspaceState {
         }
     }
 
-    /// Forward pasted text to the embedded process as a *bracketed paste*:
+    /// Forward pasted text to the focused PTY as a *bracketed paste*:
     /// wrapped in `ESC[200~` … `ESC[201~`. The child then treats the whole block
-    /// as one multi-line insert instead of submitting on every newline — which
-    /// is what made a pasted snippet split into several messages. Claude Code
-    /// also collapses a large paste into a "[Pasted text +N lines]" placeholder
-    /// once it sees these markers, so the input stays readable.
+    /// as one multi-line insert instead of submitting on every newline.
     pub fn send_paste(&self, text: &str) {
-        if let Some(pty) = self.pty.as_ref() {
+        if let Some(pty) = self.focused_pty() {
             let mut bytes = Vec::with_capacity(text.len() + 12);
             bytes.extend_from_slice(b"\x1b[200~");
             bytes.extend_from_slice(text.as_bytes());
@@ -201,12 +295,11 @@ impl WorkspaceState {
         }
     }
 
-    /// Forward a run of plain typed characters to the child, translating each
-    /// newline to a carriage return (the byte Enter sends). Used when a fast
-    /// burst of keystrokes is coalesced but isn't a multi-line paste, so it
-    /// behaves exactly as if the keys had been typed one by one.
+    /// Forward a run of plain typed characters to the focused PTY, translating
+    /// each newline to a carriage return (the byte Enter sends). Used when a
+    /// fast burst of keystrokes is coalesced but isn't a multi-line paste.
     pub fn send_typed(&self, text: &str) {
-        if let Some(pty) = self.pty.as_ref() {
+        if let Some(pty) = self.focused_pty() {
             let mut bytes = Vec::with_capacity(text.len());
             let mut tmp = [0u8; 4];
             for c in text.chars() {
@@ -221,24 +314,51 @@ impl WorkspaceState {
         }
     }
 
-    /// Scroll the Claude pane back by one page (no-op without a PTY). The page
-    /// size is the pane's current height, so it pages like a terminal.
+    /// Scroll the focused PTY pane back by one page (no-op without a PTY). The
+    /// page size is the pane's current height, so it pages like a terminal.
     pub fn scroll_up(&self) {
-        if let Some(pty) = self.pty.as_ref() {
-            pty.scroll_up(self.last_pty_size.get().0.max(1) as usize);
+        match self.focus {
+            Panel::Claude => {
+                if let Some(pty) = self.pty.as_ref() {
+                    pty.scroll_up(self.last_pty_size.get().0.max(1) as usize);
+                }
+            }
+            Panel::Terminal => {
+                if let Some(pty) = self.terminal.as_ref() {
+                    pty.scroll_up(self.last_term_size.get().0.max(1) as usize);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Scroll the Claude pane forward by one page (no-op without a PTY).
+    /// Scroll the focused PTY pane forward by one page (no-op without a PTY).
     pub fn scroll_down(&self) {
-        if let Some(pty) = self.pty.as_ref() {
-            pty.scroll_down(self.last_pty_size.get().0.max(1) as usize);
+        match self.focus {
+            Panel::Claude => {
+                if let Some(pty) = self.pty.as_ref() {
+                    pty.scroll_down(self.last_pty_size.get().0.max(1) as usize);
+                }
+            }
+            Panel::Terminal => {
+                if let Some(pty) = self.terminal.as_ref() {
+                    pty.scroll_down(self.last_term_size.get().0.max(1) as usize);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggle the Terminal pane. If it was focused while being hidden, focus Claude.
+    pub fn toggle_terminal(&mut self) {
+        self.terminal_enabled = !self.terminal_enabled;
+        if !self.terminal_enabled && self.focus == Panel::Terminal {
+            self.focus = Panel::Claude;
         }
     }
 
     /// Enabled panes in traversal order. Claude is always present; FileManager
-    /// is always present in the top row; Terminal is always in the Tab cycle
-    /// (it gains real content in Slice 2).
+    /// is always present in the top row; Terminal is present when enabled.
     fn enabled_panels(&self) -> Vec<Panel> {
         let mut panels = Vec::with_capacity(4);
         if self.git_enabled {
@@ -246,25 +366,34 @@ impl WorkspaceState {
         }
         panels.push(Panel::Claude);
         panels.push(Panel::FileManager);
-        panels.push(Panel::Terminal);
+        if self.terminal_enabled {
+            panels.push(Panel::Terminal);
+        }
         panels
     }
 
     /// Give keyboard focus to `panel` directly, if it's currently enabled
-    /// (Claude always is). Bound to Ctrl+1/2/3 so the user can jump between
-    /// panes directly — where the terminal delivers those keys.
+    /// (Claude always is). Bound to Ctrl+1/2/3/4 so the user can jump between
+    /// panes directly. Focusing the Terminal pane triggers lazy PTY spawn.
     pub fn focus_panel(&mut self, panel: Panel) {
         if self.enabled_panels().contains(&panel) {
             self.focus = panel;
+            // Lazily spawn the shell PTY on first focus of the Terminal pane.
+            if panel == Panel::Terminal {
+                self.ensure_terminal();
+            }
         }
     }
 
     /// Cycle focus to the next enabled pane, skipping disabled ones. The
-    /// universal fallback (Tab) for terminals that don't deliver Ctrl+1/2/3.
+    /// universal fallback (Tab) for terminals that don't deliver Ctrl+1/2/3/4.
     pub fn focus_next(&mut self) {
         let panels = self.enabled_panels();
         let i = panels.iter().position(|&p| p == self.focus).unwrap_or(0);
         self.focus = panels[(i + 1) % panels.len()];
+        if self.focus == Panel::Terminal {
+            self.ensure_terminal();
+        }
     }
 
     /// Cycle focus to the previous enabled pane, skipping disabled ones (BackTab).
@@ -272,6 +401,9 @@ impl WorkspaceState {
         let panels = self.enabled_panels();
         let i = panels.iter().position(|&p| p == self.focus).unwrap_or(0);
         self.focus = panels[(i + panels.len() - 1) % panels.len()];
+        if self.focus == Panel::Terminal {
+            self.ensure_terminal();
+        }
     }
 
     /// Toggle the Git pane. If it was focused while being hidden, focus Claude.
@@ -304,17 +436,18 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
     frame.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
     // Outer vertical layout:
-    //   [0] title bar   (0 or 1 row)
-    //   [1] top_row     (Git? | Claude | FileManager)
-    //   [2] terminal_row (Length(0) until Slice 2 wires the second PTY)
-    //   [3] footer bar  (0 or 1 row)
+    //   [0] title bar    (0 or 1 row)
+    //   [1] top_row      (Git? | Claude | FileManager)
+    //   [2] terminal_row (TERMINAL_ROWS when enabled, 0 when hidden)
+    //   [3] footer bar   (0 or 1 row)
     let title_height = if state.show_title { 1 } else { 0 };
     let footer_height = if state.show_footer { 1 } else { 0 };
+    let terminal_height = if state.terminal_enabled { TERMINAL_ROWS } else { 0 };
     let rows = Layout::vertical([
-        Constraint::Length(title_height),  // title bar
-        Constraint::Min(3),                // top_row: Git? + Claude + FileManager
-        Constraint::Length(0),             // terminal_row: placeholder (Slice 2)
-        Constraint::Length(footer_height), // footer hints
+        Constraint::Length(title_height),    // title bar
+        Constraint::Min(3),                  // top_row: Git? + Claude + FileManager
+        Constraint::Length(terminal_height), // terminal_row: shell PTY
+        Constraint::Length(footer_height),   // footer hints
     ])
     .split(area);
 
@@ -354,7 +487,10 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
         }
     }
 
-    // terminal_row is Length(0) in this slice — nothing to render yet.
+    // Render the terminal pane when it's enabled (non-zero height).
+    if state.terminal_enabled && rows[2].height > 0 {
+        render_terminal_pane(frame, rows[2], &pal, state.focus == Panel::Terminal, state);
+    }
 
     if state.show_footer {
         render_footer(frame, rows[3], &pal, state);
@@ -701,6 +837,77 @@ fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focuse
     simple_body(frame, inner, pal, " File manager (coming soon)");
 }
 
+/// Render the Terminal pane: the embedded shell's emulated screen.
+///
+/// Before the PTY has been spawned (before first focus) we show a short hint.
+/// Once spawned we display its screen with the same pipeline as the Claude pane.
+fn render_terminal_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
+    let block = pane_block(pal, " Terminal ", focused, true, state.border_style.border_type());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(pty) = &state.terminal else {
+        // Shell hasn't been spawned yet — show the hint message until the user
+        // focuses this pane for the first time.
+        if let Some(err) = &state.terminal_error {
+            simple_body(frame, inner, pal, &format!(" Shell error: {err}"));
+        } else {
+            simple_body(frame, inner, pal, " Press Ctrl+4 or Tab here to start a shell");
+        }
+        return;
+    };
+
+    // Keep the PTY and emulator sized to the visible area.
+    let size = (inner.height, inner.width);
+    if size.0 > 0 && size.1 > 0 && state.last_term_size.get() != size {
+        pty.resize(size.0, size.1);
+        state.last_term_size.set(size);
+    }
+
+    // If the shell has exited, show the last screen content plus a respawn hint.
+    if let Some(code) = state.terminal_exit_code {
+        if let Some(parser) = pty.lock_parser() {
+            let screen = parser.screen();
+            frame.render_widget(
+                Paragraph::new(pty_screen_lines(screen, pal)).style(Style::default().bg(pal.bg)),
+                inner,
+            );
+        }
+        // Overlay a dim hint at the bottom of the inner rect.
+        let hint_y = inner.y + inner.height.saturating_sub(1);
+        if hint_y >= inner.y {
+            let msg = format!(" Shell exited (code {code}). Press Enter to restart.");
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    msg,
+                    Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+                )))
+                .style(Style::default().bg(pal.bg)),
+                Rect { x: inner.x, y: hint_y, width: inner.width, height: 1 },
+            );
+        }
+        return;
+    }
+
+    if let Some(parser) = pty.lock_parser() {
+        let screen = parser.screen();
+        frame.render_widget(
+            Paragraph::new(pty_screen_lines(screen, pal)).style(Style::default().bg(pal.bg)),
+            inner,
+        );
+        // Show the shell's cursor only while the pane is focused, the shell
+        // isn't hiding it, we're at the live bottom, and output is idle.
+        if focused
+            && !screen.hide_cursor()
+            && screen.scrollback() == 0
+            && pty.output_idle()
+        {
+            let (row, col) = screen.cursor_position();
+            frame.set_cursor_position((inner.x + col, inner.y + row));
+        }
+    }
+}
+
 /// Top title bar: app name + the open session's name.
 fn render_title(frame: &mut Frame, area: Rect, state: &WorkspaceState, pal: &Palette) {
     let line = Line::from(vec![
@@ -735,6 +942,8 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
             txt(" switch   "),
             key("g"),
             txt(" git   "),
+            key("t"),
+            txt(" terminal   "),
             key("q"),
             txt(" quit"),
         ])

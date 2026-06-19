@@ -46,7 +46,11 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 const SCROLLBACK_LINES: usize = 10_000;
 
 /// Scrollback lines for install dialog PTY — smaller cap since it's short-lived.
-const INSTALL_SCROLLBACK: usize = 200;
+pub const INSTALL_SCROLLBACK: usize = 200;
+
+/// Scrollback lines for the terminal pane (shell) — moderate cap; shells
+/// produce less output per session than long Claude conversations.
+pub const TERMINAL_SCROLLBACK: usize = 2_000;
 
 /// After this long without any PTY output we treat the child as idle (waiting
 /// for input) and show its cursor; while output is still streaming we keep the
@@ -174,14 +178,19 @@ impl PtySession {
     ///
     /// Unlike [`PtySession::new`], this does NOT read `BRUCE_CMD` and does NOT
     /// add CI/NO_COLOR env vars — the caller controls what runs. Used by the
-    /// install dialog to give interactive installers (e.g. `npx skills add`) a
-    /// real TTY so they can render ANSI menus and accept keyboard input.
+    /// install dialog and the Terminal pane to give interactive processes a real
+    /// TTY so they can render ANSI menus and accept keyboard input.
+    ///
+    /// `scrollback` controls how many off-screen lines the emulator keeps.
+    /// Pass [`INSTALL_SCROLLBACK`] for short-lived installers or
+    /// [`TERMINAL_SCROLLBACK`] for the persistent terminal pane.
     pub fn new_command(
         rows: u16,
         cols: u16,
         program: &str,
         args: &[&str],
         cwd: Option<PathBuf>,
+        scrollback: usize,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -215,7 +224,7 @@ impl PtySession {
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer()?));
         let mut reader = pair.master.try_clone_reader()?;
 
-        let scrollback_cap = INSTALL_SCROLLBACK;
+        let scrollback_cap = scrollback;
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback_cap)));
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
