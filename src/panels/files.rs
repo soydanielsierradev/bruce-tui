@@ -8,7 +8,11 @@
 //!   every file `.gitignore` doesn't exclude; used inside a git repo.
 //! - **Skip-list** (`std::fs::read_dir` recursive): skips `.git`, `target`,
 //!   `node_modules`, `.next`, `dist`, `__pycache__`, `.turbo`; used outside a
-//!   repo. Dotfiles hidden unless `show_hidden` is on.
+//!   repo.
+//!
+//! Both strategies always descend into hidden directories (e.g. `.github`) so
+//! the flat list covers every project file; only hidden *files* are withheld
+//! until `show_hidden` is on.
 //!
 //! The walk result is always sorted and deduplicated. Slice 4 can iterate
 //! `files.lock()` directly for Ctrl+F fuzzy search.
@@ -150,18 +154,21 @@ fn walk_dir(base: &Path, dir: &Path, show_hidden: bool, out: &mut Vec<PathBuf>) 
         if is_skipped(&name_str) {
             continue;
         }
-        // Skip dotfiles unless the user has toggled show_hidden.
-        if !show_hidden && is_dotfile(&name_str) {
-            continue;
-        }
 
         let path = entry.path();
         let Ok(meta) = entry.metadata() else {
             continue;
         };
         if meta.is_dir() {
+            // Always descend into directories — even hidden ones like
+            // `.github` — so the flat list (and Ctrl+F) covers every project
+            // file. The skip-list already prunes `.git`, build dirs, etc.
             walk_dir(base, &path, show_hidden, out);
         } else if meta.is_file() {
+            // Hidden FILES respect the `.` toggle (matches the pane).
+            if !show_hidden && is_dotfile(&name_str) {
+                continue;
+            }
             // Store as a project-relative path so the list is readable and
             // the same regardless of where Bruce was opened from.
             if let Ok(rel) = path.strip_prefix(base) {
@@ -203,9 +210,6 @@ fn git_walk_dir(
         if name_str == ".git" {
             continue;
         }
-        if !show_hidden && is_dotfile(&name_str) {
-            continue;
-        }
 
         let path = entry.path();
         let Ok(rel) = path.strip_prefix(base) else {
@@ -220,8 +224,14 @@ fn git_walk_dir(
             continue;
         };
         if meta.is_dir() {
+            // Always descend — even hidden dirs like `.github` — so Ctrl+F can
+            // reach every project file. `.gitignore` still prunes the rest.
             git_walk_dir(repo, base, &path, show_hidden, out);
         } else if meta.is_file() {
+            // Hidden FILES respect the `.` toggle (matches the pane).
+            if !show_hidden && is_dotfile(&name_str) {
+                continue;
+            }
             out.push(rel.to_path_buf());
         }
     }
@@ -526,6 +536,7 @@ mod tests {
             "src/lib.rs",
             "target/debug/build",
             "node_modules/package.json",
+            ".github/workflows/ci.yml",
             "README.md",
             "Cargo.toml",
         ] {
@@ -577,6 +588,13 @@ mod tests {
         // Dotfiles hidden by default.
         assert!(!files.iter().any(|p| p == Path::new(".env")), ".env included");
         assert!(!files.iter().any(|p| p == Path::new(".hidden")), ".hidden included");
+
+        // Hidden DIRECTORIES are still descended — their regular files show up
+        // even with show_hidden off, so Ctrl+F can reach them.
+        assert!(
+            files.iter().any(|p| p == Path::new(".github/workflows/ci.yml")),
+            "file inside hidden dir missing"
+        );
     }
 
     #[test]
