@@ -596,14 +596,15 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         pending = forward_typing(ws, key)?;
                     }
                 } else if ws.focus == Panel::FileManager {
-                    // File Manager pane has focus: navigate the file list.
-                    // Up/Down move the selection; Enter opens in editor; `.`
-                    // toggles dotfile visibility. Ctrl+1/2/3/4 already handled
-                    // above via the `pane` branch.
+                    // File Manager pane has focus: browse the directory tree.
+                    // Up/Down move the selection; Enter descends into a folder
+                    // (or opens a file in the editor); Left/Backspace go up; `.`
+                    // toggles dotfiles. Ctrl+1/2/3/4 handled above via `pane`.
                     match key.code {
                         KeyCode::Up => ws.fm_prev(),
                         KeyCode::Down => ws.fm_next(),
-                        KeyCode::Enter => ws.fm_open_selected(),
+                        KeyCode::Enter => ws.fm_enter(),
+                        KeyCode::Left | KeyCode::Backspace => ws.fm_up(),
                         KeyCode::Char('.') => ws.fm_toggle_hidden(),
                         KeyCode::Char('q') | KeyCode::Char('Q') => quit = true,
                         KeyCode::Esc => transition = Some(Screen::Welcome),

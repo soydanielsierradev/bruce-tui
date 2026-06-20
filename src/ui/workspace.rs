@@ -495,26 +495,32 @@ impl WorkspaceState {
         self.file_manager.toggle_hidden();
     }
 
-    /// Open the selected file in the editor. Uses `$BRUCE_EDITOR` if set,
-    /// otherwise falls back to `code` or `code-insiders` on the PATH.
-    ///
-    /// For VS Code the file is opened with `--goto <abs>:1` so it focuses
-    /// the file immediately. For other editors just `arg(abs_path)` is used.
-    /// If no editor is found the error is surfaced as `file_manager_status`.
-    pub fn fm_open_selected(&mut self) {
+    /// Act on the selected file-manager row: go up via "..", descend into a
+    /// folder, or open a file in the editor.
+    pub fn fm_enter(&mut self) {
         self.file_manager_status = None;
+        if let Some(abs_path) = self.file_manager.enter() {
+            self.open_in_editor(&abs_path);
+        }
+    }
 
-        let Some(abs_path) = self.file_manager.selected_abs_path() else {
-            return;
-        };
+    /// Go up one directory in the file manager.
+    pub fn fm_up(&mut self) {
+        self.file_manager.cd_up();
+    }
 
+    /// Open `abs_path` in the editor: `$BRUCE_EDITOR` if set, else `code` /
+    /// `code-insiders` on the PATH. VS Code gets `<project> --goto <abs>:1` so
+    /// it focuses the file. On Windows the editor is launched through `cmd /C`
+    /// (because `code` is a `.cmd` shim std::process::Command won't resolve);
+    /// Unix spawns it directly. Detached. Errors go to `file_manager_status`.
+    fn open_in_editor(&mut self, abs_path: &std::path::Path) {
         let Some((editor, is_vscode)) = editor_command() else {
             self.file_manager_status =
                 Some("No editor found. Set $BRUCE_EDITOR or install 'code'.".to_string());
             return;
         };
 
-        // Build the editor arguments.
         let mut args: Vec<String> = Vec::new();
         if is_vscode {
             args.push(self.session.project_path.to_string_lossy().into_owned());
@@ -524,9 +530,6 @@ impl WorkspaceState {
             args.push(abs_path.to_string_lossy().into_owned());
         }
 
-        // On Windows, `code` is a `.cmd` shim that std::process::Command won't
-        // resolve directly, so launch the editor through the shell. Unix spawns
-        // it directly. Either way it runs detached from Bruce.
         #[cfg(windows)]
         let mut cmd = {
             let mut c = std::process::Command::new("cmd");
@@ -651,42 +654,9 @@ impl WorkspaceState {
             return;
         };
 
-        // Reuse the same open logic as fm_open_selected.
+        // Reuse the shared editor dispatch, then close the overlay.
         self.file_manager_status = None;
-        let Some((editor, is_vscode)) = editor_command() else {
-            self.file_manager_status =
-                Some("No editor found. Set $BRUCE_EDITOR or install 'code'.".to_string());
-            self.dialog = WorkspaceDialog::None;
-            return;
-        };
-
-        let mut args: Vec<String> = Vec::new();
-        if is_vscode {
-            args.push(self.session.project_path.to_string_lossy().into_owned());
-            args.push("--goto".to_string());
-            args.push(format!("{}:1", abs_path.display()));
-        } else {
-            args.push(abs_path.to_string_lossy().into_owned());
-        }
-
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut c = std::process::Command::new("cmd");
-            c.arg("/C").arg(&editor).args(&args);
-            c
-        };
-        #[cfg(not(windows))]
-        let mut cmd = {
-            let mut c = std::process::Command::new(&editor);
-            c.args(&args);
-            c
-        };
-
-        if let Err(e) = cmd.spawn() {
-            self.file_manager_status = Some(format!("Failed to open editor: {e}"));
-        }
-
-        // Always close the dialog after attempting to open.
+        self.open_in_editor(&abs_path);
         self.dialog = WorkspaceDialog::None;
     }
 
@@ -1136,21 +1106,25 @@ fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focuse
         return;
     }
 
-    // Reserve the bottom row for the status / hint line.
-    let list_height = inner.height.saturating_sub(1) as usize;
-    let status_y = inner.y + inner.height.saturating_sub(1);
-
-    // Render list ─────────────────────────────────────────────────────────────
-    // Safety: we hold the Arc<Mutex> immutably for the duration of render, which
-    // is always fast (no I/O). The walk thread only locks when it writes the
-    // result, which is also quick (a single swap).
     let fm = &state.file_manager;
-    // clamp_scroll requires &mut self, but render only has &WorkspaceState.
-    // We work around this by computing the scroll window inline, read-only.
-    let file_count = fm.file_count();
 
-    // Compute the visible window without mutating (render is called with &).
-    let selected = fm.selected.min(file_count.saturating_sub(1));
+    // Row 0: the directory currently being browsed.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", fm.current_dir_label()),
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(pal.bg)),
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+    );
+
+    // The list lives between the path row (top) and the status row (bottom).
+    let list_top = inner.y + 1;
+    let status_y = inner.y + inner.height.saturating_sub(1);
+    let list_height = inner.height.saturating_sub(2) as usize;
+
+    let count = fm.entries.len();
+    let selected = fm.selected.min(count.saturating_sub(1));
     let scroll = if selected < fm.scroll_offset {
         selected
     } else {
@@ -1162,56 +1136,51 @@ fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focuse
         }
     };
 
-    if let Ok(guard) = fm.files.lock() {
-        let visible = guard.iter().skip(scroll).take(list_height);
-        for (i, path) in visible.enumerate() {
-            let abs_idx = scroll + i;
-            let is_selected = abs_idx == selected;
-            let display = path.display().to_string();
-            let y = inner.y + i as u16;
-            if y >= inner.y + list_height as u16 {
-                break;
-            }
+    if count == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " (empty)",
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: list_top, width: inner.width, height: 1 },
+        );
+    } else {
+        for (i, item) in fm.entries.iter().skip(scroll).take(list_height).enumerate() {
+            let is_selected = scroll + i == selected;
+            let y = list_top + i as u16;
+            let icon = crate::panels::files::icon_for(item);
+            let suffix = if item.is_dir && !item.is_parent { "/" } else { "" };
+            let label = format!(" {icon} {}{suffix}", item.name);
             let style = if is_selected {
                 Style::default()
                     .fg(pal.bg)
                     .bg(pal.accent)
                     .add_modifier(Modifier::BOLD)
+            } else if item.is_dir {
+                Style::default().fg(pal.accent)
             } else {
                 Style::default().fg(pal.fg)
             };
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {display}"),
-                    style,
-                )))
-                .style(Style::default().bg(pal.bg)),
+                Paragraph::new(Line::from(Span::styled(label, style)))
+                    .style(Style::default().bg(pal.bg)),
                 Rect { x: inner.x, y, width: inner.width, height: 1 },
-            );
-        }
-        if file_count == 0 {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    " Scanning files…",
-                    Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
-                )))
-                .style(Style::default().bg(pal.bg)),
-                Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
             );
         }
     }
 
     // Status / hint line ───────────────────────────────────────────────────────
     let hint_text = if let Some(status) = &state.file_manager_status {
-        status.as_str().to_string()
+        status.clone()
     } else if focused {
-        let hidden_hint = if fm.show_hidden { "·  hide" } else { "·  show" };
-        format!(" ↑↓ navigate  Enter open  . {hidden_hint} dotfiles")
+        let dot = if fm.show_hidden { "hide" } else { "show" };
+        format!(" ↑↓ nav  Enter open/cd  ← up  . {dot} dotfiles")
     } else {
         String::new()
     };
 
-    if !hint_text.is_empty() && status_y < inner.y + inner.height {
+    if !hint_text.is_empty() && status_y >= list_top {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint_text,

@@ -49,6 +49,46 @@ pub fn is_dotfile(name: &str) -> bool {
     name.starts_with('.')
 }
 
+/// One row in the file manager's current-directory view.
+pub struct DirItem {
+    /// The entry name, or ".." for the parent-directory row.
+    pub name: String,
+    /// True for directories (and the ".." parent row).
+    pub is_dir: bool,
+    /// True only for the ".." parent-directory row.
+    pub is_parent: bool,
+}
+
+/// A width-2 icon for a directory entry: a folder for directories, otherwise a
+/// glyph chosen from the file extension. All icons are width-2 emoji so the
+/// names line up in a column.
+pub fn icon_for(item: &DirItem) -> &'static str {
+    if item.is_dir {
+        return "📁";
+    }
+    let ext = Path::new(&item.name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "rs" => "🦀",
+        "js" | "jsx" | "mjs" | "cjs" => "📜",
+        "ts" | "tsx" => "📘",
+        "json" => "🔧",
+        "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" => "📋",
+        "md" | "markdown" => "📝",
+        "py" => "🐍",
+        "go" => "🐹",
+        "html" | "htm" => "🌐",
+        "css" | "scss" | "sass" => "🎨",
+        "sh" | "bash" | "zsh" | "ps1" | "bat" => "💻",
+        "lock" => "🔒",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => "📷",
+        _ => "📄",
+    }
+}
+
 /// Walk `root` recursively, skipping entries from [`is_skipped`] and (when
 /// `show_hidden` is false) dotfiles. Returns project-relative paths, sorted.
 ///
@@ -168,6 +208,13 @@ pub struct FileManager {
     last_refresh: Instant,
     /// Root path of the project being browsed.
     project_path: PathBuf,
+    /// Directory currently being browsed, relative to `project_path` (empty at
+    /// the root). The pane shows this directory's entries; `files` (the flat
+    /// list above) stays whole for Ctrl+F search.
+    pub current_dir: PathBuf,
+    /// Entries of `current_dir`: a ".." row first (unless at root), then
+    /// directories, then files. Rebuilt by [`reload_dir`] on navigation.
+    pub entries: Vec<DirItem>,
 }
 
 impl FileManager {
@@ -184,7 +231,10 @@ impl FileManager {
             walk_handle: None,
             last_refresh: Instant::now(),
             project_path,
+            current_dir: PathBuf::new(),
+            entries: Vec::new(),
         };
+        fm.reload_dir();
         fm.start_walk();
         fm
     }
@@ -220,11 +270,6 @@ impl FileManager {
         }
     }
 
-    /// Number of files currently in the list (reads the shared vec, cheap).
-    pub fn file_count(&self) -> usize {
-        self.files.lock().map(|g| g.len()).unwrap_or(0)
-    }
-
     /// Move selection up by one row, clamped to the top.
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
@@ -233,7 +278,7 @@ impl FileManager {
 
     /// Move selection down by one row, clamped to the last entry.
     pub fn select_next(&mut self) {
-        let max = self.file_count().saturating_sub(1);
+        let max = self.entry_count().saturating_sub(1);
         if self.selected < max {
             self.selected += 1;
         }
@@ -247,8 +292,8 @@ impl FileManager {
         if visible_height == 0 {
             return;
         }
-        // Clamp selected to the actual count (walk may have shrunk the list).
-        let count = self.file_count();
+        // Clamp selected to the actual count.
+        let count = self.entry_count();
         if count == 0 {
             self.selected = 0;
             self.scroll_offset = 0;
@@ -267,26 +312,95 @@ impl FileManager {
         }
     }
 
-    /// Toggle dotfile visibility and immediately re-walk.
+    /// Toggle dotfile visibility, reload the current directory, and re-walk the
+    /// flat list (used by Ctrl+F).
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
+        self.reload_dir();
+        self.start_walk();
+    }
+
+    /// Number of rows in the current-directory view.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Rebuild [`entries`] from `current_dir` on disk: a ".." row first (unless
+    /// at the root), then directories, then files — each group sorted
+    /// case-insensitively. Build artifacts (`is_skipped`) and, unless
+    /// `show_hidden`, dotfiles are omitted. Resets the selection to the top.
+    pub fn reload_dir(&mut self) {
+        let dir = self.project_path.join(&self.current_dir);
+        let mut dirs: Vec<DirItem> = Vec::new();
+        let mut files: Vec<DirItem> = Vec::new();
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            for entry in read.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_skipped(&name) || (!self.show_hidden && is_dotfile(&name)) {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let item = DirItem { name, is_dir, is_parent: false };
+                if is_dir {
+                    dirs.push(item);
+                } else {
+                    files.push(item);
+                }
+            }
+        }
+        dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+        let mut entries = Vec::with_capacity(dirs.len() + files.len() + 1);
+        if !self.current_dir.as_os_str().is_empty() {
+            entries.push(DirItem { name: "..".to_string(), is_dir: true, is_parent: true });
+        }
+        entries.append(&mut dirs);
+        entries.append(&mut files);
+
+        self.entries = entries;
         self.selected = 0;
         self.scroll_offset = 0;
-        self.start_walk();
+    }
+
+    /// Act on the selected entry: go up via "..", descend into a directory, or
+    /// return the absolute path of a file to open. `None` means we navigated.
+    pub fn enter(&mut self) -> Option<PathBuf> {
+        let item = self.entries.get(self.selected)?;
+        if item.is_parent {
+            self.current_dir.pop();
+            self.reload_dir();
+            None
+        } else if item.is_dir {
+            let name = item.name.clone();
+            self.current_dir.push(name);
+            self.reload_dir();
+            None
+        } else {
+            Some(self.project_path.join(&self.current_dir).join(&item.name))
+        }
+    }
+
+    /// Go up to the parent directory (no-op at the root).
+    pub fn cd_up(&mut self) {
+        if self.current_dir.pop() {
+            self.reload_dir();
+        }
+    }
+
+    /// A short project-relative label for the current directory ("/" at root).
+    pub fn current_dir_label(&self) -> String {
+        if self.current_dir.as_os_str().is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", self.current_dir.display().to_string().replace('\\', "/"))
+        }
     }
 
     /// Trigger a forced refresh (e.g. on first focus). Idempotent if the walk
     /// thread is still running — `start_walk` always replaces the handle.
     pub fn refresh(&mut self) {
         self.start_walk();
-    }
-
-    /// Return the absolute path of the currently selected file, or `None` when
-    /// the list is empty.
-    pub fn selected_abs_path(&self) -> Option<PathBuf> {
-        let guard = self.files.lock().ok()?;
-        let rel = guard.get(self.selected)?;
-        Some(self.project_path.join(rel))
     }
 }
 
