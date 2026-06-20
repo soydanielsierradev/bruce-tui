@@ -4,8 +4,8 @@
 //! paths populated by a background thread so the render loop is never blocked.
 //!
 //! Two walk strategies:
-//! - **Git-aware** (`git2::Repository::statuses`): tracked + untracked files
-//!   that respect `.gitignore`; used when `project_path` is inside a git repo.
+//! - **Git-aware** (recursive `read_dir` + `git2::Repository::is_path_ignored`):
+//!   every file `.gitignore` doesn't exclude; used inside a git repo.
 //! - **Skip-list** (`std::fs::read_dir` recursive): skips `.git`, `target`,
 //!   `node_modules`, `.next`, `dist`, `__pycache__`, `.turbo`; used outside a
 //!   repo. Dotfiles hidden unless `show_hidden` is on.
@@ -96,41 +96,60 @@ fn walk_dir(base: &Path, dir: &Path, show_hidden: bool, out: &mut Vec<PathBuf>) 
     }
 }
 
-/// Walk a git repository, collecting tracked + untracked files that are NOT
-/// ignored by `.gitignore`. Respects `show_hidden`.
+/// Walk a git repository, collecting EVERY file that `.gitignore` doesn't
+/// exclude (not just the changed ones). Respects `show_hidden`.
 ///
-/// Returns project-relative paths, sorted.
-pub fn git_aware_walk(
-    repo: &git2::Repository,
-    root: &Path,
-    show_hidden: bool,
-) -> Vec<PathBuf> {
-    let mut opts = git2::StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .exclude_submodules(true)
-        // Do NOT include ignored files.
-        .include_ignored(false);
-
-    let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
-        // Fall back to the skip-list walk if git2 fails.
-        return skip_list_walk(root, show_hidden);
-    };
-
-    let mut result: Vec<PathBuf> = statuses
-        .iter()
-        .filter_map(|entry| {
-            let path = entry.path()?;
-            if !show_hidden && path.split('/').any(is_dotfile) {
-                return None;
-            }
-            Some(PathBuf::from(path))
-        })
-        .collect();
-
+/// Returns project-relative paths, sorted. The repo must be opened on the same
+/// thread that calls this (`git2::Repository` is not `Send`).
+pub fn git_aware_walk(repo: &git2::Repository, root: &Path, show_hidden: bool) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    git_walk_dir(repo, root, root, show_hidden, &mut result);
     result.sort();
-    result.dedup();
     result
+}
+
+/// Recursive helper for [`git_aware_walk`]: like [`walk_dir`] but skips the
+/// `.git` directory and anything `.gitignore` excludes (via
+/// `repo.is_path_ignored`), so build artifacts and vendored deps stay hidden
+/// without a hard-coded skip-list.
+fn git_walk_dir(
+    repo: &git2::Repository,
+    base: &Path,
+    dir: &Path,
+    show_hidden: bool,
+    out: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == ".git" {
+            continue;
+        }
+        if !show_hidden && is_dotfile(&name_str) {
+            continue;
+        }
+
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(base) else {
+            continue;
+        };
+        // Honour .gitignore at every level (skips dirs like target/ wholesale).
+        if repo.is_path_ignored(rel).unwrap_or(false) {
+            continue;
+        }
+
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            git_walk_dir(repo, base, &path, show_hidden, out);
+        } else if meta.is_file() {
+            out.push(rel.to_path_buf());
+        }
+    }
 }
 
 /// File manager state owned by [`WorkspaceState`].

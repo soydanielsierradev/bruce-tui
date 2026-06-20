@@ -478,26 +478,40 @@ impl WorkspaceState {
             return;
         };
 
-        match editor_command() {
-            Some((editor, is_vscode)) => {
-                let mut cmd = std::process::Command::new(&editor);
-                if is_vscode {
-                    cmd.arg(&self.session.project_path);
-                    cmd.arg("--goto");
-                    cmd.arg(format!("{}:1", abs_path.display()));
-                } else {
-                    cmd.arg(&abs_path);
-                }
-                // Spawn detached — the editor runs independently of Bruce.
-                if let Err(e) = cmd.spawn() {
-                    self.file_manager_status =
-                        Some(format!("Failed to open editor: {e}"));
-                }
-            }
-            None => {
-                self.file_manager_status =
-                    Some("No editor found. Set $BRUCE_EDITOR or install 'code'.".to_string());
-            }
+        let Some((editor, is_vscode)) = editor_command() else {
+            self.file_manager_status =
+                Some("No editor found. Set $BRUCE_EDITOR or install 'code'.".to_string());
+            return;
+        };
+
+        // Build the editor arguments.
+        let mut args: Vec<String> = Vec::new();
+        if is_vscode {
+            args.push(self.session.project_path.to_string_lossy().into_owned());
+            args.push("--goto".to_string());
+            args.push(format!("{}:1", abs_path.display()));
+        } else {
+            args.push(abs_path.to_string_lossy().into_owned());
+        }
+
+        // On Windows, `code` is a `.cmd` shim that std::process::Command won't
+        // resolve directly, so launch the editor through the shell. Unix spawns
+        // it directly. Either way it runs detached from Bruce.
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/C").arg(&editor).args(&args);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = std::process::Command::new(&editor);
+            c.args(&args);
+            c
+        };
+
+        if let Err(e) = cmd.spawn() {
+            self.file_manager_status = Some(format!("Failed to open editor: {e}"));
         }
     }
 
