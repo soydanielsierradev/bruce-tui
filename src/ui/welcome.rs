@@ -121,8 +121,9 @@ const KEYBINDINGS: &[(&str, &str)] = &[
 /// Settings-block rows, in display order (index = `settings_selected`). Each
 /// toggles a persisted look preference; the on/off value is read live from
 /// state, not from this label.
-const SETTINGS_LABELS: [&str; 6] = [
+const SETTINGS_LABELS: [&str; 7] = [
     "Theme",
+    "File icons",
     "Terminal colors",
     "Border style",
     "Side width",
@@ -374,6 +375,8 @@ pub struct WelcomeState {
     pub border_style: BorderStyle,
     /// Width of each side pane (Settings option).
     pub side_width: SideWidth,
+    /// Use Nerd Font file icons (Settings toggle; carried into the workspace).
+    pub nerd_icons: bool,
     /// Selected row within the Skills block.
     pub skill_selected: usize,
     /// Result of the version check (drives the badge and the App block).
@@ -430,6 +433,7 @@ impl WelcomeState {
             show_title: config.show_title,
             border_style: config.border_style,
             side_width: config.side_width,
+            nerd_icons: config.nerd_icons,
             update_status,
             update_check,
             last_update_check: config.last_update_check,
@@ -510,6 +514,7 @@ impl WelcomeState {
             show_title: self.show_title,
             border_style: self.border_style,
             side_width: self.side_width,
+            nerd_icons: self.nerd_icons,
         }
         .save();
     }
@@ -652,15 +657,16 @@ impl WelcomeState {
     /// The Settings rows as (label, current value text), in display order.
     /// The Theme row shows the active theme's name; booleans read as on/off;
     /// multi-value options show their current label.
-    pub fn settings_rows(&self) -> [(&'static str, String); 6] {
+    pub fn settings_rows(&self) -> [(&'static str, String); 7] {
         let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
         [
             (SETTINGS_LABELS[0], self.theme.palette().name.to_string()),
-            (SETTINGS_LABELS[1], on_off(self.sync_colors)),
-            (SETTINGS_LABELS[2], self.border_style.label().to_string()),
-            (SETTINGS_LABELS[3], self.side_width.label().to_string()),
-            (SETTINGS_LABELS[4], on_off(self.show_title)),
-            (SETTINGS_LABELS[5], on_off(self.show_footer)),
+            (SETTINGS_LABELS[1], if self.nerd_icons { "Nerd Font" } else { "emoji" }.to_string()),
+            (SETTINGS_LABELS[2], on_off(self.sync_colors)),
+            (SETTINGS_LABELS[3], self.border_style.label().to_string()),
+            (SETTINGS_LABELS[4], self.side_width.label().to_string()),
+            (SETTINGS_LABELS[5], on_off(self.show_title)),
+            (SETTINGS_LABELS[6], on_off(self.show_footer)),
         ]
     }
 
@@ -675,11 +681,12 @@ impl WelcomeState {
     /// picker, so it's a no-op here.
     pub fn toggle_setting(&mut self) {
         match self.settings_selected {
-            1 => self.sync_colors = !self.sync_colors,
-            2 => self.border_style = self.border_style.next(),
-            3 => self.side_width = self.side_width.next(),
-            4 => self.show_title = !self.show_title,
-            5 => self.show_footer = !self.show_footer,
+            1 => self.nerd_icons = !self.nerd_icons,
+            2 => self.sync_colors = !self.sync_colors,
+            3 => self.border_style = self.border_style.next(),
+            4 => self.side_width = self.side_width.next(),
+            5 => self.show_title = !self.show_title,
+            6 => self.show_footer = !self.show_footer,
             _ => {}
         }
         self.persist_config();

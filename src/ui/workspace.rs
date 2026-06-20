@@ -78,6 +78,8 @@ pub struct WorkspaceState {
     pub border_style: BorderStyle,
     /// Width of each side pane (Settings → Side width).
     pub side_width: SideWidth,
+    /// Use Nerd Font file icons in the File Manager (Settings → File icons).
+    pub nerd_icons: bool,
     /// Snapshot of the repository state shown in the Git pane.
     pub git: GitView,
     /// The embedded process + emulated terminal for the Claude pane.
@@ -184,6 +186,7 @@ impl WorkspaceState {
         show_title: bool,
         border_style: BorderStyle,
         side_width: SideWidth,
+        nerd_icons: bool,
     ) -> Self {
         let cwd = session.project_path.clone();
         let git = git::load(&cwd);
@@ -216,6 +219,7 @@ impl WorkspaceState {
             show_title,
             border_style,
             side_width,
+            nerd_icons,
             git,
             pty,
             pty_error,
@@ -1149,7 +1153,7 @@ fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focuse
         for (i, item) in fm.entries.iter().skip(scroll).take(list_height).enumerate() {
             let is_selected = scroll + i == selected;
             let y = list_top + i as u16;
-            let icon = crate::panels::files::icon_for(item, crate::panels::files::nerd_icons_enabled());
+            let icon = crate::panels::files::icon_for(item, state.nerd_icons);
             let suffix = if item.is_dir && !item.is_parent { "/" } else { "" };
             let label = format!(" {icon} {}{suffix}", item.name);
             let style = if is_selected {

@@ -59,21 +59,6 @@ pub struct DirItem {
     pub is_parent: bool,
 }
 
-/// Whether Nerd Font icons are enabled, read once from `BRUCE_ICONS=nerd`.
-///
-/// Nerd Font glyphs look like VS Code's file icons but need a Nerd Font set in
-/// the terminal; emoji (the default) render in any modern terminal. Cached so
-/// the env var is read a single time.
-pub fn nerd_icons_enabled() -> bool {
-    use std::sync::OnceLock;
-    static NERD: OnceLock<bool> = OnceLock::new();
-    *NERD.get_or_init(|| {
-        std::env::var("BRUCE_ICONS")
-            .map(|v| v.eq_ignore_ascii_case("nerd"))
-            .unwrap_or(false)
-    })
-}
-
 /// The lowercase extension of a name (empty if none).
 fn ext_of(name: &str) -> String {
     Path::new(name)

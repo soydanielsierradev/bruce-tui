@@ -82,6 +82,7 @@ fn open_session_loading(
         welcome.show_title,
         welcome.border_style,
         welcome.side_width,
+        welcome.nerd_icons,
     );
     Screen::Loading(LoadingState::new(ws, message))
 }

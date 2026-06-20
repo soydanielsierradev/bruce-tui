@@ -49,6 +49,10 @@ pub struct Config {
     /// Width of each side pane. Defaults normal (25%).
     #[serde(default)]
     pub side_width: SideWidth,
+    /// Use Nerd Font file icons in the file manager (needs a Nerd Font set in
+    /// the terminal). Off = emoji icons, which render anywhere. Defaults off.
+    #[serde(default)]
+    pub nerd_icons: bool,
 }
 
 /// Serde default for the boolean preferences added after the first release, so
@@ -70,6 +74,7 @@ impl Default for Config {
             show_title: true,
             border_style: BorderStyle::default(),
             side_width: SideWidth::default(),
+            nerd_icons: false,
         }
     }
 }
