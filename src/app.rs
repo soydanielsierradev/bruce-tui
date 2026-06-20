@@ -538,6 +538,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                 } else if ctrl && key.code == KeyCode::Char('f') {
                     // Ctrl+F opens the file-search overlay from ANY pane.
                     ws.open_file_search();
+                } else if ctrl && key.code == KeyCode::Char('t') {
+                    // Ctrl+T toggles the terminal pane from ANY pane.
+                    ws.toggle_terminal();
                 } else {
 
                 // Ctrl+1/2/3/4 jump straight to a pane from anywhere — even

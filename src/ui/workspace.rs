@@ -1401,6 +1401,9 @@ fn render_workspace_dialog(frame: &mut Frame, area: Rect, pal: &Palette, state: 
     match &state.dialog {
         WorkspaceDialog::None => {}
         WorkspaceDialog::FileSearch { query, results, selected } => {
+            // Mute the workspace behind the overlay so the modal stands out,
+            // the same backdrop the welcome dialogs use.
+            crate::ui::welcome::dim_behind_dialog(frame, area, pal);
             render_file_search_dialog(frame, area, pal, query, results, *selected);
         }
     }

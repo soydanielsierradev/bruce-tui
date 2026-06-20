@@ -2871,7 +2871,7 @@ fn panel_block(pal: &Palette, title: &str, focused: bool) -> Block<'static> {
 /// modal dialogs. The modal is drawn crisp on top afterwards, so only the
 /// background recedes — the terminal equivalent of dimming/blurring behind a
 /// dialog. Faded styling is also stripped so nothing in the background stays bold.
-fn dim_behind_dialog(frame: &mut Frame, area: Rect, pal: &Palette) {
+pub(crate) fn dim_behind_dialog(frame: &mut Frame, area: Rect, pal: &Palette) {
     let buf = frame.buffer_mut();
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
