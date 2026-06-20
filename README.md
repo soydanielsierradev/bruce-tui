@@ -12,18 +12,26 @@
 </div>
 
 A terminal workspace for [Claude Code](https://docs.claude.com/claude-code): a
-three-pane TUI with **Git** status on the left, **Claude** running live in the
-center, and token **Metrics** on the right. It keeps a session per project — open
-Bruce in a directory and pick up exactly where you left off, with the full
-conversation restored.
+four-pane TUI with **Git** status on the left, **Claude** running live in the
+center, a **File Manager** on the right, and a **Terminal** across the bottom. It
+keeps a session per project — open Bruce in a directory and pick up exactly where
+you left off, with the full conversation restored.
 
 ```
-┌─ git · main ──┐┌─ Claude Code ─────────┐┌─ Metrics ─┐
-│ BRANCHES      ││                       ││ tokens    │
-│ COMMITS       ││   (claude runs here)  ││ context % │
-│ WORKING TREE  ││                       ││ cost      │
+┌─ git · main ──┐┌─ Claude Code ─────────┐┌─ Files ───┐
+│ BRANCHES      ││                       ││ 📁 src    │
+│ COMMITS       ││   (claude runs here)  ││ 📄 README │
+│ WORKING TREE  ││                       ││ 🦀 main.rs│
 └───────────────┘└───────────────────────┘└───────────┘
+┌─ Terminal ───────────────────────────────────────────┐
+│ $ run shell commands here                             │
+└───────────────────────────────────────────────────────┘
 ```
+
+The File Manager opens files in **VS Code** (`code`) by default — set
+`$BRUCE_EDITOR` to use another editor. File icons are emoji by default and switch
+to Nerd Font glyphs under **Settings → File icons** if your terminal uses a Nerd
+Font.
 
 ## Requirements
 
@@ -98,8 +106,8 @@ bruce          # opens the workspace (same as `bruce tui`)
 ```
 
 On the welcome screen you can open, create, rename, duplicate and delete
-sessions, tweak the look under **Settings** (theme, border style, layout, title
-and footer bars), and find the repo and this keybindings list under
+sessions, tweak the look under **Settings** (theme, file icons, border style,
+layout, title and footer bars), and find the repo and this keybindings list under
 **Documentation** — your choices are remembered between runs.
 
 ### Keys
@@ -125,31 +133,49 @@ and footer bars), and find the repo and this keybindings list under
 | `Y` / `N` | Confirm / cancel a delete |
 | `Esc` | Close the picker |
 
-**Workspace — a side pane (Git / Metrics) focused**
+**Workspace — any pane**
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus Git / Claude / Metrics |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` | Focus Git / Claude / Files / Terminal |
+| `Ctrl+F` | Fuzzy file search → open in your editor |
+| `Ctrl+T` | Toggle the Terminal pane |
 | `Tab` / `Shift+Tab` | Cycle panes |
-| `Ctrl+g` / `Ctrl+m` | Toggle the Git / Metrics pane |
-| `Shift+PageUp` / `Shift+PageDown` | Scroll Claude’s history |
 | `Esc` | Back to the welcome screen |
-| `q` / `Q` | Quit Bruce |
+| `q` / `Q` | Quit (when a non-typing pane is focused) |
 
-**Workspace — Claude focused**
+**Workspace — File Manager pane**
 
 | Key | Action |
 |-----|--------|
-| type | Send keystrokes to Claude |
-| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Focus Git / Claude / Metrics |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Open a file in your editor · enter a folder |
+| `←` / `Backspace` | Go up a directory |
+| `.` | Toggle hidden files |
+
+**Workspace — Claude / Terminal pane**
+
+| Key | Action |
+|-----|--------|
+| type | Send keystrokes to the focused process |
 | `Shift+PageUp` / `Shift+PageDown` | Scroll Claude’s history |
 | `Ctrl+b` then `b` | Back to the welcome screen |
 | `Ctrl+b` then `Tab` | Switch pane |
-| `Ctrl+b` then `g` / `m` | Toggle the Git / Metrics pane |
+| `Ctrl+b` then `g` / `t` | Toggle the Git / Terminal pane |
 | `Ctrl+b` then `q` | Quit Bruce |
 
-Anything else typed while the Claude pane is focused goes straight to Claude. The
-same list is available in-app under **Documentation → Keybindings**.
+**File search overlay** (`Ctrl+F`)
+
+| Key | Action |
+|-----|--------|
+| type | Filter files |
+| `↑` / `↓` | Move the selection |
+| `Enter` | Open the selected file |
+| `Esc` | Close the overlay |
+
+Anything else typed while the Claude or Terminal pane is focused goes straight to
+that process. The same list is available in-app under **Documentation →
+Keybindings**.
 
 ## Build from source
 

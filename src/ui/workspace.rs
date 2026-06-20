@@ -737,7 +737,7 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
     for (col, panel) in cols.iter().zip(order) {
         let focused = state.focus == panel;
         match panel {
-            Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git, state.border_style.border_type()),
+            Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git, state.border_style),
             Panel::Claude => render_claude_pane(frame, *col, &pal, focused, state),
             Panel::FileManager => render_file_manager_pane(frame, *col, &pal, focused, state),
             // Terminal is rendered in rows[2]; not part of the top_row split.
@@ -921,12 +921,12 @@ fn mark_color(mark: char, pal: &Palette) -> Color {
 
 /// Render the Git pane: branches, recent commits and the working tree as titled
 /// sections, plus a pinned stats footer (ahead/behind/staged/unstaged).
-fn render_git_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, view: &GitView, border_type: BorderType) {
+fn render_git_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, view: &GitView, border_style: BorderStyle) {
     let title = match view {
         GitView::Repo(info) => format!(" git · {} ", info.branch),
         _ => " git ".to_string(),
     };
-    let block = pane_block(pal, title.as_str(), focused, true, border_type);
+    let block = pane_block(pal, title.as_str(), focused, border_style.bordered(), border_style.border_type());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1102,7 +1102,7 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
 ///   `scroll_offset` are always consistent.
 fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
     let border_type = state.border_style.border_type();
-    let block = pane_block(pal, " Files ", focused, true, border_type);
+    let block = pane_block(pal, " Files ", focused, state.border_style.bordered(), border_type);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1201,7 +1201,7 @@ fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focuse
 /// Before the PTY has been spawned (before first focus) we show a short hint.
 /// Once spawned we display its screen with the same pipeline as the Claude pane.
 fn render_terminal_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
-    let block = pane_block(pal, " Terminal ", focused, true, state.border_style.border_type());
+    let block = pane_block(pal, " Terminal ", focused, state.border_style.bordered(), state.border_style.border_type());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1312,20 +1312,22 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
             txt("  typing → Claude    "),
             key("Ctrl+1/2/3/4"),
             txt(" panes    "),
+            key("Ctrl+F"),
+            txt(" find    "),
             key("Shift+PgUp/PgDn"),
             txt(" scroll    "),
             key("Ctrl+b"),
-            txt(" leader (Tab/b/g/q)"),
+            txt(" leader"),
         ])
     } else {
         // Side pane focused: direct navigation.
         Line::from(vec![
             key("  Ctrl+1/2/3/4"),
-            txt(" / "),
-            key("Tab"),
             txt(" panes   "),
-            key("^g"),
-            txt(" git   "),
+            key("Ctrl+F"),
+            txt(" find   "),
+            key("Ctrl+T"),
+            txt(" term   "),
             key("Esc"),
             txt(" back   "),
             key("Q"),

@@ -20,13 +20,16 @@ pub enum Theme {
     Tokyo,
 }
 
-/// Line style for the framed side panes (Git, Metrics). A Settings option.
+/// Line style for the framed side panes (Git, File Manager, Terminal). A
+/// Settings option; `None` drops the border lines entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BorderStyle {
     #[default]
     Rounded,
     Square,
     Double,
+    /// No border lines — the panes show just their title, like the Claude pane.
+    None,
 }
 
 impl BorderStyle {
@@ -35,7 +38,8 @@ impl BorderStyle {
         match self {
             BorderStyle::Rounded => BorderStyle::Square,
             BorderStyle::Square => BorderStyle::Double,
-            BorderStyle::Double => BorderStyle::Rounded,
+            BorderStyle::Double => BorderStyle::None,
+            BorderStyle::None => BorderStyle::Rounded,
         }
     }
 
@@ -45,15 +49,22 @@ impl BorderStyle {
             BorderStyle::Rounded => "rounded",
             BorderStyle::Square => "square",
             BorderStyle::Double => "double",
+            BorderStyle::None => "none",
         }
     }
 
-    /// The ratatui border type to draw.
+    /// Whether the panes draw border lines (false for [`BorderStyle::None`]).
+    pub fn bordered(self) -> bool {
+        self != BorderStyle::None
+    }
+
+    /// The ratatui border type to draw. Unused when [`bordered`] is false.
     pub fn border_type(self) -> BorderType {
         match self {
             BorderStyle::Rounded => BorderType::Rounded,
             BorderStyle::Square => BorderType::Plain,
             BorderStyle::Double => BorderType::Double,
+            BorderStyle::None => BorderType::Plain,
         }
     }
 }
