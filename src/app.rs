@@ -519,6 +519,27 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                 // the other. The plain keys still reach Claude.
                 let scroll_mod = ctrl || key.modifiers.contains(KeyModifiers::SHIFT);
 
+                // ── Dialog intercept (highest priority) ──────────────────────
+                // When the Ctrl+F file-search overlay is open, route ALL keys to
+                // the dialog — nothing reaches Claude, the shell, or the panel
+                // nav branches below. This must come BEFORE the pane-switch
+                // and forward_typing branches so Ctrl+F is never forwarded.
+                if ws.dialog_open() {
+                    match key.code {
+                        KeyCode::Esc => ws.close_dialog(),
+                        KeyCode::Enter => ws.fs_open_selected(),
+                        KeyCode::Up => ws.fs_prev(),
+                        KeyCode::Down => ws.fs_next(),
+                        KeyCode::Backspace => ws.fs_pop_char(),
+                        KeyCode::Char(c) if !ctrl => ws.fs_push_char(c),
+                        _ => {} // swallow unhandled keys while dialog is open
+                    }
+                    // Skip ALL other branches: dialog consumes the event.
+                } else if ctrl && key.code == KeyCode::Char('f') {
+                    // Ctrl+F opens the file-search overlay from ANY pane.
+                    ws.open_file_search();
+                } else {
+
                 // Ctrl+1/2/3/4 jump straight to a pane from anywhere — even
                 // while Claude has focus — so switching never needs the leader chord.
                 let pane = ctrl
@@ -602,6 +623,8 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
                         _ => {}
                     }
                 }
+
+                } // end of `else` block wrapping all non-dialog workspace key handling
             }
         }
 

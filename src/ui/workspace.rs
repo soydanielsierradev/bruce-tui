@@ -8,19 +8,45 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Padding, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
 };
 
 use crate::config::Config;
-use crate::panels::files::FileManager;
+use crate::panels::files::{FileManager, subsequence_match};
 use crate::panels::git::{self, GitView};
 use crate::panels::metrics;
 use crate::pty::{self, PtySession, SpawnOptions, TERMINAL_SCROLLBACK};
 use crate::session::Session;
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
+
+/// Modal dialog overlaid on top of the workspace. Only one dialog can be open
+/// at a time. `None` means no dialog is active.
+pub enum WorkspaceDialog {
+    /// No dialog open — the default state.
+    None,
+    /// Ctrl+F fuzzy file-search overlay.
+    FileSearch {
+        /// The characters the user has typed so far.
+        query: String,
+        /// Snapshot of all project files filtered by `query` (subsequence match).
+        /// Capped to [`FILE_SEARCH_MAX_RESULTS`] items for rendering performance.
+        results: Vec<std::path::PathBuf>,
+        /// Index into `results` of the highlighted row.
+        selected: usize,
+    },
+}
+
+impl Default for WorkspaceDialog {
+    fn default() -> Self {
+        WorkspaceDialog::None
+    }
+}
+
+/// Maximum number of results shown in the Ctrl+F file-search overlay.
+const FILE_SEARCH_MAX_RESULTS: usize = 200;
 
 /// Which pane currently has keyboard focus. `Tab` cycles through them.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,6 +117,9 @@ pub struct WorkspaceState {
     /// Exit code of the shell if it has exited, `None` while running.
     /// Set by `tick()`; the renderer shows a "Press Enter to restart" hint.
     pub terminal_exit_code: Option<i32>,
+    // ── Ctrl+F file-search overlay (Slice 4) ─────────────────────────────────
+    /// The active modal dialog, if any. `WorkspaceDialog::None` when idle.
+    pub dialog: WorkspaceDialog,
     // ─────────────────────────────────────────────────────────────────────────
 }
 
@@ -206,6 +235,7 @@ impl WorkspaceState {
             terminal_enabled: true,
             last_term_size: Cell::new((TERMINAL_ROWS, 80)),
             terminal_exit_code: None,
+            dialog: WorkspaceDialog::None,
         }
     }
 
@@ -515,6 +545,151 @@ impl WorkspaceState {
         }
     }
 
+    /// Open the Ctrl+F file-search overlay. Snapshots the current file list and
+    /// computes the initial (empty-query) result set immediately.
+    pub fn open_file_search(&mut self) {
+        let all_files = self
+            .file_manager
+            .files
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        // Empty query → all files (capped).
+        let results: Vec<_> = all_files
+            .into_iter()
+            .take(FILE_SEARCH_MAX_RESULTS)
+            .collect();
+        self.dialog = WorkspaceDialog::FileSearch {
+            query: String::new(),
+            results,
+            selected: 0,
+        };
+    }
+
+    /// Returns `true` if a modal dialog is currently open.
+    pub fn dialog_open(&self) -> bool {
+        !matches!(self.dialog, WorkspaceDialog::None)
+    }
+
+    /// Close whatever dialog is open.
+    pub fn close_dialog(&mut self) {
+        self.dialog = WorkspaceDialog::None;
+    }
+
+    /// Type a character into the FileSearch query, then re-filter.
+    pub fn fs_push_char(&mut self, c: char) {
+        if let WorkspaceDialog::FileSearch { query, results, selected } = &mut self.dialog {
+            query.push(c);
+            Self::fs_refilter_inner(query, results, selected, &self.file_manager.files);
+        }
+    }
+
+    /// Delete the last character from the FileSearch query, then re-filter.
+    pub fn fs_pop_char(&mut self) {
+        if let WorkspaceDialog::FileSearch { query, results, selected } = &mut self.dialog {
+            query.pop();
+            Self::fs_refilter_inner(query, results, selected, &self.file_manager.files);
+        }
+    }
+
+    /// Re-compute the results list from the current query.
+    fn fs_refilter_inner(
+        query: &str,
+        results: &mut Vec<std::path::PathBuf>,
+        selected: &mut usize,
+        files: &std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+    ) {
+        let guard = match files.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        *results = guard
+            .iter()
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                subsequence_match(query, &s)
+            })
+            .take(FILE_SEARCH_MAX_RESULTS)
+            .cloned()
+            .collect();
+        // Clamp selection to the new result count.
+        let max = results.len().saturating_sub(1);
+        *selected = (*selected).min(max);
+    }
+
+    /// Move selection up inside the FileSearch overlay.
+    pub fn fs_prev(&mut self) {
+        if let WorkspaceDialog::FileSearch { selected, .. } = &mut self.dialog {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
+    /// Move selection down inside the FileSearch overlay, clamped to last result.
+    pub fn fs_next(&mut self) {
+        if let WorkspaceDialog::FileSearch { results, selected, .. } = &mut self.dialog {
+            let max = results.len().saturating_sub(1);
+            if *selected < max {
+                *selected += 1;
+            }
+        }
+    }
+
+    /// Open the currently selected file from the FileSearch overlay using the
+    /// same editor dispatch as `fm_open_selected`. Closes the dialog on success.
+    pub fn fs_open_selected(&mut self) {
+        // Extract the absolute path from the dialog without borrowing self.
+        let abs_path = if let WorkspaceDialog::FileSearch { results, selected, .. } = &self.dialog
+        {
+            results
+                .get(*selected)
+                .map(|rel| self.session.project_path.join(rel))
+        } else {
+            return;
+        };
+
+        let Some(abs_path) = abs_path else {
+            return;
+        };
+
+        // Reuse the same open logic as fm_open_selected.
+        self.file_manager_status = None;
+        let Some((editor, is_vscode)) = editor_command() else {
+            self.file_manager_status =
+                Some("No editor found. Set $BRUCE_EDITOR or install 'code'.".to_string());
+            self.dialog = WorkspaceDialog::None;
+            return;
+        };
+
+        let mut args: Vec<String> = Vec::new();
+        if is_vscode {
+            args.push(self.session.project_path.to_string_lossy().into_owned());
+            args.push("--goto".to_string());
+            args.push(format!("{}:1", abs_path.display()));
+        } else {
+            args.push(abs_path.to_string_lossy().into_owned());
+        }
+
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/C").arg(&editor).args(&args);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = std::process::Command::new(&editor);
+            c.args(&args);
+            c
+        };
+
+        if let Err(e) = cmd.spawn() {
+            self.file_manager_status = Some(format!("Failed to open editor: {e}"));
+        }
+
+        // Always close the dialog after attempting to open.
+        self.dialog = WorkspaceDialog::None;
+    }
+
     /// Toggle the Git pane. If it was focused while being hidden, focus Claude.
     pub fn toggle_git(&mut self) {
         self.git_enabled = !self.git_enabled;
@@ -603,6 +778,11 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
 
     if state.show_footer {
         render_footer(frame, rows[3], &pal, state);
+    }
+
+    // Modal overlays are always rendered last so they appear on top.
+    if !matches!(state.dialog, WorkspaceDialog::None) {
+        render_workspace_dialog(frame, area, &pal, state);
     }
 }
 
@@ -1184,6 +1364,183 @@ fn render_footer(frame: &mut Frame, area: Rect, pal: &Palette, state: &Workspace
         Paragraph::new(hints).style(Style::default().bg(pal.bg)),
         area,
     );
+}
+
+/// Compute a rectangle centred inside `area`, sized as percentages of its
+/// width and height. Mirrors the same helper in `welcome.rs` so the workspace
+/// can render its own dialogs without importing welcome's private API.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::vertical([Constraint::Percentage(percent_y)])
+        .flex(Flex::Center)
+        .split(area);
+    Layout::horizontal([Constraint::Percentage(percent_x)])
+        .flex(Flex::Center)
+        .split(vertical[0])[0]
+}
+
+/// Build a dialog overlay block using the project's standard style: rounded
+/// border in accent colour, accent title, background fill.
+fn dialog_block<'a>(pal: &Palette, title: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pal.accent))
+        .title(Span::styled(
+            title,
+            Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(pal.bg))
+}
+
+/// Render the active modal dialog overlay on top of the workspace.
+///
+/// Currently only `WorkspaceDialog::FileSearch` is defined. The overlay is
+/// sized to 70 × 70 % of the screen and centred. The `Clear` widget erases
+/// the background so the dialog appears floating rather than transparent.
+fn render_workspace_dialog(frame: &mut Frame, area: Rect, pal: &Palette, state: &WorkspaceState) {
+    match &state.dialog {
+        WorkspaceDialog::None => {}
+        WorkspaceDialog::FileSearch { query, results, selected } => {
+            render_file_search_dialog(frame, area, pal, query, results, *selected);
+        }
+    }
+}
+
+/// Render the Ctrl+F file-search overlay.
+///
+/// Layout (inside the dialog border):
+/// ```
+/// ┌─ File Search ───────────────────────────────┐
+/// │  > {query}_                                  │   ← input line
+/// │ ─────────────────────────────────────────── │   ← separator
+/// │  src/app.rs                                  │   ← results list
+/// │  src/main.rs  ← highlighted                 │
+/// │  …                                           │
+/// │ ─────────────────────────────────────────── │   ← separator
+/// │  type to filter  ↑↓ select  Enter open  Esc │   ← footer hint
+/// └──────────────────────────────────────────────┘
+/// ```
+fn render_file_search_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    pal: &Palette,
+    query: &str,
+    results: &[std::path::PathBuf],
+    selected: usize,
+) {
+    let overlay = centered_rect(70, 70, area);
+    frame.render_widget(Clear, overlay);
+    let block = dialog_block(pal, " File Search ");
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    if inner.height < 4 {
+        return;
+    }
+
+    // Reserve: 1 input line + 1 separator + N results + 1 separator + 1 footer.
+    // Rows available for the results list:
+    let reserved = 4usize; // input + sep + sep + footer
+    let list_height = (inner.height as usize).saturating_sub(reserved);
+
+    // ── Input line ────────────────────────────────────────────────────────────
+    let input_text = format!(" > {}█", query);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            input_text,
+            Style::default().fg(pal.fg),
+        )))
+        .style(Style::default().bg(pal.bg)),
+        Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+    );
+
+    // ── Top separator ─────────────────────────────────────────────────────────
+    let sep_y = inner.y + 1;
+    if sep_y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(pal.dim),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: sep_y, width: inner.width, height: 1 },
+        );
+    }
+
+    // ── Results list ──────────────────────────────────────────────────────────
+    // Compute a scroll window so the selected entry is always visible.
+    let scroll = if list_height == 0 {
+        0
+    } else if selected < list_height {
+        0
+    } else {
+        selected + 1 - list_height
+    };
+
+    let list_start_y = inner.y + 2;
+    for (i, path) in results.iter().skip(scroll).take(list_height).enumerate() {
+        let abs_idx = scroll + i;
+        let is_selected = abs_idx == selected;
+        let display = path.display().to_string();
+        let y = list_start_y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let style = if is_selected {
+            Style::default()
+                .fg(pal.bg)
+                .bg(pal.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(pal.fg)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {display}"),
+                style,
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
+        );
+    }
+
+    // Show a dim hint when results are empty.
+    if results.is_empty() && list_height > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " No files match",
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: list_start_y, width: inner.width, height: 1 },
+        );
+    }
+
+    // ── Bottom separator ──────────────────────────────────────────────────────
+    let bot_sep_y = inner.y + 2 + list_height as u16;
+    if bot_sep_y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(pal.dim),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: bot_sep_y, width: inner.width, height: 1 },
+        );
+    }
+
+    // ── Footer hint ───────────────────────────────────────────────────────────
+    let footer_y = inner.y + inner.height.saturating_sub(1);
+    if footer_y >= inner.y && footer_y < inner.y + inner.height {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " type to filter  ↑↓ select  Enter open  Esc close",
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: footer_y, width: inner.width, height: 1 },
+        );
+    }
 }
 
 /// Encode a key event as the bytes a terminal would send to the child.

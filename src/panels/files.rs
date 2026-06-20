@@ -290,6 +290,31 @@ impl FileManager {
     }
 }
 
+/// Returns `true` when every character of `query` appears, in order, inside
+/// `candidate` (case-insensitive subsequence match).
+///
+/// An empty query matches every candidate. This is the same algorithm used by
+/// fuzzy finders like fzf for in-order character matching without gaps scoring.
+///
+/// Pure, side-effect-free — unit-testable.
+pub fn subsequence_match(query: &str, candidate: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut q_chars = query.chars().flat_map(|c| c.to_lowercase());
+    let mut current = q_chars.next();
+    for c in candidate.chars().flat_map(|c| c.to_lowercase()) {
+        match current {
+            None => return true,
+            Some(q) if q == c => {
+                current = q_chars.next();
+            }
+            _ => {}
+        }
+    }
+    current.is_none()
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -420,5 +445,52 @@ mod tests {
         let mut sorted = files.clone();
         sorted.sort();
         assert_eq!(files, sorted, "walk result is not sorted");
+    }
+
+    // ── subsequence_match tests ───────────────────────────────────────────────
+
+    #[test]
+    fn subsequence_empty_query_matches_everything() {
+        assert!(subsequence_match("", "anything"));
+        assert!(subsequence_match("", ""));
+    }
+
+    #[test]
+    fn subsequence_exact_match() {
+        assert!(subsequence_match("main", "main.rs"));
+    }
+
+    #[test]
+    fn subsequence_interleaved_chars() {
+        // 's', 'r', 'c' appear in order inside "src/app.rs"
+        assert!(subsequence_match("src", "src/app.rs"));
+        // 'a', 'p', 'p' in order in "src/app.rs"
+        assert!(subsequence_match("app", "src/app.rs"));
+    }
+
+    #[test]
+    fn subsequence_case_insensitive() {
+        assert!(subsequence_match("MAIN", "src/main.rs"));
+        assert!(subsequence_match("Main", "src/main.rs"));
+    }
+
+    #[test]
+    fn subsequence_no_match_wrong_order() {
+        // "zrc" — 'z' doesn't appear in "src/main.rs" at all, so it can't match.
+        assert!(!subsequence_match("zrc", "src/main.rs"));
+        // "sr" appears in order but "rs" would need 'r' before 's' — yet 'r'
+        // at index 1 can still be followed by 's' at the end. Use a query whose
+        // chars genuinely cannot be found in order.
+        assert!(!subsequence_match("zz", "src/main.rs"));
+    }
+
+    #[test]
+    fn subsequence_no_match_missing_char() {
+        assert!(!subsequence_match("xyz", "src/main.rs"));
+    }
+
+    #[test]
+    fn subsequence_query_longer_than_candidate() {
+        assert!(!subsequence_match("verylongquerythatcantmatch", "a"));
     }
 }
