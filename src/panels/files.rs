@@ -59,19 +59,46 @@ pub struct DirItem {
     pub is_parent: bool,
 }
 
-/// A width-2 icon for a directory entry: a folder for directories, otherwise a
-/// glyph chosen from the file extension. All icons are width-2 emoji so the
-/// names line up in a column.
-pub fn icon_for(item: &DirItem) -> &'static str {
-    if item.is_dir {
-        return "📁";
-    }
-    let ext = Path::new(&item.name)
+/// Whether Nerd Font icons are enabled, read once from `BRUCE_ICONS=nerd`.
+///
+/// Nerd Font glyphs look like VS Code's file icons but need a Nerd Font set in
+/// the terminal; emoji (the default) render in any modern terminal. Cached so
+/// the env var is read a single time.
+pub fn nerd_icons_enabled() -> bool {
+    use std::sync::OnceLock;
+    static NERD: OnceLock<bool> = OnceLock::new();
+    *NERD.get_or_init(|| {
+        std::env::var("BRUCE_ICONS")
+            .map(|v| v.eq_ignore_ascii_case("nerd"))
+            .unwrap_or(false)
+    })
+}
+
+/// The lowercase extension of a name (empty if none).
+fn ext_of(name: &str) -> String {
+    Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
-        .to_lowercase();
-    match ext.as_str() {
+        .to_lowercase()
+}
+
+/// An icon for a directory entry. With `nerd`, returns Nerd Font glyphs (VS
+/// Code-like, needs a Nerd Font); otherwise width-2 emoji that render anywhere.
+/// Within either set every glyph is the same width so the names stay aligned.
+pub fn icon_for(item: &DirItem, nerd: bool) -> &'static str {
+    if nerd {
+        nerd_icon(item)
+    } else {
+        emoji_icon(item)
+    }
+}
+
+fn emoji_icon(item: &DirItem) -> &'static str {
+    if item.is_dir {
+        return "📁";
+    }
+    match ext_of(&item.name).as_str() {
         "rs" => "🦀",
         "js" | "jsx" | "mjs" | "cjs" => "📜",
         "ts" | "tsx" => "📘",
@@ -86,6 +113,29 @@ pub fn icon_for(item: &DirItem) -> &'static str {
         "lock" => "🔒",
         "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => "📷",
         _ => "📄",
+    }
+}
+
+/// Nerd Font (Private Use Area) glyphs — the devicon/seti set, like VS Code.
+fn nerd_icon(item: &DirItem) -> &'static str {
+    if item.is_dir {
+        return "\u{f07b}"; // folder
+    }
+    match ext_of(&item.name).as_str() {
+        "rs" => "\u{e7a8}",
+        "js" | "jsx" | "mjs" | "cjs" => "\u{e74e}",
+        "ts" | "tsx" => "\u{e628}",
+        "json" => "\u{e60b}",
+        "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" => "\u{e615}",
+        "md" | "markdown" => "\u{e73e}",
+        "py" => "\u{e73c}",
+        "go" => "\u{e627}",
+        "html" | "htm" => "\u{e736}",
+        "css" | "scss" | "sass" => "\u{e749}",
+        "sh" | "bash" | "zsh" | "ps1" | "bat" => "\u{f489}",
+        "lock" => "\u{f023}",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" => "\u{f1c5}",
+        _ => "\u{f15b}",
     }
 }
 
@@ -336,10 +386,15 @@ impl FileManager {
         if let Ok(read) = std::fs::read_dir(&dir) {
             for entry in read.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if is_skipped(&name) || (!self.show_hidden && is_dotfile(&name)) {
+                if is_skipped(&name) {
                     continue;
                 }
                 let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                // Hidden FOLDERS are always shown; hidden FILES respect the
+                // `.` toggle.
+                if is_dotfile(&name) && !is_dir && !self.show_hidden {
+                    continue;
+                }
                 let item = DirItem { name, is_dir, is_parent: false };
                 if is_dir {
                     dirs.push(item);

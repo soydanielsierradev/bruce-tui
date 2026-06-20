@@ -1149,7 +1149,7 @@ fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focuse
         for (i, item) in fm.entries.iter().skip(scroll).take(list_height).enumerate() {
             let is_selected = scroll + i == selected;
             let y = list_top + i as u16;
-            let icon = crate::panels::files::icon_for(item);
+            let icon = crate::panels::files::icon_for(item, crate::panels::files::nerd_icons_enabled());
             let suffix = if item.is_dir && !item.is_parent { "/" } else { "" };
             let label = format!(" {icon} {}{suffix}", item.name);
             let style = if is_selected {
