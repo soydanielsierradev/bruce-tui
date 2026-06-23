@@ -98,9 +98,16 @@ pub fn run() -> Result<()> {
     // arrives as one Enter keypress per line, and the Claude pane submits a
     // message on each — splitting the paste into many sends.
     set_bracketed_paste(true);
+    // Ask the terminal to disambiguate key combos that legacy terminals can't
+    // tell apart — most importantly Ctrl+1/2/3, which otherwise arrive as bare
+    // digits so the pane-switch shortcuts silently do nothing.
+    let keyboard_enhanced = set_keyboard_enhancement(true);
     let outcome = run_loop(&mut terminal);
     // Hand the terminal back with its own colours restored before leaving the
     // alternate screen, so the user's normal prompt isn't left recoloured.
+    if keyboard_enhanced {
+        set_keyboard_enhancement(false);
+    }
     set_bracketed_paste(false);
     set_mouse_capture(false);
     reset_terminal_colors();
@@ -126,6 +133,38 @@ fn set_mouse_capture(on: bool) {
     } else {
         crossterm::execute!(out, DisableMouseCapture)
     };
+}
+
+/// Push or pop the Kitty keyboard protocol's `DISAMBIGUATE_ESCAPE_CODES` flag.
+///
+/// Legacy terminals collapse several distinct combos onto the same byte —
+/// `Ctrl+1`/`Ctrl+2`/`Ctrl+3` arrive as plain `1`/`2`/`3` (only `Ctrl+4` survives,
+/// as the FS control code), so Bruce's pane-switch shortcuts appear dead. The
+/// protocol makes the terminal report each combo distinctly.
+///
+/// Only the single disambiguation flag is requested — not key-release or repeat
+/// reporting — so the event stream stays the same shape (still press-only). When
+/// enabling, returns whether the flag was actually pushed; the caller pops it on
+/// exit only when so. Guarded by [`supports_keyboard_enhancement`] so terminals
+/// without support (e.g. the legacy Windows console) are left untouched.
+fn set_keyboard_enhancement(on: bool) -> bool {
+    use crossterm::event::{
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
+    let mut out = std::io::stdout();
+    if on {
+        if !matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)) {
+            return false;
+        }
+        crossterm::execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    } else {
+        let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
+        false
+    }
 }
 
 /// Enable or disable bracketed paste mode. When on, the terminal delivers a
