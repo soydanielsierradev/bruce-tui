@@ -222,6 +222,113 @@ pub fn relocate_into_claude(src: &Path, folder: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 
+// ─── Per-project activation ───────────────────────────────────────────────────
+//
+// Bruce uses a "library + per-project copies" model for skills:
+//
+// - The library lives at `~/.claude/skills/<folder>/` and is kept globally
+//   DISABLED (i.e. `SKILL.md.disabled`) so the user's whole-machine Claude
+//   sessions don't auto-load it. The install flow takes care of that.
+//
+// - Activating a skill in project X copies the library folder into
+//   `<X>/.claude/skills/<folder>/` and enables `SKILL.md` in the project copy.
+//   Claude discovers project-scoped skills under `<project>/.claude/skills/`
+//   when it runs in that project.
+//
+// - Deactivating just removes the project-local copy. The library is untouched
+//   so the skill remains installed for use in other projects.
+
+/// Resolve the per-project skills directory: `<project>/.claude/skills/`. Bruce
+/// stores activated copies there, mirroring the layout Claude expects for
+/// project-scoped skills.
+pub fn project_skills_dir(project_path: &Path) -> PathBuf {
+    project_path.join(".claude").join("skills")
+}
+
+/// True when `folder_name` is currently activated in `project_path` — i.e. the
+/// project copy exists with an enabled `SKILL.md`. Filesystem-driven, never
+/// cached.
+pub fn is_active_in_project(project_path: &Path, folder_name: &str) -> bool {
+    project_skills_dir(project_path)
+        .join(folder_name)
+        .join("SKILL.md")
+        .exists()
+}
+
+/// Copy `~/.claude/skills/<folder_name>/` into `<project>/.claude/skills/` and
+/// enable the project copy. The library is left untouched.
+///
+/// If a project copy already exists it is wiped first so the project version
+/// stays in sync with the library. Returns an error if the library copy is
+/// missing — the caller surfaces that as a status-line message.
+pub fn activate_in_project(project_path: &Path, folder_name: &str) -> Result<()> {
+    let src = claude_skills_dir()?.join(folder_name);
+    if !src.exists() {
+        return Err(anyhow!(
+            "skill {folder_name} is not installed in ~/.claude/skills"
+        ));
+    }
+    let project_root = project_skills_dir(project_path);
+    let dest = project_root.join(folder_name);
+
+    // Refresh the project copy from the library every time so an activate
+    // after a library update reflects the latest content.
+    match fs::remove_dir_all(&dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("removing stale project copy {}", dest.display()))
+        }
+    }
+    fs::create_dir_all(&project_root)
+        .with_context(|| format!("creating {}", project_root.display()))?;
+    copy_dir_recursive(&src, &dest)
+        .with_context(|| format!("copying {folder_name} into {}", dest.display()))?;
+
+    // The library is kept disabled (`SKILL.md.disabled`); flip the project
+    // copy to enabled. If the library version was already enabled, the
+    // project copy already has `SKILL.md` and there's nothing to rename.
+    let project_md = dest.join("SKILL.md");
+    let project_disabled = dest.join("SKILL.md.disabled");
+    if !project_md.exists() && project_disabled.exists() {
+        fs::rename(&project_disabled, &project_md)
+            .with_context(|| format!("enabling project copy of {folder_name}"))?;
+    }
+    Ok(())
+}
+
+/// Remove the project-local copy of `folder_name`. No-op when the skill wasn't
+/// activated in this project.
+pub fn deactivate_in_project(project_path: &Path, folder_name: &str) -> Result<()> {
+    let dest = project_skills_dir(project_path).join(folder_name);
+    match fs::remove_dir_all(&dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e)
+            .with_context(|| format!("deactivating {folder_name} in {}", dest.display())),
+    }
+}
+
+/// Recursively copy the contents of `src` into `dst`, creating `dst` as needed.
+/// Symlinks are skipped on purpose — Bruce never wants to chase a link out of
+/// the source skill folder into unrelated parts of the user's filesystem.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 // ─── Frontmatter parser ───────────────────────────────────────────────────────
 
 /// Extract `(name, description)` from the YAML frontmatter of a SKILL.md file.
@@ -321,18 +428,7 @@ pub fn skill_state(skill_dir: &Path) -> SkillState {
     }
 }
 
-// ─── Enable / disable / delete ───────────────────────────────────────────────
-
-/// Enable a skill by renaming `SKILL.md.disabled` → `SKILL.md`.
-///
-/// Returns `Err` if the `.disabled` file is absent (skill is already enabled
-/// or in a broken state) — callers should surface this as a status-line error.
-pub fn enable_skill(skill_dir: &Path) -> Result<()> {
-    let from = skill_dir.join("SKILL.md.disabled");
-    let to = skill_dir.join("SKILL.md");
-    fs::rename(&from, &to)
-        .with_context(|| format!("enabling skill at {}", skill_dir.display()))
-}
+// ─── Disable / delete ────────────────────────────────────────────────────────
 
 /// Disable a skill by renaming `SKILL.md` → `SKILL.md.disabled`.
 ///
@@ -685,25 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn test_enable_skill_path_construction() {
-        let tmp = tempdir_guard::TempDir::new();
-        let skill_dir = tmp.path().join("my-skill");
-        fs::create_dir(&skill_dir).expect("mkdir");
-        // Start in Disabled state.
-        fs::write(skill_dir.join("SKILL.md.disabled"), b"").expect("write disabled");
-        assert_eq!(skill_state(&skill_dir), SkillState::Disabled);
-
-        enable_skill(&skill_dir).expect("enable");
-
-        assert!(skill_dir.join("SKILL.md").exists(), "SKILL.md should exist");
-        assert!(
-            !skill_dir.join("SKILL.md.disabled").exists(),
-            "SKILL.md.disabled should be gone"
-        );
-        assert_eq!(skill_state(&skill_dir), SkillState::Enabled);
-    }
-
-    #[test]
     fn test_disable_skill_path_construction() {
         let tmp = tempdir_guard::TempDir::new();
         let skill_dir = tmp.path().join("my-skill");
@@ -781,6 +858,70 @@ mod tests {
             Err(e) => Err(e),
         };
         assert!(result.is_ok(), "NotFound on remove_dir_all must be Ok");
+    }
+
+    // ── Per-project activation ───────────────────────────────────────────────
+
+    #[test]
+    fn test_is_active_in_project_false_when_missing() {
+        let tmp = tempdir_guard::TempDir::new();
+        assert!(!is_active_in_project(tmp.path(), "any-skill"));
+    }
+
+    #[test]
+    fn test_is_active_in_project_true_when_skill_md_exists() {
+        let tmp = tempdir_guard::TempDir::new();
+        let dest = tmp.path().join(".claude").join("skills").join("my-skill");
+        fs::create_dir_all(&dest).expect("mkdir");
+        fs::write(dest.join("SKILL.md"), b"---\nname: my-skill\n---\n").expect("write");
+        assert!(is_active_in_project(tmp.path(), "my-skill"));
+    }
+
+    #[test]
+    fn test_is_active_in_project_false_when_only_disabled_file() {
+        let tmp = tempdir_guard::TempDir::new();
+        let dest = tmp.path().join(".claude").join("skills").join("my-skill");
+        fs::create_dir_all(&dest).expect("mkdir");
+        fs::write(dest.join("SKILL.md.disabled"), b"").expect("write");
+        assert!(!is_active_in_project(tmp.path(), "my-skill"));
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_replicates_tree() {
+        let tmp = tempdir_guard::TempDir::new();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(src.join("nested")).expect("mkdir nested");
+        fs::write(src.join("a.txt"), b"hello").expect("a.txt");
+        fs::write(src.join("nested").join("b.txt"), b"world").expect("b.txt");
+
+        copy_dir_recursive(&src, &dst).expect("copy");
+
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).expect("a"), "hello");
+        assert_eq!(
+            fs::read_to_string(dst.join("nested").join("b.txt")).expect("b"),
+            "world"
+        );
+    }
+
+    #[test]
+    fn test_deactivate_in_project_noop_when_missing() {
+        let tmp = tempdir_guard::TempDir::new();
+        // Skill was never activated in this project — must succeed silently.
+        deactivate_in_project(tmp.path(), "ghost-skill").expect("deactivate");
+    }
+
+    #[test]
+    fn test_deactivate_in_project_removes_existing() {
+        let tmp = tempdir_guard::TempDir::new();
+        let dest = tmp.path().join(".claude").join("skills").join("my-skill");
+        fs::create_dir_all(&dest).expect("mkdir");
+        fs::write(dest.join("SKILL.md"), b"").expect("write");
+        assert!(is_active_in_project(tmp.path(), "my-skill"));
+
+        deactivate_in_project(tmp.path(), "my-skill").expect("deactivate");
+        assert!(!dest.exists(), "project copy should be gone");
+        assert!(!is_active_in_project(tmp.path(), "my-skill"));
     }
 
     // ── P1-T5: SkillLedger::reconcile ────────────────────────────────────────

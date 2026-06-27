@@ -24,8 +24,9 @@ use crate::pty::PtySession;
 use crate::session::{self, Session};
 use crate::skills::{
     SkillEntry, SkillLedger, SkillState,
-    delete_skill, dir_skill_names, disable_skill, enable_skill, parse_frontmatter,
-    relocate_into_claude, skill_state, skill_touched_since, snapshot_roots,
+    activate_in_project, deactivate_in_project, delete_skill, dir_skill_names, disable_skill,
+    is_active_in_project, parse_frontmatter, relocate_into_claude, skill_state,
+    skill_touched_since, snapshot_roots,
 };
 use crate::ui::theme::{BorderStyle, Palette, SideWidth, Theme};
 use crate::ui::workspace::encode_key;
@@ -763,6 +764,11 @@ impl WelcomeState {
     }
 
     /// Open the manage dialog, loading and reconciling the ledger immediately.
+    ///
+    /// The state shown per skill is whether it's currently activated **in this
+    /// project** (`<project>/.claude/skills/<folder>/SKILL.md` exists) — not
+    /// the global library state. Toggling activates/deactivates the project
+    /// copy.
     pub fn open_manage_dialog(&mut self) {
         let mut ledger = match SkillLedger::load() {
             Ok(l) => l,
@@ -774,12 +780,16 @@ impl WelcomeState {
         };
         // Reconcile drops any entry whose folder is gone (ADR-5: once per open).
         let _ = ledger.reconcile();
-        let skills_root = claude_skills_dir().unwrap_or_default();
+        let project = self.project_path.clone();
         let entries: Vec<(SkillEntry, SkillState)> = ledger
             .entries()
             .iter()
             .map(|e| {
-                let state = skill_state(&skills_root.join(&e.folder_name));
+                let state = if is_active_in_project(&project, &e.folder_name) {
+                    SkillState::Enabled
+                } else {
+                    SkillState::Disabled
+                };
                 (e.clone(), state)
             })
             .collect();
@@ -1431,56 +1441,52 @@ impl WelcomeState {
     }
 
     fn manage_enable(&mut self, idx: usize) {
-        let skill_dir = if let Some(Dialog::SkillManage(d)) = &self.dialog {
-            d.entries.get(idx).map(|(e, _)| {
-                claude_skills_dir().unwrap_or_default().join(&e.folder_name)
-            })
+        let folder = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            d.entries.get(idx).map(|(e, _)| e.folder_name.clone())
         } else {
             None
         };
-        if let Some(dir) = skill_dir {
-            match enable_skill(&dir) {
-                Ok(()) => {
-                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
-                        if let Some((_, state)) = d.entries.get_mut(idx) {
-                            *state = skill_state(&dir);
-                        }
-                        d.restart_needed = true;
-                        d.status_line.clear();
+        let Some(folder) = folder else { return };
+        let project = self.project_path.clone();
+        match activate_in_project(&project, &folder) {
+            Ok(()) => {
+                if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                    if let Some((_, state)) = d.entries.get_mut(idx) {
+                        *state = SkillState::Enabled;
                     }
+                    d.restart_needed = true;
+                    d.status_line.clear();
                 }
-                Err(e) => {
-                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
-                        d.status_line = format!("Error: {e}");
-                    }
+            }
+            Err(e) => {
+                if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                    d.status_line = format!("Error: {e}");
                 }
             }
         }
     }
 
     fn manage_disable(&mut self, idx: usize) {
-        let skill_dir = if let Some(Dialog::SkillManage(d)) = &self.dialog {
-            d.entries.get(idx).map(|(e, _)| {
-                claude_skills_dir().unwrap_or_default().join(&e.folder_name)
-            })
+        let folder = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+            d.entries.get(idx).map(|(e, _)| e.folder_name.clone())
         } else {
             None
         };
-        if let Some(dir) = skill_dir {
-            match disable_skill(&dir) {
-                Ok(()) => {
-                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
-                        if let Some((_, state)) = d.entries.get_mut(idx) {
-                            *state = skill_state(&dir);
-                        }
-                        d.restart_needed = true;
-                        d.status_line.clear();
+        let Some(folder) = folder else { return };
+        let project = self.project_path.clone();
+        match deactivate_in_project(&project, &folder) {
+            Ok(()) => {
+                if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                    if let Some((_, state)) = d.entries.get_mut(idx) {
+                        *state = SkillState::Disabled;
                     }
+                    d.restart_needed = true;
+                    d.status_line.clear();
                 }
-                Err(e) => {
-                    if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
-                        d.status_line = format!("Error: {e}");
-                    }
+            }
+            Err(e) => {
+                if let Some(Dialog::SkillManage(d)) = &mut self.dialog {
+                    d.status_line = format!("Error: {e}");
                 }
             }
         }
@@ -1527,20 +1533,23 @@ impl WelcomeState {
     // ─── Skill preview key handler ─────────────────────────────────────────────
 
     fn open_skill_preview(&mut self, idx: usize) {
-        let (entry, state_val) = if let Some(Dialog::SkillManage(d)) = &self.dialog {
+        let entry = if let Some(Dialog::SkillManage(d)) = &self.dialog {
             match d.entries.get(idx) {
-                Some(pair) => pair.clone(),
+                Some((entry, _)) => entry.clone(),
                 None => return,
             }
         } else {
             return;
         };
 
+        // Preview reads the library copy (the single source of truth for the
+        // skill's content). The Manage list's per-project state has no bearing
+        // on which file to open — we just pick whichever of SKILL.md or
+        // SKILL.md.disabled actually exists in `~/.claude/skills/<folder>`.
         let skill_dir = claude_skills_dir().unwrap_or_default().join(&entry.folder_name);
-        let path = if state_val == SkillState::Disabled {
-            skill_dir.join("SKILL.md.disabled")
-        } else {
-            skill_dir.join("SKILL.md")
+        let path = match skill_state(&skill_dir) {
+            SkillState::Disabled => skill_dir.join("SKILL.md.disabled"),
+            _ => skill_dir.join("SKILL.md"),
         };
 
         let lines: Vec<String> = match std::fs::read_to_string(&path) {
@@ -1606,24 +1615,30 @@ impl WelcomeState {
         WelcomeEvent::None
     }
 
-    /// Enable or disable the skill being previewed, and keep the stashed Manage
-    /// list's marker in sync so it's correct when the user pops back.
+    /// Activate or deactivate the skill being previewed in the current project,
+    /// and keep the stashed Manage list's marker in sync so it's correct when
+    /// the user pops back.
     fn preview_set_enabled(&mut self, enable: bool) {
         let folder = if let Some(Dialog::SkillPreview { folder_name, .. }) = &self.dialog {
             folder_name.clone()
         } else {
             return;
         };
-        let dir = claude_skills_dir().unwrap_or_default().join(&folder);
-        let result = if enable { enable_skill(&dir) } else { disable_skill(&dir) };
+        let project = self.project_path.clone();
+        let result = if enable {
+            activate_in_project(&project, &folder)
+        } else {
+            deactivate_in_project(&project, &folder)
+        };
         if result.is_err() {
             return;
         }
-        // Reflect the new on-disk state in the stashed Manage list + flag restart.
+        // Reflect the new per-project state in the stashed Manage list + flag restart.
+        let new_state = if enable { SkillState::Enabled } else { SkillState::Disabled };
         if let Some(manage) = self.pending_manage.as_mut() {
             for (entry, state) in manage.entries.iter_mut() {
                 if entry.folder_name == folder {
-                    *state = skill_state(&dir);
+                    *state = new_state;
                 }
             }
             manage.restart_needed = true;
