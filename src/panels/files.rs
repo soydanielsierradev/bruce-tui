@@ -36,8 +36,14 @@ const SKIP_DIRS: &[&str] = &[
     ".cache",
 ];
 
-/// How long between automatic background refreshes of the file list.
+/// How long between automatic background refreshes of the full project file
+/// list (used by Ctrl+F).
 pub const FILE_MANAGER_REFRESH: Duration = Duration::from_secs(30);
+
+/// How long between automatic re-reads of the visible directory. Short enough
+/// to feel live when the user (or another tool) creates/deletes/renames a file
+/// in the current directory; cheap because it's a single `read_dir`.
+pub const DIR_RELOAD_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// True if `name` is a directory entry the skip-list walk should ignore.
 ///
@@ -251,6 +257,8 @@ pub struct FileManager {
     walk_handle: Option<JoinHandle<()>>,
     /// When the last background walk started (used to throttle refreshes).
     last_refresh: Instant,
+    /// When the visible directory was last re-read from disk.
+    last_dir_reload: Instant,
     /// Root path of the project being browsed.
     project_path: PathBuf,
     /// Directory currently being browsed, relative to `project_path` (empty at
@@ -268,13 +276,15 @@ impl FileManager {
     /// writes its result — typically within a few hundred milliseconds.
     pub fn new(project_path: PathBuf) -> Self {
         let files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
         let mut fm = Self {
             files,
             selected: 0,
             scroll_offset: 0,
             show_hidden: false,
             walk_handle: None,
-            last_refresh: Instant::now(),
+            last_refresh: now,
+            last_dir_reload: now,
             project_path,
             current_dir: PathBuf::new(),
             entries: Vec::new(),
@@ -307,9 +317,16 @@ impl FileManager {
         self.last_refresh = Instant::now();
     }
 
-    /// Called from `WorkspaceState::tick()`. Re-triggers the background walk
-    /// when [`FILE_MANAGER_REFRESH`] has elapsed since the last one.
+    /// Called from `WorkspaceState::tick()`. Drives two cadences:
+    /// - [`DIR_RELOAD_INTERVAL`]: re-read the visible directory so newly
+    ///   created/deleted/renamed files appear without manual navigation.
+    /// - [`FILE_MANAGER_REFRESH`]: re-trigger the full project walk that
+    ///   feeds Ctrl+F search.
     pub fn tick(&mut self) {
+        if self.last_dir_reload.elapsed() >= DIR_RELOAD_INTERVAL {
+            self.refresh_dir();
+            self.last_dir_reload = Instant::now();
+        }
         if self.last_refresh.elapsed() >= FILE_MANAGER_REFRESH {
             self.start_walk();
         }
@@ -370,11 +387,11 @@ impl FileManager {
         self.entries.len()
     }
 
-    /// Rebuild [`entries`] from `current_dir` on disk: a ".." row first (unless
+    /// Build the entry list for `current_dir` on disk: a ".." row first (unless
     /// at the root), then directories, then files — each group sorted
     /// case-insensitively. Build artifacts (`is_skipped`) and, unless
-    /// `show_hidden`, dotfiles are omitted. Resets the selection to the top.
-    pub fn reload_dir(&mut self) {
+    /// `show_hidden`, dotfiles are omitted.
+    fn build_entries(&self) -> Vec<DirItem> {
         let dir = self.project_path.join(&self.current_dir);
         let mut dirs: Vec<DirItem> = Vec::new();
         let mut files: Vec<DirItem> = Vec::new();
@@ -407,10 +424,41 @@ impl FileManager {
         }
         entries.append(&mut dirs);
         entries.append(&mut files);
+        entries
+    }
 
-        self.entries = entries;
+    /// Rebuild [`entries`] from `current_dir` and reset selection to the top.
+    /// Used on navigation (entering a directory, going up, toggling hidden) —
+    /// situations where jumping to the first row is the right UX.
+    pub fn reload_dir(&mut self) {
+        self.entries = self.build_entries();
         self.selected = 0;
         self.scroll_offset = 0;
+    }
+
+    /// Rebuild [`entries`] from `current_dir` while preserving the highlighted
+    /// row by name. Used by the periodic [`tick`] refresh so files appearing or
+    /// disappearing in the current directory show up without yanking the cursor
+    /// back to the top.
+    pub fn refresh_dir(&mut self) {
+        let prev_name = self.entries.get(self.selected).map(|e| e.name.clone());
+        self.entries = self.build_entries();
+
+        let len = self.entries.len();
+        if len == 0 {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        // Try to keep the highlighted row on the same name; if the file is
+        // gone, clamp the previous index into the new range so the cursor
+        // doesn't fly off the end.
+        match prev_name.and_then(|n| self.entries.iter().position(|e| e.name == n)) {
+            Some(idx) => self.selected = idx,
+            None => self.selected = self.selected.min(len - 1),
+        }
+        // `scroll_offset` gets re-clamped on the next render by
+        // `clamp_scroll(visible_height)`, so don't touch it here.
     }
 
     /// Act on the selected entry: go up via "..", descend into a directory, or
