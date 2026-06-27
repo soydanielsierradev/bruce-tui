@@ -1,21 +1,24 @@
 # Bruce — TUI workspace para Claude Code
 
 ## Qué es este proyecto
-Aplicación TUI en Rust con 3 paneles: Git (izquierdo), Claude Code 
-embebido en PTY (centro), Métricas de tokens (derecho). 
-Pantalla de bienvenida con 3 bloques (Options, Settings, Documentation):
+Aplicación TUI en Rust con 4 paneles: Git (izquierdo), Claude Code
+embebido en PTY (centro), File Manager (derecho) y Terminal (full-width
+abajo, segundo PTY). El conteo de tokens vive embebido en la welcome (se
+lee del transcript JSONL de Claude, sin watcher). Pantalla de bienvenida
+con 4 bloques en grilla 2×2 (Options, Settings, Documentation, Skills):
 abrir/crear/renombrar/duplicar/eliminar sesiones vía picker con búsqueda,
-preferencias de look en Settings (tema, bordes, layout) y repo + atajos en
-Documentation. Transición de loading al abrir una sesión.
+preferencias de look en Settings (tema, bordes, layout, file icons),
+repo + atajos en Documentation y manage/install de skills en Skills.
+Transición de loading al abrir una sesión.
 
 ## Stack
 - ratatui + crossterm — TUI
+- vt100 — emulador de terminal (parsea ANSI del PTY a una grilla propia)
 - clap — CLI (`bruce tui`)
-- git2 — panel Git
-- portable-pty — embeber proceso claude
-- notify — file watcher para métricas
-- serde_json — sesiones en ~/.config/bruce/sessions/
-- tokio — async runtime
+- git2 — panel Git (sin features default, evita openssl-sys en Windows)
+- portable-pty — embeber proceso `claude` y la terminal inferior
+- serde / serde_json — sesiones en `~/.config/bruce/sessions/` + config
+- uuid (v4) — id de sesión que se le pasa a `claude --session-id`
 - anyhow — manejo de errores
 
 ## Reglas de código
@@ -29,10 +32,15 @@ Documentation. Transición de loading al abrir una sesión.
 ## Estructura
 src/main.rs — entry point + clap
 src/app.rs — estado global y event loop
-src/ui/ — layout, welcome screen, temas
+src/ui/ — layout (workspace.rs), welcome screen, temas
 src/session/ — struct Session, persistencia JSON
-src/panels/ — git.rs, metrics.rs
-src/pty/ — spawn y comunicación PTY
+src/panels/ — git.rs, files.rs (file manager), metrics.rs
+              (metrics ya no es panel — quedó como helper para leer
+              tokens del transcript JSONL de Claude)
+src/pty/ — spawn y comunicación PTY (Claude + terminal inferior)
+src/skills/ — install/manage de skills (ledger en skills.json)
+src/update/ — chequeo de versión y auto-update por método de instalación
+src/config/ — preferencias persistentes en `config.json`
 
 ## Sesiones
 JSON en ~/.config/bruce/sessions/<id>.json
@@ -90,6 +98,44 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
       dentro del modal. Fix: paste multilínea en el panel Claude entra como un
       solo mensaje (bracketed paste en Unix; coalescing de teclas en Windows,
       donde crossterm no emite `Event::Paste`). Labels de métricas en inglés.
+- [x] Paso 17 (v0.15.0): rediseño de workspace. **Métricas como panel
+      eliminadas** (también la dep `notify` y el watcher); el módulo
+      `metrics.rs` sobrevive como helper que lee el transcript JSONL y
+      alimenta el contador de tokens en la welcome. Nuevo panel **File
+      Manager** a la derecha que navega por carpeta, abre archivos en el
+      editor (vía shell en Windows para soportar `code`, etc.), e iconos
+      de archivo configurables (emoji por default, Nerd Font opt-in en
+      Settings). Nuevo panel **Terminal** full-width abajo, backed por un
+      segundo PTY, toggle con `Ctrl+T` y dim del fondo cuando hay overlay.
+      Overlay `Ctrl+F`: **fuzzy file-search** sobre todo el proyecto
+      (subsequence match, cap 200 resultados). Panel enum pasa a 4
+      variantes: `Git`, `Claude`, `FileManager`, `Terminal`.
+- [x] Paso 18 (v0.15.1): pulido. Border style **"none"** (borderless)
+      sumado a los existentes y refresh de la doc de keybindings. Fix:
+      los Ctrl+digit de cambio de panel se reportan vía el **keyboard
+      protocol** (no llegaban con terminales que negocian kitty/CSI-u).
+      Fix: el file walker ahora **incluye archivos dentro de carpetas
+      hidden** (antes los saltaba enteros y se perdían cosas legítimas
+      como `.github/workflows/*`).
+- [x] Paso 19 (v0.16.0): UX en tiempo real + skills per-project.
+      **File manager live refresh**: `FileManager::tick()` ahora re-lee el
+      directorio visible cada 1.5s (cadencia separada del walk completo
+      del proyecto, que sigue corriendo cada 30s para alimentar `Ctrl+F`).
+      `reload_dir` mantiene el reset-al-top para navegación; `refresh_dir`
+      es nuevo y preserva la selección por nombre — los archivos
+      creados/borrados/renombrados aparecen sin tener que salir y reabrir.
+      **Skills activation per-project**: la library en
+      `~/.claude/skills/<folder>/` queda **siempre disabled**
+      (`SKILL.md.disabled`); el toggle `E` en Manage copia la library a
+      `<project>/.claude/skills/<folder>/` y habilita `SKILL.md` ahí
+      (donde Claude descubre skills project-scoped). Deactivate borra
+      solo la copia del proyecto. Estado en Manage = "¿existe
+      `<project>/.claude/skills/<folder>/SKILL.md`?". `enable_skill`
+      eliminado (la library nunca se re-habilita). Funciones nuevas en
+      `src/skills/mod.rs`: `activate_in_project`, `deactivate_in_project`,
+      `is_active_in_project`, `project_skills_dir` (+ helper privado
+      `copy_dir_recursive`). Copia en vez de symlink — portable en Windows
+      y el equipo puede commitear `.claude/skills/` si quiere compartirlo.
 
 ## Commits
 - Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
@@ -106,7 +152,7 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
   hace minor).
 - Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
   del cambio (la versión se muestra en la welcome screen).
-  Versión actual: 0.14.0.
+  Versión actual: 0.16.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
