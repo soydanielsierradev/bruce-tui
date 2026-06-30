@@ -136,6 +136,24 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
       `is_active_in_project`, `project_skills_dir` (+ helper privado
       `copy_dir_recursive`). Copia en vez de symlink — portable en Windows
       y el equipo puede commitear `.claude/skills/` si quiere compartirlo.
+- [x] Paso 20 (v0.16.1): higiene + robustness pasada post-release.
+      `.gitattributes` con `* text=auto eol=lf` para cortar el drama
+      CRLF↔LF al editar desde Windows + Linux. `fetch_latest()` ahora
+      cappea `curl` con `--connect-timeout 5 --max-time 10` para que el
+      worker del update check no se cuelgue si GitHub no responde.
+      `FileManager::start_walk()` gatea con `JoinHandle::is_finished()`
+      para no spawnear walks paralelos sobre el mismo `Arc<Mutex<…>>`.
+      `respond_to_queries()` ahora persiste un tail buffer entre
+      lecturas del PTY, así las secuencias ESC de device-attributes que
+      cruzan el borde entre dos chunks (chunk N termina en `\x1b[`,
+      chunk N+1 arranca con `c`) ya no se pierden silenciosamente —
+      pura `detect_queries(chunk, prev_tail, cursor)` testeada con 10
+      casos. `Session::claude_args(resume)` extraído de
+      `WorkspaceState::new` para fijar por test que `--session-id` y
+      `--resume` no se invierten. `#![deny(unsafe_code)]` crate-wide.
+      Tests nuevos para `encode_key()` cubriendo Ctrl letters, DECCKM
+      cursor mode y tilde nav keys. README documenta `BRUCE_CMD` y
+      `BRUCE_EDITOR`. Total: 44 → 66 tests.
 
 ## Commits
 - Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
@@ -152,7 +170,7 @@ Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
   hace minor).
 - Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
   del cambio (la versión se muestra en la welcome screen).
-  Versión actual: 0.16.0.
+  Versión actual: 0.16.1.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
