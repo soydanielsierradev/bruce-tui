@@ -177,6 +177,13 @@ Anything else typed while the Claude or Terminal pane is focused goes straight t
 that process. The same list is available in-app under **Documentation →
 Keybindings**.
 
+## Environment variables
+
+| Var | What it does |
+|-----|--------------|
+| `BRUCE_CMD` | Program Bruce spawns in the Claude pane. Defaults to `claude`. Useful when the CLI lives under a different name on your PATH (`claude-code`, a wrapper script, a full path to a shim, or even `pwsh` for a plain shell to dogfood the pane). Bruce skips the “claude is missing” startup warning whenever this is set, on the assumption you picked something else on purpose. |
+| `BRUCE_EDITOR` | Editor the File Manager hands off to on `Enter`. Falls back to `code` / `code-insiders` if not set. |
+
 ## Build from source
 
 ```sh
