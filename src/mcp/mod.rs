@@ -105,23 +105,65 @@ pub fn list_via_claude(project_path: &Path) -> Vec<String> {
     parse_claude_list(&stdout)
 }
 
-/// Parse the line-oriented output of `claude mcp list`: each non-empty line
-/// looks like `<name>: <command and args>`. Lines without a colon or with a
-/// blank name are skipped.
+/// Parse the line-oriented output of `claude mcp list`.
+///
+/// As of Claude Code 0.16-ish the real format is:
+///
+/// ```text
+/// <name>: <command-and-args> - <status icon and text>
+/// ```
+///
+/// where `<name>` can contain colons (notably the `plugin:<plugin>:<server>`
+/// namespacing the plugin system uses for MCPs it provides), so we split on
+/// `": "` (colon followed by space) — the actual delimiter Claude writes
+/// between name and command — instead of the bare colon.
+///
+/// We also filter by status: only servers reporting `✔ Connected` make it
+/// into the list, so disconnected / unauthenticated entries don't surface as
+/// "active" in the subpanel.
 ///
 /// Pure, testable without invoking `claude`.
 pub fn parse_claude_list(raw: &str) -> Vec<String> {
     let mut names: Vec<String> = raw
         .lines()
-        .filter_map(|line| {
-            let (head, _) = line.split_once(':')?;
-            let name = head.trim();
-            if name.is_empty() { None } else { Some(name.to_string()) }
-        })
+        .filter_map(parse_claude_list_line)
         .collect();
     names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
     names.dedup();
     names
+}
+
+/// Parse a single line of `claude mcp list` output. Returns the display name
+/// when the line describes a connected server, or `None` otherwise (blank
+/// line, header, malformed, or not-yet-connected server).
+fn parse_claude_list_line(line: &str) -> Option<String> {
+    // Split the status suffix off the right end. The line shape is
+    // "name: command - status"; the final " - " is the delimiter. Use
+    // rsplit so a command containing " - " (uncommon but possible) doesn't
+    // confuse us.
+    let (head, status) = line.rsplit_once(" - ")?;
+    if !status.contains("Connected") {
+        return None;
+    }
+
+    // Now split "name: command" using ": " — Claude uses colon+space as the
+    // real delimiter, so colons inside the name (e.g. `plugin:engram:engram`)
+    // don't break the split.
+    let (raw_name, _command) = head.split_once(": ")?;
+    let raw_name = raw_name.trim();
+    if raw_name.is_empty() {
+        return None;
+    }
+
+    // Plugin-provided MCPs are namespaced as `plugin:<plugin>:<server>`.
+    // Show just the meaningful tail so the subpanel reads naturally — what
+    // the user wants to see is "engram", not "plugin".
+    let display = if let Some(rest) = raw_name.strip_prefix("plugin:") {
+        rest.rsplit(':').next().unwrap_or(rest)
+    } else {
+        raw_name
+    };
+    Some(display.to_string())
 }
 
 /// Merge two name lists and return a deduplicated, sorted vec.
@@ -183,12 +225,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_list_extracts_name_before_colon() {
-        let raw = "\
-github: gh-cli --remote
-filesystem: node fs-server.js
-postgres: pg-mcp
-";
+    fn parse_claude_list_extracts_connected_servers() {
+        let raw = "Checking MCP server health…\n\n\
+github: gh-cli --remote - ✔ Connected\n\
+filesystem: node fs-server.js - ✔ Connected\n\
+postgres: pg-mcp - ✔ Connected\n";
         assert_eq!(
             parse_claude_list(raw),
             vec!["filesystem", "github", "postgres"]
@@ -196,14 +237,50 @@ postgres: pg-mcp
     }
 
     #[test]
-    fn parse_claude_list_skips_blank_and_colonless_lines() {
-        let raw = "\n\nno-colon-line\n   : empty-name\nrealone: foo\n";
+    fn parse_claude_list_skips_unauthenticated_servers() {
+        // Real-world: Google Drive shows up here with "Needs authentication"
+        // when the user hasn't completed OAuth. They don't think of it as
+        // "active", so it must not appear in the subpanel.
+        let raw = "\
+claude.ai Google Drive: https://drivemcp.googleapis.com/mcp/v1 - ! Needs authentication\n\
+github: gh-cli - ✔ Connected\n";
+        assert_eq!(parse_claude_list(raw), vec!["github"]);
+    }
+
+    #[test]
+    fn parse_claude_list_unwraps_plugin_namespaced_names() {
+        // Plugin-provided MCPs come through as "plugin:<plugin>:<server>" —
+        // the colon-separated prefix would have made the old parser show
+        // "plugin" instead of the real server name.
+        let raw = "plugin:engram:engram: engram mcp --tools=agent - ✔ Connected\n";
+        assert_eq!(parse_claude_list(raw), vec!["engram"]);
+    }
+
+    #[test]
+    fn parse_claude_list_handles_realistic_mixed_output() {
+        // Exactly the shape `claude mcp list` produced for the v0.16.1 dogfood:
+        // a header line, a blank line, an unauthenticated entry, and a
+        // plugin-namespaced connected one. Only the connected one survives,
+        // with its display name unwrapped.
+        let raw = "Checking MCP server health…\n\n\
+claude.ai Google Drive: https://drivemcp.googleapis.com/mcp/v1 - ! Needs authentication\n\
+plugin:engram:engram: engram mcp --tools=agent - ✔ Connected\n";
+        assert_eq!(parse_claude_list(raw), vec!["engram"]);
+    }
+
+    #[test]
+    fn parse_claude_list_skips_blank_and_malformed_lines() {
+        let raw = "\n\
+no-status-line\n\
+no-colon-line - ✔ Connected\n\
+   : empty-name - ✔ Connected\n\
+realone: foo - ✔ Connected\n";
         assert_eq!(parse_claude_list(raw), vec!["realone"]);
     }
 
     #[test]
     fn parse_claude_list_dedupes_repeated_names() {
-        let raw = "foo: bar\nfoo: bar\n";
+        let raw = "foo: bar - ✔ Connected\nfoo: bar - ✔ Connected\n";
         assert_eq!(parse_claude_list(raw), vec!["foo"]);
     }
 
