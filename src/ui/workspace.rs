@@ -1572,3 +1572,104 @@ fn cursor_seq(app_cursor: bool, final_byte: u8) -> Vec<u8> {
     seq.push(final_byte);
     seq
 }
+
+// ── Unit tests for the key encoder ────────────────────────────────────────────
+
+#[cfg(test)]
+mod encode_key_tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn plain_ascii_char_is_passed_through() {
+        assert_eq!(encode_key(&key(KeyCode::Char('a')), false), Some(b"a".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Char('Z')), false), Some(b"Z".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_alpha_maps_to_control_byte() {
+        // Ctrl+A → 0x01, Ctrl+Z → 0x1a — independent of letter case.
+        assert_eq!(encode_key(&ctrl(KeyCode::Char('a')), false), Some(vec![0x01]));
+        assert_eq!(encode_key(&ctrl(KeyCode::Char('A')), false), Some(vec![0x01]));
+        assert_eq!(encode_key(&ctrl(KeyCode::Char('z')), false), Some(vec![0x1a]));
+    }
+
+    #[test]
+    fn ctrl_non_alpha_falls_back_to_utf8() {
+        // Ctrl+1 isn't a real control sequence; we let the digit through so
+        // apps that read modified key events still get the printable byte.
+        assert_eq!(encode_key(&ctrl(KeyCode::Char('1')), false), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn multibyte_utf8_char_is_encoded_in_utf8() {
+        // 'ñ' is two bytes in UTF-8.
+        assert_eq!(
+            encode_key(&key(KeyCode::Char('ñ')), false),
+            Some("ñ".as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn enter_tab_backtab_backspace_escape() {
+        assert_eq!(encode_key(&key(KeyCode::Enter), false), Some(vec![b'\r']));
+        assert_eq!(encode_key(&key(KeyCode::Tab), false), Some(vec![b'\t']));
+        assert_eq!(encode_key(&key(KeyCode::BackTab), false), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Backspace), false), Some(vec![0x7f]));
+        assert_eq!(encode_key(&key(KeyCode::Esc), false), Some(vec![0x1b]));
+    }
+
+    #[test]
+    fn cursor_keys_normal_mode() {
+        assert_eq!(encode_key(&key(KeyCode::Up), false), Some(b"\x1b[A".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Down), false), Some(b"\x1b[B".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Right), false), Some(b"\x1b[C".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Left), false), Some(b"\x1b[D".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Home), false), Some(b"\x1b[H".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::End), false), Some(b"\x1b[F".to_vec()));
+    }
+
+    #[test]
+    fn cursor_keys_application_mode_use_ss3_prefix() {
+        // DECCKM on: `ESC O <letter>` instead of `ESC [ <letter>`.
+        assert_eq!(encode_key(&key(KeyCode::Up), true), Some(b"\x1bOA".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Down), true), Some(b"\x1bOB".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Right), true), Some(b"\x1bOC".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Left), true), Some(b"\x1bOD".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::Home), true), Some(b"\x1bOH".to_vec()));
+        assert_eq!(encode_key(&key(KeyCode::End), true), Some(b"\x1bOF".to_vec()));
+    }
+
+    #[test]
+    fn tilde_nav_keys_unaffected_by_app_cursor() {
+        // PageUp/PageDown/Delete are CSI ~ sequences in both modes.
+        for app_cursor in [false, true] {
+            assert_eq!(
+                encode_key(&key(KeyCode::PageUp), app_cursor),
+                Some(b"\x1b[5~".to_vec())
+            );
+            assert_eq!(
+                encode_key(&key(KeyCode::PageDown), app_cursor),
+                Some(b"\x1b[6~".to_vec())
+            );
+            assert_eq!(
+                encode_key(&key(KeyCode::Delete), app_cursor),
+                Some(b"\x1b[3~".to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_key_returns_none() {
+        // F-keys and similar aren't translated — caller can choose to ignore.
+        assert_eq!(encode_key(&key(KeyCode::F(1)), false), None);
+        assert_eq!(encode_key(&key(KeyCode::Null), false), None);
+    }
+}
