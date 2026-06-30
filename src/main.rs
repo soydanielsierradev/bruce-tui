@@ -3,6 +3,11 @@
 //! `main` only parses the CLI and dispatches to a subcommand. All TUI logic
 //! lives in [`app`].
 
+// Bruce shouldn't need to reach into raw pointers anywhere. Pin that as a
+// crate-wide build-time check so a future refactor can't sneak unsafe in
+// without an explicit per-block override.
+#![deny(unsafe_code)]
+
 mod app;
 mod config;
 mod panels;
