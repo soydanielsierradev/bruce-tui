@@ -298,6 +298,30 @@ pub fn activate_in_project(project_path: &Path, folder_name: &str) -> Result<()>
     Ok(())
 }
 
+/// Names of every skill currently activated in `project_path`. Reads
+/// `<project>/.claude/skills/` and keeps only entries whose `SKILL.md` is
+/// present (matching the same filesystem-driven definition used by
+/// [`is_active_in_project`]).
+///
+/// Sorted case-insensitively for stable display. Returns an empty vec when
+/// the project has no active skills (or the directory doesn't exist).
+pub fn active_skills_in_project(project_path: &Path) -> Vec<String> {
+    let dir = project_skills_dir(project_path);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                && e.path().join("SKILL.md").exists()
+        })
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_owned()))
+        .collect();
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    names
+}
+
 /// Remove the project-local copy of `folder_name`. No-op when the skill wasn't
 /// activated in this project.
 pub fn deactivate_in_project(project_path: &Path, folder_name: &str) -> Result<()> {
@@ -902,6 +926,40 @@ mod tests {
             fs::read_to_string(dst.join("nested").join("b.txt")).expect("b"),
             "world"
         );
+    }
+
+    #[test]
+    fn test_active_skills_in_project_empty_when_dir_missing() {
+        let tmp = tempdir_guard::TempDir::new();
+        assert!(active_skills_in_project(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn test_active_skills_in_project_lists_only_enabled_folders() {
+        let tmp = tempdir_guard::TempDir::new();
+        let root = tmp.path().join(".claude").join("skills");
+
+        // Active skill — has SKILL.md.
+        let alpha = root.join("alpha");
+        fs::create_dir_all(&alpha).expect("alpha");
+        fs::write(alpha.join("SKILL.md"), b"---\nname: alpha\n---\n").expect("alpha md");
+
+        // Disabled — has SKILL.md.disabled but not SKILL.md.
+        let beta = root.join("beta");
+        fs::create_dir_all(&beta).expect("beta");
+        fs::write(beta.join("SKILL.md.disabled"), b"").expect("beta disabled");
+
+        // Active again — has SKILL.md.
+        let gamma = root.join("Gamma");
+        fs::create_dir_all(&gamma).expect("gamma");
+        fs::write(gamma.join("SKILL.md"), b"").expect("gamma md");
+
+        // Stray file at the root of skills/ — must be ignored.
+        fs::write(root.join("stray.txt"), b"").expect("stray");
+
+        let active = active_skills_in_project(tmp.path());
+        // Case-insensitive sort: alpha, Gamma — beta excluded.
+        assert_eq!(active, vec!["alpha".to_string(), "Gamma".to_string()]);
     }
 
     #[test]

@@ -1,0 +1,218 @@
+//! MCP server discovery for the workspace's "MCPs in this project" subpanel.
+//!
+//! Two sources combined:
+//!
+//! - `<project>/.mcp.json` — Claude Code's project-scoped MCP config (cheap
+//!   to read, runs on every tick).
+//! - `claude mcp list` — Claude Code's authoritative listing including user-
+//!   scoped servers that the project still inherits (slower, run once at
+//!   workspace open and cached).
+//!
+//! Results are deduplicated by name so a server present in both sources
+//! appears only once. Anything that fails (no `.mcp.json`, no `claude` on
+//! PATH, garbled JSON) is treated as "empty" — the subpanel will just say
+//! "no MCPs configured".
+
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+/// Shape Claude Code writes to `.mcp.json`: a single `mcpServers` object whose
+/// keys are server names. Everything inside the value is irrelevant for the
+/// subpanel (which only shows names).
+#[derive(Debug, Deserialize)]
+struct McpJson {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Parse `.mcp.json`-style JSON and return the server names sorted
+/// case-insensitively. Anything malformed (missing key, wrong shape, parse
+/// error) yields an empty vec — the file existing without a valid shape is
+/// effectively "no MCPs", not a hard error.
+///
+/// Pure, side-effect-free — unit-testable without a real file.
+pub fn parse_mcp_json(raw: &str) -> Vec<String> {
+    let parsed: Result<McpJson, _> = serde_json::from_str(raw);
+    let Ok(parsed) = parsed else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = parsed.mcp_servers.into_iter().map(|(k, _)| k).collect();
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    names
+}
+
+/// Read `<project>/.mcp.json` and return the server names. Missing file or
+/// unreadable bytes yield an empty vec; this is the normal case for projects
+/// that don't ship project-scoped MCP servers.
+pub fn read_project_mcp_json(project_path: &Path) -> Vec<String> {
+    let path = project_path.join(".mcp.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    parse_mcp_json(&raw)
+}
+
+/// How long we wait for `claude mcp list` to return before giving up. The CLI
+/// usually answers in well under a second; the cap stops a slow boot from
+/// holding the workspace open.
+const CLAUDE_MCP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Ask the `claude` CLI for every MCP server it sees from `project_path`
+/// (project-scoped + user-scoped). Empty vec if `claude` isn't on PATH, if it
+/// errors, or if its output doesn't match the expected shape.
+///
+/// The CLI's stable output is one server per line, of the form
+/// `<name>: <command>`. We trim each line at the first colon and take the
+/// left side. Newer or future `claude` versions may add columns; this stays
+/// forwards-compatible by ignoring everything past the first colon.
+pub fn list_via_claude(project_path: &Path) -> Vec<String> {
+    // Spawn with a small timeout via std + child kill. Bare `Command::output()`
+    // would block forever if the CLI hangs.
+    let mut child = match Command::new("claude")
+        .args(["mcp", "list"])
+        .current_dir(project_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let start = std::time::Instant::now();
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) => {
+                if start.elapsed() >= CLAUDE_MCP_TIMEOUT {
+                    let _ = child.kill();
+                    return Vec::new();
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    let Some(output) = output else { return Vec::new() };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_claude_list(&stdout)
+}
+
+/// Parse the line-oriented output of `claude mcp list`: each non-empty line
+/// looks like `<name>: <command and args>`. Lines without a colon or with a
+/// blank name are skipped.
+///
+/// Pure, testable without invoking `claude`.
+pub fn parse_claude_list(raw: &str) -> Vec<String> {
+    let mut names: Vec<String> = raw
+        .lines()
+        .filter_map(|line| {
+            let (head, _) = line.split_once(':')?;
+            let name = head.trim();
+            if name.is_empty() { None } else { Some(name.to_string()) }
+        })
+        .collect();
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    names.dedup();
+    names
+}
+
+/// Merge two name lists and return a deduplicated, sorted vec.
+///
+/// Pure, testable.
+pub fn merge_mcps(project_scoped: Vec<String>, claude_listed: Vec<String>) -> Vec<String> {
+    let mut all: Vec<String> = project_scoped;
+    all.extend(claude_listed);
+    all.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    all.dedup();
+    all
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mcp_json_returns_server_names_sorted() {
+        let raw = r#"{
+            "mcpServers": {
+                "zed": {"command": "z"},
+                "alpha": {"command": "a"},
+                "Mid": {"command": "m"}
+            }
+        }"#;
+        assert_eq!(parse_mcp_json(raw), vec!["alpha", "Mid", "zed"]);
+    }
+
+    #[test]
+    fn parse_mcp_json_handles_empty_servers_map() {
+        let raw = r#"{"mcpServers": {}}"#;
+        assert!(parse_mcp_json(raw).is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_json_returns_empty_for_garbage() {
+        assert!(parse_mcp_json("not json").is_empty());
+        assert!(parse_mcp_json("").is_empty());
+        // Wrong shape: no mcpServers key.
+        assert!(parse_mcp_json(r#"{"foo": []}"#).is_empty());
+    }
+
+    #[test]
+    fn read_project_mcp_json_returns_empty_when_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bruce-mcp-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // No `.mcp.json` written.
+        assert!(read_project_mcp_json(&tmp).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn parse_claude_list_extracts_name_before_colon() {
+        let raw = "\
+github: gh-cli --remote
+filesystem: node fs-server.js
+postgres: pg-mcp
+";
+        assert_eq!(
+            parse_claude_list(raw),
+            vec!["filesystem", "github", "postgres"]
+        );
+    }
+
+    #[test]
+    fn parse_claude_list_skips_blank_and_colonless_lines() {
+        let raw = "\n\nno-colon-line\n   : empty-name\nrealone: foo\n";
+        assert_eq!(parse_claude_list(raw), vec!["realone"]);
+    }
+
+    #[test]
+    fn parse_claude_list_dedupes_repeated_names() {
+        let raw = "foo: bar\nfoo: bar\n";
+        assert_eq!(parse_claude_list(raw), vec!["foo"]);
+    }
+
+    #[test]
+    fn merge_mcps_dedupes_and_sorts_case_insensitively() {
+        let merged = merge_mcps(
+            vec!["github".to_string(), "Filesystem".to_string()],
+            vec!["github".to_string(), "postgres".to_string()],
+        );
+        assert_eq!(merged, vec!["Filesystem", "github", "postgres"]);
+    }
+}

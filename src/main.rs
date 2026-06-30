@@ -10,6 +10,7 @@
 
 mod app;
 mod config;
+mod mcp;
 mod panels;
 mod pty;
 mod session;

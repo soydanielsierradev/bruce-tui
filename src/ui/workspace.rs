@@ -122,6 +122,22 @@ pub struct WorkspaceState {
     // ── Ctrl+F file-search overlay (Slice 4) ─────────────────────────────────
     /// The active modal dialog, if any. `WorkspaceDialog::None` when idle.
     pub dialog: WorkspaceDialog,
+    // ── Project extras subpanels (under the File Manager) ────────────────────
+    /// Names of every MCP server active in this project — drawn into the
+    /// bottom-left subpanel under the file manager. Combination of
+    /// `<project>/.mcp.json` (re-read every tick, cheap) and a one-shot
+    /// `claude mcp list` run at workspace open (cached in
+    /// `claude_listed_mcps`).
+    pub active_mcps: Vec<String>,
+    /// Cached user-scoped MCP names from the one-shot `claude mcp list`. Kept
+    /// across ticks so we don't shell out repeatedly.
+    claude_listed_mcps: Vec<String>,
+    /// Names of every skill activated in this project — drawn into the
+    /// bottom-right subpanel under the file manager. Filesystem-driven, no
+    /// ledger.
+    pub active_skills_names: Vec<String>,
+    /// When the project-extras lists were last refreshed.
+    last_extras_refresh: Instant,
     // ─────────────────────────────────────────────────────────────────────────
 }
 
@@ -129,6 +145,11 @@ pub struct WorkspaceState {
 /// repo while a session runs, so the snapshot must refresh; once a second keeps
 /// it current without re-running git status every frame.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often the project-extras lists (active MCPs from `.mcp.json`, active
+/// skills) are re-read on tick. Cheap reads (one `read_dir`, one file open),
+/// so a few seconds keeps the subpanels live without flickering.
+const EXTRAS_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Height of the terminal pane in rows when it is visible.
 const TERMINAL_ROWS: u16 = 12;
@@ -208,6 +229,14 @@ impl WorkspaceState {
         // file list is populated by the time the user first focuses that pane.
         let cwd_fm = session.project_path.clone();
 
+        // One-shot `claude mcp list` so user-scoped MCPs show up too, not just
+        // the ones in `.mcp.json`. Has its own internal timeout so it can't
+        // freeze workspace open if `claude` hangs.
+        let claude_listed_mcps = crate::mcp::list_via_claude(&session.project_path);
+        let project_mcps = crate::mcp::read_project_mcp_json(&session.project_path);
+        let active_mcps = crate::mcp::merge_mcps(project_mcps, claude_listed_mcps.clone());
+        let active_skills_names = crate::skills::active_skills_in_project(&session.project_path);
+
         Self {
             session,
             theme,
@@ -239,6 +268,10 @@ impl WorkspaceState {
             last_term_size: Cell::new((TERMINAL_ROWS, 80)),
             terminal_exit_code: None,
             dialog: WorkspaceDialog::None,
+            active_mcps,
+            claude_listed_mcps,
+            active_skills_names,
+            last_extras_refresh: Instant::now(),
         }
     }
 
@@ -261,6 +294,18 @@ impl WorkspaceState {
         }
         // Trigger background refresh of the file list on its 30-second cadence.
         self.file_manager.tick();
+
+        // Refresh the project-extras subpanels: re-merge `.mcp.json` with the
+        // cached `claude mcp list` results, and re-read active skills. The
+        // shell-out itself only runs once at workspace open; ticks just
+        // re-read the cheap files.
+        if self.last_extras_refresh.elapsed() >= EXTRAS_REFRESH_INTERVAL {
+            let project_mcps = crate::mcp::read_project_mcp_json(&self.session.project_path);
+            self.active_mcps = crate::mcp::merge_mcps(project_mcps, self.claude_listed_mcps.clone());
+            self.active_skills_names =
+                crate::skills::active_skills_in_project(&self.session.project_path);
+            self.last_extras_refresh = Instant::now();
+        }
     }
 
     /// Respawn the shell PTY after the previous one has exited.
@@ -738,7 +783,7 @@ pub fn render(frame: &mut Frame, state: &WorkspaceState) {
         match panel {
             Panel::Git => render_git_pane(frame, *col, &pal, focused, &state.git, state.border_style),
             Panel::Claude => render_claude_pane(frame, *col, &pal, focused, state),
-            Panel::FileManager => render_file_manager_pane(frame, *col, &pal, focused, state),
+            Panel::FileManager => render_file_manager_column(frame, *col, &pal, focused, state),
             // Terminal is rendered in rows[2]; not part of the top_row split.
             Panel::Terminal => {}
         }
@@ -1099,6 +1144,136 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
 /// - The list scrolls to keep the selection in view; `clamp_scroll` is called
 ///   here (the only place with the real visible height) so `selected` and
 ///   `scroll_offset` are always consistent.
+/// Drive the entire right-hand column: top half is the file manager, bottom
+/// half is two side-by-side read-only subpanels listing active MCPs and active
+/// skills for this project. The focus marker stays with the file manager —
+/// the subpanels are info-only, not navigable.
+///
+/// When the column is too short for both halves to be useful (under ~10 rows)
+/// the whole column falls back to just the file manager so we don't render a
+/// 2-row "MCPs" panel that's useless to read.
+fn render_file_manager_column(
+    frame: &mut Frame,
+    area: Rect,
+    pal: &Palette,
+    focused: bool,
+    state: &WorkspaceState,
+) {
+    const EXTRAS_MIN_HEIGHT: u16 = 10;
+    if area.height < EXTRAS_MIN_HEIGHT {
+        render_file_manager_pane(frame, area, pal, focused, state);
+        return;
+    }
+
+    let halves = Layout::vertical([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(area);
+    render_file_manager_pane(frame, halves[0], pal, focused, state);
+    render_project_extras_pane(frame, halves[1], pal, state);
+}
+
+/// The bottom half of the right column: MCPs (left) and active skills (right),
+/// each in its own framed pane. Pure rendering — no focus, no input handling.
+fn render_project_extras_pane(
+    frame: &mut Frame,
+    area: Rect,
+    pal: &Palette,
+    state: &WorkspaceState,
+) {
+    let halves = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Percentage(50),
+    ])
+    .split(area);
+
+    render_extras_list(
+        frame,
+        halves[0],
+        pal,
+        state,
+        " MCPs ",
+        &state.active_mcps,
+        "(no MCPs)",
+    );
+    render_extras_list(
+        frame,
+        halves[1],
+        pal,
+        state,
+        " Skills ",
+        &state.active_skills_names,
+        "(no skills)",
+    );
+}
+
+/// Render one of the bottom subpanels: a framed block with a one-line-per-name
+/// list, or a dimmed "(no X)" placeholder when the list is empty.
+fn render_extras_list(
+    frame: &mut Frame,
+    area: Rect,
+    pal: &Palette,
+    state: &WorkspaceState,
+    title: &str,
+    items: &[String],
+    empty_hint: &str,
+) {
+    let block = pane_block(
+        pal,
+        title,
+        false,
+        state.border_style.bordered(),
+        state.border_style.border_type(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {empty_hint}"),
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        );
+        return;
+    }
+
+    let visible = inner.height as usize;
+    for (i, name) in items.iter().take(visible).enumerate() {
+        let y = inner.y + i as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" • {name}"),
+                Style::default().fg(pal.fg),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
+        );
+    }
+
+    // If there are more entries than fit, show a "+N more" footer on the last
+    // line instead of silently truncating.
+    if items.len() > visible && visible >= 2 {
+        let remaining = items.len() - (visible - 1);
+        let y = inner.y + (visible as u16) - 1;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" … +{remaining} more"),
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
+        );
+    }
+}
+
 fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
     let border_type = state.border_style.border_type();
     let block = pane_block(pal, " Files ", focused, state.border_style.bordered(), border_type);
