@@ -192,10 +192,9 @@ impl WorkspaceState {
         let git = git::load(&cwd);
 
         // Pin the conversation to the session id so it can be resumed later.
-        let flag = if resume { "--resume" } else { "--session-id" };
         let opts = SpawnOptions {
             cwd: Some(cwd),
-            args: vec![flag.to_string(), session.id.clone()],
+            args: session.claude_args(resume),
         };
 
         // Spawn the PTY with a placeholder size; the first render resizes it to

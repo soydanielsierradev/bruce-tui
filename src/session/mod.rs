@@ -115,6 +115,18 @@ impl Session {
         copy.save()?;
         Ok(copy)
     }
+
+    /// The CLI args Bruce hands to `claude` to either start or resume this
+    /// session: `[--session-id, <uuid>]` for `resume=false`, `[--resume, <uuid>]`
+    /// for `resume=true`.
+    ///
+    /// Pure and decoupled from the spawn machinery so a regression here (flag
+    /// swap, missing id) is caught by unit tests instead of silently shipping
+    /// "the session won't resume" to the user.
+    pub fn claude_args(&self, resume: bool) -> Vec<String> {
+        let flag = if resume { "--resume" } else { "--session-id" };
+        vec![flag.to_string(), self.id.clone()]
+    }
 }
 
 /// Load every valid session from disk, most-recently-used first.
@@ -189,4 +201,51 @@ fn now_epoch() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(id: &str) -> Session {
+        Session {
+            id: id.to_owned(),
+            name: "test".to_owned(),
+            project_path: PathBuf::from("/tmp/project"),
+            branch: None,
+            created_at: 0,
+            last_used: 0,
+            tokens_used: 0,
+        }
+    }
+
+    #[test]
+    fn claude_args_new_session_uses_session_id_flag() {
+        let s = fixture("abc-123");
+        assert_eq!(
+            s.claude_args(false),
+            vec!["--session-id".to_string(), "abc-123".to_string()]
+        );
+    }
+
+    #[test]
+    fn claude_args_resume_uses_resume_flag() {
+        let s = fixture("abc-123");
+        assert_eq!(
+            s.claude_args(true),
+            vec!["--resume".to_string(), "abc-123".to_string()]
+        );
+    }
+
+    #[test]
+    fn claude_args_passes_id_through_verbatim() {
+        // The UUID format isn't enforced here; whatever string the session
+        // holds is what we hand to Claude. Guard against a future refactor
+        // accidentally normalising it.
+        let s = fixture("not-a-uuid-but-still-an-id");
+        let args = s.claude_args(false);
+        assert_eq!(args[1], "not-a-uuid-but-still-an-id");
+    }
 }
