@@ -295,9 +295,22 @@ impl FileManager {
     }
 
     /// Spawn a background thread that walks the project and writes the result
-    /// into `self.files`. Replaces any previous walk handle (which is joined
-    /// passively; we don't block).
+    /// into `self.files`.
+    ///
+    /// If a previous walk is still in flight, skip — we never want two walks
+    /// racing to write the same `Arc<Mutex<Vec<PathBuf>>>` or stacking CPU/IO
+    /// on top of each other. `JoinHandle::is_finished()` is non-blocking, so
+    /// the check doesn't freeze the event loop the way `join()` would.
     pub fn start_walk(&mut self) {
+        if let Some(handle) = self.walk_handle.take() {
+            if !handle.is_finished() {
+                // Still running — leave it alone and bail.
+                self.walk_handle = Some(handle);
+                return;
+            }
+            // Finished — drop the handle by letting `take()` consume it.
+        }
+
         let files = Arc::clone(&self.files);
         let root = self.project_path.clone();
         let show_hidden = self.show_hidden;
