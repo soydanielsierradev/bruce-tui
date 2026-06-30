@@ -60,10 +60,20 @@ impl Check {
 
 /// Ask GitHub for the latest release tag, returned without the leading `v`
 /// (e.g. `"0.9.2"`). `None` on any failure (no curl, offline, rate-limited).
+///
+/// `--connect-timeout` caps how long curl waits for TCP+TLS to come up and
+/// `--max-time` caps the whole call, so the update-check worker can't sit
+/// blocked on a hung GitHub edge.
 pub fn fetch_latest() -> Option<String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let output = Command::new("curl")
-        .args(["-fsSL", "-H", "User-Agent: bruce-tui", &url])
+        .args([
+            "-fsSL",
+            "--connect-timeout", "5",
+            "--max-time", "10",
+            "-H", "User-Agent: bruce-tui",
+            &url,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
