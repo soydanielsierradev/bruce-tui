@@ -125,6 +125,7 @@ impl PtySession {
 
         let reader_handle = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut query_tail: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break, // EOF or read error: child is gone.
@@ -142,7 +143,12 @@ impl PtySession {
                         }
                         // Answer queries *after* processing, so the cursor
                         // position we report is current.
-                        respond_to_queries(chunk, &parser_for_thread, &writer_for_thread);
+                        respond_to_queries(
+                            chunk,
+                            &mut query_tail,
+                            &parser_for_thread,
+                            &writer_for_thread,
+                        );
                     }
                 }
             }
@@ -239,6 +245,7 @@ impl PtySession {
 
         let reader_handle = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut query_tail: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -251,7 +258,12 @@ impl PtySession {
                         if let Ok(mut t) = last_output_for_thread.lock() {
                             *t = Instant::now();
                         }
-                        respond_to_queries(chunk, &parser_for_thread, &writer_for_thread);
+                        respond_to_queries(
+                            chunk,
+                            &mut query_tail,
+                            &parser_for_thread,
+                            &writer_for_thread,
+                        );
                     }
                 }
             }
@@ -415,10 +427,48 @@ impl Drop for PtySession {
     }
 }
 
-/// Reply to the capability/status queries a TUI sends at startup. ConPTY (and
-/// real terminals) route these to the host and feed our reply back to the child.
-fn respond_to_queries(chunk: &[u8], parser: &Arc<Mutex<vt100::Parser>>, writer: &SharedWriter) {
-    let contains = |needle: &[u8]| chunk.windows(needle.len()).any(|w| w == needle);
+/// Maximum needle length we look for in [`respond_to_queries`]. The longest
+/// today is `ESC [ > 0 c` (5 bytes), so we have to remember the last 4 bytes
+/// of each chunk to keep cross-chunk matching honest.
+const QUERY_TAIL_BYTES: usize = 4;
+
+/// Build a reply to any device-attribute or status queries inside `chunk`.
+///
+/// Pure: takes the chunk and the previous tail, returns the reply bytes plus
+/// the new tail. Easy to unit-test without mocking a parser or a writer.
+///
+/// Cross-chunk safety: an ESC sequence that lands half in chunk N and half in
+/// chunk N+1 would have been silently dropped if we only inspected each chunk
+/// in isolation. The caller threads the returned tail back into the next call
+/// so the haystack is always (previous tail || current chunk) and matches
+/// across the boundary.
+fn detect_queries(
+    chunk: &[u8],
+    prev_tail: &[u8],
+    cursor: (u16, u16),
+) -> (Vec<u8>, Vec<u8>) {
+    let mut haystack: Vec<u8> = Vec::with_capacity(prev_tail.len() + chunk.len());
+    haystack.extend_from_slice(prev_tail);
+    haystack.extend_from_slice(chunk);
+    let tail_len = prev_tail.len();
+    // Only match sequences that include at least one byte of the new chunk;
+    // matches sitting entirely inside the carried-over tail were already
+    // handled (or didn't qualify) on the previous call. Without this guard
+    // a needle that landed fully inside one chunk and survives in the tail
+    // would replay on every subsequent call.
+    let contains = |needle: &[u8]| {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return false;
+        }
+        let start_min = tail_len.saturating_sub(needle.len() - 1);
+        let start_max = haystack.len() - needle.len();
+        for start in start_min..=start_max {
+            if &haystack[start..start + needle.len()] == needle {
+                return true;
+            }
+        }
+        false
+    };
 
     let mut reply: Vec<u8> = Vec::new();
 
@@ -436,13 +486,35 @@ fn respond_to_queries(chunk: &[u8], parser: &Arc<Mutex<vt100::Parser>>, writer: 
     }
     // Device Status Report — cursor position (ESC[6n -> ESC[row;colR).
     if contains(b"\x1b[6n") {
-        let (row, col) = parser
-            .lock()
-            .ok()
-            .map(|p| p.screen().cursor_position())
-            .unwrap_or((0, 0));
+        let (row, col) = cursor;
         reply.extend_from_slice(format!("\x1b[{};{}R", row + 1, col + 1).as_bytes());
     }
+
+    // Keep the trailing bytes for the next call so a sequence split across
+    // chunks still matches.
+    let keep = haystack.len().min(QUERY_TAIL_BYTES);
+    let new_tail = haystack[haystack.len() - keep..].to_vec();
+
+    (reply, new_tail)
+}
+
+/// Reply to the capability/status queries a TUI sends at startup. ConPTY (and
+/// real terminals) route these to the host and feed our reply back to the
+/// child. `tail` is the trailing bytes of the previous chunk — the caller
+/// keeps it across iterations so cross-chunk sequences still match.
+fn respond_to_queries(
+    chunk: &[u8],
+    tail: &mut Vec<u8>,
+    parser: &Arc<Mutex<vt100::Parser>>,
+    writer: &SharedWriter,
+) {
+    let cursor = parser
+        .lock()
+        .ok()
+        .map(|p| p.screen().cursor_position())
+        .unwrap_or((0, 0));
+    let (reply, new_tail) = detect_queries(chunk, tail, cursor);
+    *tail = new_tail;
 
     if !reply.is_empty() {
         if let Ok(mut writer) = writer.lock() {
@@ -595,4 +667,87 @@ pub fn on_path(program: &str) -> bool {
         }
     }
     false
+}
+
+// ── Unit tests for the query detector ─────────────────────────────────────────
+
+#[cfg(test)]
+mod detect_queries_tests {
+    use super::*;
+
+    #[test]
+    fn primary_device_attributes_in_one_chunk() {
+        let (reply, tail) = detect_queries(b"\x1b[c", b"", (0, 0));
+        assert_eq!(reply, b"\x1b[?1;2c".to_vec());
+        // Tail keeps the last QUERY_TAIL_BYTES bytes for the next call.
+        assert!(tail.len() <= QUERY_TAIL_BYTES);
+    }
+
+    #[test]
+    fn secondary_device_attributes_zero_form() {
+        let (reply, _) = detect_queries(b"foo\x1b[>0cbar", b"", (0, 0));
+        assert_eq!(reply, b"\x1b[>0;276;0c".to_vec());
+    }
+
+    #[test]
+    fn status_report_ok() {
+        let (reply, _) = detect_queries(b"\x1b[5n", b"", (0, 0));
+        assert_eq!(reply, b"\x1b[0n".to_vec());
+    }
+
+    #[test]
+    fn status_report_cursor_uses_one_based_position() {
+        let (reply, _) = detect_queries(b"\x1b[6n", b"", (3, 9));
+        // vt100 cursor_position() is 0-based; the DSR reply is 1-based.
+        assert_eq!(reply, b"\x1b[4;10R".to_vec());
+    }
+
+    #[test]
+    fn nothing_to_reply_for_unrelated_bytes() {
+        let (reply, _) = detect_queries(b"plain output, no queries", b"", (0, 0));
+        assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn cross_chunk_split_between_escape_and_letter() {
+        // Chunk N ends in "\x1b[", chunk N+1 starts with "c" — the sequence
+        // is "\x1b[c" only when joined.
+        let (reply_a, tail_a) = detect_queries(b"foo\x1b[", b"", (0, 0));
+        assert!(reply_a.is_empty(), "first chunk alone has no full match");
+        let (reply_b, _) = detect_queries(b"cbar", &tail_a, (0, 0));
+        assert_eq!(reply_b, b"\x1b[?1;2c".to_vec());
+    }
+
+    #[test]
+    fn cross_chunk_split_inside_csi_prefix() {
+        // Worst case: chunk break right after \x1b, before [.
+        let (_, tail_a) = detect_queries(b"\x1b", b"", (0, 0));
+        let (reply_b, _) = detect_queries(b"[c", &tail_a, (0, 0));
+        assert_eq!(reply_b, b"\x1b[?1;2c".to_vec());
+    }
+
+    #[test]
+    fn cross_chunk_longest_needle_split() {
+        // ESC[>0c is the longest needle (5 bytes). Drop 4 of them at the end
+        // of one chunk and the last one at the start of the next.
+        let (_, tail_a) = detect_queries(b"\x1b[>0", b"", (0, 0));
+        let (reply_b, _) = detect_queries(b"c", &tail_a, (0, 0));
+        assert_eq!(reply_b, b"\x1b[>0;276;0c".to_vec());
+    }
+
+    #[test]
+    fn tail_does_not_replay_already_detected_sequence() {
+        // After a chunk fully containing "\x1b[c", the next chunk of unrelated
+        // bytes must not re-trigger the reply.
+        let (reply_a, tail_a) = detect_queries(b"\x1b[c", b"", (0, 0));
+        assert_eq!(reply_a, b"\x1b[?1;2c".to_vec());
+        let (reply_b, _) = detect_queries(b"some normal output", &tail_a, (0, 0));
+        assert!(reply_b.is_empty(), "stale tail must not replay the match");
+    }
+
+    #[test]
+    fn multiple_queries_in_one_chunk_get_combined_reply() {
+        let (reply, _) = detect_queries(b"\x1b[c\x1b[5n", b"", (0, 0));
+        assert_eq!(reply, b"\x1b[?1;2c\x1b[0n".to_vec());
+    }
 }
