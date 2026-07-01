@@ -1,6 +1,6 @@
 [package]
 name = "bruce"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2024"
 license = "MIT"
 description = "A terminal workspace for Claude Code: live Git, embedded Claude, a file manager and a terminal, with per-project sessions."
