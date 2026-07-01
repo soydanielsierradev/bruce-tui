@@ -48,7 +48,10 @@ Campos: id, name, project_path, branch, created_at,
         last_used, tokens_used, scrollback (base64)
 
 ## Temas disponibles
-Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night
+Hackerman (default), Cyberpunk, Claude, Dracula, Nord, Light, Amber, Tokyo Night,
+Omarchy (lee `~/.config/omarchy/current/theme/alacritty.toml` en el primer
+acceso y cachea; fallback silencioso a Hackerman si Omarchy no está instalado o
+el TOML no parsea).
 
 ## Estado actual del proyecto
 <!-- Actualizá esta sección manualmente a medida que avanzás -->

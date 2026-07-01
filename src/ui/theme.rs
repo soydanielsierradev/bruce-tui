@@ -18,6 +18,10 @@ pub enum Theme {
     Light,
     Amber,
     Tokyo,
+    /// Follow whatever theme Omarchy is currently applying (Linux-only in
+    /// practice — Bruce falls back to Hacker silently when the Omarchy config
+    /// isn't present or is malformed).
+    Omarchy,
 }
 
 /// Line style for the framed side panes (Git, File Manager, Terminal). A
@@ -109,6 +113,7 @@ impl SideWidth {
 }
 
 /// A resolved set of colors for rendering a single theme.
+#[derive(Clone, Copy)]
 pub struct Palette {
     /// Human-readable theme name, shown in the theme selector.
     pub name: &'static str,
@@ -132,7 +137,7 @@ pub struct Palette {
 
 impl Theme {
     /// All themes in selector order.
-    pub const ALL: [Theme; 8] = [
+    pub const ALL: [Theme; 9] = [
         Theme::Hacker,
         Theme::Cyberpunk,
         Theme::Claude,
@@ -141,6 +146,7 @@ impl Theme {
         Theme::Light,
         Theme::Amber,
         Theme::Tokyo,
+        Theme::Omarchy,
     ];
 
     /// A short palette preview for the welcome theme selector: the theme's
@@ -243,6 +249,11 @@ impl Theme {
                 removed: Color::Rgb(0xf7, 0x76, 0x8e),
                 renamed: Color::Rgb(0xe0, 0xaf, 0x68),
             },
+            // Read from `~/.config/omarchy/current/theme/alacritty.toml` on
+            // first call, then cached process-wide. Falls back to Hacker when
+            // Omarchy isn't installed or the palette can't be parsed, so the
+            // picker option is safe to pick from any OS.
+            Theme::Omarchy => crate::ui::omarchy::palette(),
             // The original Bruce "Dark": green-on-near-black, the classic
             // terminal-hacker look.
             Theme::Hacker => Palette {
