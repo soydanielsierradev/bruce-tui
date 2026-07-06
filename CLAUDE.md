@@ -157,6 +157,33 @@ el TOML no parsea).
       Tests nuevos para `encode_key()` cubriendo Ctrl letters, DECCKM
       cursor mode y tilde nav keys. README documenta `BRUCE_CMD` y
       `BRUCE_EDITOR`. Total: 44 → 66 tests.
+- [x] Paso 21 (v0.18.0): rediseño de la columna derecha con dos bloques
+      nuevos + un fix de persistencia. Layout con constraints de alto fijo
+      (`Files` = `Fill(1)`, resto `Length(n)`) — la fila MCP+Skills subió a
+      9 filas para que no queden aplastados. Nuevo panel **Session**: model
+      (nombre friendly: `Opus 4.7`), speed tier (`Standard`/`Fast`),
+      **barra de contexto** con % libre coloreado por salud (verde ≥40%,
+      accent 15-39%, rojo `pal.removed` <15% — visual de proximidad al
+      auto-compact), y turns. Nuevo panel **Usage** debajo: input / output
+      / cached tokens acumulados + **estimated cost** (`~$X.XX`) con
+      pricing por family hardcoded con date-stamp (Opus premium, Sonnet/
+      Fable médium, Haiku barato). Ambos alimentados por
+      `SessionInfo::parse` en una sola pasada del transcript JSONL.
+      **Skills subpanel** revierte a "solo activas en el proyecto" —
+      `<project>/.claude/skills/*/SKILL.md`; función
+      `active_skill_names_in_project` reemplaza a `available_skill_names`.
+      **MCPs conectados** ahora muestran **✔ verde** (`pal.added`, bold)
+      en vez del bullet — `render_extras_list` acepta
+      `connected: Option<&[String]>` y lo compara contra
+      `claude_listed_mcps`. Fix: **`terminal_enabled` persiste**
+      (`Config::terminal_enabled` con default `true`); `toggle_terminal`
+      llama a `persist_panels`; la welcome sincroniza back al salir del
+      workspace — antes se mostraba siempre al abrir. Fix: MCP subpanel
+      ya no parpadea — timeout de `claude mcp list` 3s → 10s (corre en
+      background, no bloquea la UI); cuando el job devuelve vacío por
+      timeout/error, NO pisa el último resultado bueno. Regresión
+      adjunta: `parse_alacritty_palette` tolera `[colors.cursor]`
+      (config real de Omarchy trae esa sección). Total: 66 → 92 tests.
 
 ## Commits
 - Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
@@ -173,7 +200,7 @@ el TOML no parsea).
   hace minor).
 - Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
   del cambio (la versión se muestra en la welcome screen).
-  Versión actual: 0.16.1.
+  Versión actual: 0.18.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).
