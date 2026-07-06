@@ -78,6 +78,7 @@ fn open_session_loading(
         resume,
         welcome.theme,
         welcome.git_enabled,
+        welcome.terminal_enabled,
         welcome.show_footer,
         welcome.show_title,
         welcome.border_style,
@@ -679,6 +680,7 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> Result<Option<Vec<String
             if let Screen::Workspace(ws) = &mut screen {
                 ws.persist_metrics();
                 welcome.git_enabled = ws.git_enabled;
+                welcome.terminal_enabled = ws.terminal_enabled;
                 welcome.persist_config();
             }
         }

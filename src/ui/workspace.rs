@@ -3,6 +3,7 @@
 //! the Terminal pane is a second PTY wired in Slice 2.
 
 use std::cell::Cell;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -125,17 +126,31 @@ pub struct WorkspaceState {
     // ── Project extras subpanels (under the File Manager) ────────────────────
     /// Names of every MCP server active in this project — drawn into the
     /// bottom-left subpanel under the file manager. Combination of
-    /// `<project>/.mcp.json` (re-read every tick, cheap) and a one-shot
-    /// `claude mcp list` run at workspace open (cached in
-    /// `claude_listed_mcps`).
+    /// `<project>/.mcp.json` (re-read every tick, cheap) and the cached result
+    /// of `claude mcp list` in `claude_listed_mcps`.
     pub active_mcps: Vec<String>,
-    /// Cached user-scoped MCP names from the one-shot `claude mcp list`. Kept
-    /// across ticks so we don't shell out repeatedly.
+    /// Cached MCP names from the background `claude mcp list` run. Empty until
+    /// the first shell-out completes; refreshed periodically by re-spawning
+    /// the background job.
     claude_listed_mcps: Vec<String>,
-    /// Names of every skill activated in this project — drawn into the
-    /// bottom-right subpanel under the file manager. Filesystem-driven, no
-    /// ledger.
+    /// Handle to the in-flight `claude mcp list` background job, if any. Polled
+    /// on every tick — we join it as soon as `is_finished()` is true so the
+    /// subpanel populates on the very first tick after `claude` responds.
+    mcp_list_job: Option<JoinHandle<Vec<String>>>,
+    /// When the background `claude mcp list` job was last kicked off. Used to
+    /// re-run periodically so newly added user-scoped MCPs eventually surface
+    /// without reopening the workspace.
+    last_mcp_list_kick: Instant,
+    /// Names of the skills currently activated in this project — drawn into
+    /// the bottom-right subpanel under the file manager. This is the same set
+    /// the user toggles with `E` from Manage Skills, so what shows up here
+    /// stays in lock-step with the user's own on/off decisions instead of
+    /// listing every skill in the library.
     pub active_skills_names: Vec<String>,
+    /// Snapshot of live session info (model, speed, context usage, turn count)
+    /// pulled from Claude's transcript for the Session subpanel. `None` until
+    /// the transcript file exists — the pane then shows a placeholder.
+    pub session_info: Option<metrics::SessionInfo>,
     /// When the project-extras lists were last refreshed.
     last_extras_refresh: Instant,
     // ─────────────────────────────────────────────────────────────────────────
@@ -146,10 +161,16 @@ pub struct WorkspaceState {
 /// it current without re-running git status every frame.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How often the project-extras lists (active MCPs from `.mcp.json`, active
+/// How often the project-extras lists (active MCPs from `.mcp.json`, available
 /// skills) are re-read on tick. Cheap reads (one `read_dir`, one file open),
 /// so a few seconds keeps the subpanels live without flickering.
 const EXTRAS_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How often `claude mcp list` is re-run in the background. The CLI is not
+/// free (Node cold start + network health checks), so we only run it every
+/// ~30 s — enough to pick up MCPs that were installed while Bruce was open,
+/// but not so aggressively that it burns cycles.
+const MCP_LIST_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Height of the terminal pane in rows when it is visible.
 const TERMINAL_ROWS: u16 = 12;
@@ -203,6 +224,7 @@ impl WorkspaceState {
         resume: bool,
         theme: Theme,
         git_enabled: bool,
+        terminal_enabled: bool,
         show_footer: bool,
         show_title: bool,
         border_style: BorderStyle,
@@ -229,13 +251,16 @@ impl WorkspaceState {
         // file list is populated by the time the user first focuses that pane.
         let cwd_fm = session.project_path.clone();
 
-        // One-shot `claude mcp list` so user-scoped MCPs show up too, not just
-        // the ones in `.mcp.json`. Has its own internal timeout so it can't
-        // freeze workspace open if `claude` hangs.
-        let claude_listed_mcps = crate::mcp::list_via_claude(&session.project_path);
+        // Kick `claude mcp list` off on a background thread so workspace open
+        // never waits on it. The subpanel starts with just `.mcp.json`
+        // contents; the CLI results merge in on the first tick after the
+        // shell-out completes.
+        let mcp_list_job = Some(crate::mcp::spawn_list_via_claude(session.project_path.clone()));
         let project_mcps = crate::mcp::read_project_mcp_json(&session.project_path);
-        let active_mcps = crate::mcp::merge_mcps(project_mcps, claude_listed_mcps.clone());
-        let active_skills_names = crate::skills::active_skills_in_project(&session.project_path);
+        let active_mcps = crate::mcp::merge_mcps(project_mcps, Vec::new());
+        let active_skills_names =
+            crate::skills::active_skill_names_in_project(&session.project_path);
+        let session_info = metrics::read_session_info(&session.project_path, &session.id);
 
         Self {
             session,
@@ -264,13 +289,16 @@ impl WorkspaceState {
             // Windows simultaneously before we've confirmed that works.
             terminal: None,
             terminal_error: None,
-            terminal_enabled: true,
+            terminal_enabled,
             last_term_size: Cell::new((TERMINAL_ROWS, 80)),
             terminal_exit_code: None,
             dialog: WorkspaceDialog::None,
             active_mcps,
-            claude_listed_mcps,
+            claude_listed_mcps: Vec::new(),
+            mcp_list_job,
+            last_mcp_list_kick: Instant::now(),
             active_skills_names,
+            session_info,
             last_extras_refresh: Instant::now(),
         }
     }
@@ -295,15 +323,54 @@ impl WorkspaceState {
         // Trigger background refresh of the file list on its 30-second cadence.
         self.file_manager.tick();
 
+        // Join the `claude mcp list` background job as soon as it's done so
+        // the results merge into the subpanel on the very next frame — no
+        // waiting for the next `EXTRAS_REFRESH_INTERVAL` tick.
+        //
+        // Empty results (panicked thread, CLI timeout, `claude` not on PATH)
+        // do NOT overwrite the last good cache: a periodic refresh that fails
+        // for transient reasons would otherwise blank the subpanel until the
+        // next successful run, making entries flicker in and out. Real
+        // disconnects surface as an empty list once the user reopens Bruce.
+        if let Some(job) = &self.mcp_list_job {
+            if job.is_finished() {
+                if let Some(job) = self.mcp_list_job.take() {
+                    let listed = job.join().unwrap_or_default();
+                    if !listed.is_empty() {
+                        self.claude_listed_mcps = listed;
+                    }
+                    let project_mcps =
+                        crate::mcp::read_project_mcp_json(&self.session.project_path);
+                    self.active_mcps =
+                        crate::mcp::merge_mcps(project_mcps, self.claude_listed_mcps.clone());
+                }
+            }
+        }
+
+        // Re-kick the `claude mcp list` shell-out periodically so newly
+        // installed MCPs eventually surface without reopening the workspace.
+        // Only kick when no job is already in flight.
+        if self.mcp_list_job.is_none()
+            && self.last_mcp_list_kick.elapsed() >= MCP_LIST_REFRESH_INTERVAL
+        {
+            self.mcp_list_job = Some(crate::mcp::spawn_list_via_claude(
+                self.session.project_path.clone(),
+            ));
+            self.last_mcp_list_kick = Instant::now();
+        }
+
         // Refresh the project-extras subpanels: re-merge `.mcp.json` with the
-        // cached `claude mcp list` results, and re-read active skills. The
-        // shell-out itself only runs once at workspace open; ticks just
-        // re-read the cheap files.
+        // cached `claude mcp list` results, re-read which skills are
+        // currently activated in this project, and re-read Claude's
+        // transcript so the Session pane's model / speed / context stay
+        // live as the conversation advances.
         if self.last_extras_refresh.elapsed() >= EXTRAS_REFRESH_INTERVAL {
             let project_mcps = crate::mcp::read_project_mcp_json(&self.session.project_path);
             self.active_mcps = crate::mcp::merge_mcps(project_mcps, self.claude_listed_mcps.clone());
             self.active_skills_names =
-                crate::skills::active_skills_in_project(&self.session.project_path);
+                crate::skills::active_skill_names_in_project(&self.session.project_path);
+            self.session_info =
+                metrics::read_session_info(&self.session.project_path, &self.session.id);
             self.last_extras_refresh = Instant::now();
         }
     }
@@ -467,11 +534,14 @@ impl WorkspaceState {
     }
 
     /// Toggle the Terminal pane. If it was focused while being hidden, focus Claude.
+    /// Persists the choice immediately so it survives a hard terminal close
+    /// (same rationale as `toggle_git`).
     pub fn toggle_terminal(&mut self) {
         self.terminal_enabled = !self.terminal_enabled;
         if !self.terminal_enabled && self.focus == Panel::Terminal {
             self.focus = Panel::Claude;
         }
+        self.persist_panels();
     }
 
     /// Enabled panes in traversal order. Claude is always present; FileManager
@@ -725,6 +795,7 @@ impl WorkspaceState {
     fn persist_panels(&self) {
         let mut config = Config::load();
         config.git_enabled = self.git_enabled;
+        config.terminal_enabled = self.terminal_enabled;
         let _ = config.save();
     }
 }
@@ -1144,14 +1215,19 @@ fn simple_body(frame: &mut Frame, area: Rect, pal: &Palette, text: &str) {
 /// - The list scrolls to keep the selection in view; `clamp_scroll` is called
 ///   here (the only place with the real visible height) so `selected` and
 ///   `scroll_offset` are always consistent.
-/// Drive the entire right-hand column: top half is the file manager, bottom
-/// half is two side-by-side read-only subpanels listing active MCPs and active
-/// skills for this project. The focus marker stays with the file manager —
-/// the subpanels are info-only, not navigable.
+/// Drive the entire right-hand column. Layout, top to bottom:
 ///
-/// When the column is too short for both halves to be useful (under ~10 rows)
-/// the whole column falls back to just the file manager so we don't render a
-/// 2-row "MCPs" panel that's useless to read.
+/// - **Files** (flex — takes whatever the fixed rows leave).
+/// - **MCPs + Skills** side by side (`EXTRAS_ROW_HEIGHT`).
+/// - **Session** (`SESSION_ROW_HEIGHT`) — model, speed, context bar, turns.
+/// - **Usage** (`USAGE_ROW_HEIGHT`) — cumulative tokens + estimated cost.
+///
+/// The focus marker stays with the file manager; the three bottom rows are
+/// info-only and not navigable.
+///
+/// When the column is too short for the whole stack to be useful (under
+/// [`EXTRAS_MIN_HEIGHT`] rows) the extras collapse and only the file manager
+/// is rendered so we don't paint 2-row panels that no one can read.
 fn render_file_manager_column(
     frame: &mut Frame,
     area: Rect,
@@ -1159,19 +1235,38 @@ fn render_file_manager_column(
     focused: bool,
     state: &WorkspaceState,
 ) {
-    const EXTRAS_MIN_HEIGHT: u16 = 10;
+    /// Fixed height for the MCP + Skills row. 9 rows leaves 7 for content
+    /// after the frame, so 3-4 items breathe instead of crowding the
+    /// pane's edges. The Files pane loses the same amount from its flex
+    /// share, matching the "shrink Files a bit to un-squash the extras"
+    /// intent.
+    const EXTRAS_ROW_HEIGHT: u16 = 9;
+    /// Session pane needs an extra line for the context bar.
+    const SESSION_ROW_HEIGHT: u16 = 7;
+    /// Usage pane has 4 rows of content.
+    const USAGE_ROW_HEIGHT: u16 = 6;
+    /// Threshold below which the whole extras stack collapses. Sum of the
+    /// three fixed rows plus a floor for the file manager (~6 rows). Under
+    /// this the panes stack too tight to read.
+    const EXTRAS_MIN_HEIGHT: u16 =
+        EXTRAS_ROW_HEIGHT + SESSION_ROW_HEIGHT + USAGE_ROW_HEIGHT + 6;
+
     if area.height < EXTRAS_MIN_HEIGHT {
         render_file_manager_pane(frame, area, pal, focused, state);
         return;
     }
 
-    let halves = Layout::vertical([
-        Constraint::Percentage(50),
-        Constraint::Percentage(50),
+    let rows = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(EXTRAS_ROW_HEIGHT),
+        Constraint::Length(SESSION_ROW_HEIGHT),
+        Constraint::Length(USAGE_ROW_HEIGHT),
     ])
     .split(area);
-    render_file_manager_pane(frame, halves[0], pal, focused, state);
-    render_project_extras_pane(frame, halves[1], pal, state);
+    render_file_manager_pane(frame, rows[0], pal, focused, state);
+    render_project_extras_pane(frame, rows[1], pal, state);
+    render_session_pane(frame, rows[2], pal, state);
+    render_usage_pane(frame, rows[3], pal, state);
 }
 
 /// The bottom half of the right column: MCPs (left) and active skills (right),
@@ -1188,6 +1283,10 @@ fn render_project_extras_pane(
     ])
     .split(area);
 
+    // MCPs: pass the set of names `claude mcp list` reported as connected
+    // so each entry gets a green check or the neutral bullet. Skills don't
+    // need the distinction — they're either activated in this project or
+    // not listed at all.
     render_extras_list(
         frame,
         halves[0],
@@ -1196,6 +1295,7 @@ fn render_project_extras_pane(
         " MCPs ",
         &state.active_mcps,
         "(no MCPs)",
+        Some(&state.claude_listed_mcps),
     );
     render_extras_list(
         frame,
@@ -1205,11 +1305,18 @@ fn render_project_extras_pane(
         " Skills ",
         &state.active_skills_names,
         "(no skills)",
+        None,
     );
 }
 
 /// Render one of the bottom subpanels: a framed block with a one-line-per-name
 /// list, or a dimmed "(no X)" placeholder when the list is empty.
+///
+/// When `connected` is `Some`, each entry present in that set is drawn with
+/// a green check (`✔`) to distinguish live MCP servers from configured-but-
+/// unreachable ones; entries missing from the set fall back to the neutral
+/// bullet. Pass `None` for lists where every item is inherently "on" (e.g.
+/// skills — if they're listed, they're activated).
 fn render_extras_list(
     frame: &mut Frame,
     area: Rect,
@@ -1218,6 +1325,7 @@ fn render_extras_list(
     title: &str,
     items: &[String],
     empty_hint: &str,
+    connected: Option<&[String]>,
 ) {
     let block = pane_block(
         pal,
@@ -1248,11 +1356,23 @@ fn render_extras_list(
     let visible = inner.height as usize;
     for (i, name) in items.iter().take(visible).enumerate() {
         let y = inner.y + i as u16;
+        let is_connected = connected
+            .map(|set| set.iter().any(|c| c == name))
+            .unwrap_or(false);
+        let (glyph, glyph_style) = if is_connected {
+            (
+                "✔",
+                Style::default().fg(pal.added).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("•", Style::default().fg(pal.dim))
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" • {name}"),
-                Style::default().fg(pal.fg),
-            )))
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(glyph, glyph_style),
+                Span::styled(format!(" {name}"), Style::default().fg(pal.fg)),
+            ]))
             .style(Style::default().bg(pal.bg)),
             Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
@@ -1271,6 +1391,320 @@ fn render_extras_list(
             .style(Style::default().bg(pal.bg)),
             Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
+    }
+}
+
+/// The Session subpanel: live snapshot of the Claude conversation running in
+/// the center pane. Four rows, all `label + value`, plus a context bar so the
+/// user can see at a glance how close the transcript is to auto-compact.
+///
+/// - **Model** — friendly family + version (`Opus 4.7`).
+/// - **Speed** — `Standard` / `Fast` from the last usage block.
+/// - **Context** — `NNK free · MM%` plus a proportional bar; `%` is the share
+///   of the model's context window still available (100 % right after
+///   `/clear`, ticks down toward 0 as the transcript grows).
+/// - **Turns** — user messages sent.
+///
+/// Placeholder text appears when the transcript hasn't been written yet
+/// (Claude hasn't produced its first response, or Bruce can't locate the
+/// transcript file).
+fn render_session_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &WorkspaceState) {
+    let block = pane_block(
+        pal,
+        " Session ",
+        false,
+        state.border_style.bordered(),
+        state.border_style.border_type(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let Some(info) = state.session_info.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " waiting for first response…",
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        );
+        return;
+    };
+
+    let label_style = Style::default().fg(pal.dim);
+    let value_style = Style::default().fg(pal.fg);
+
+    // Fixed-width label column so the values line up vertically, matching
+    // the "Model / Speed / Context / Turns" grid look in the mock.
+    let mut lines: Vec<(String, Line)> = Vec::new();
+
+    let model_display = info
+        .model
+        .as_deref()
+        .map(metrics::model_display)
+        .unwrap_or_else(|| "—".to_string());
+    lines.push((
+        " Model".to_string(),
+        Line::from(Span::styled(model_display, value_style)),
+    ));
+
+    let speed_display = info
+        .speed
+        .as_deref()
+        .map(|s| {
+            let mut chars = s.chars();
+            match chars.next() {
+                Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
+    lines.push((
+        " Speed".to_string(),
+        Line::from(Span::styled(speed_display, value_style)),
+    ));
+
+    // Context: how much of the window is still free. `used` may exceed the
+    // model's declared cap on very long transcripts because Claude expands
+    // caches; clamp so the display never shows a negative "free" figure.
+    let cap = info
+        .model
+        .as_deref()
+        .map(metrics::context_cap)
+        .unwrap_or(200_000);
+    let used = info.last_context_tokens.min(cap);
+    let free = cap.saturating_sub(used);
+    let pct_free = if cap == 0 {
+        0
+    } else {
+        ((free as f64 / cap as f64) * 100.0).round() as u64
+    };
+    lines.push((
+        " Context".to_string(),
+        Line::from(vec![
+            Span::styled(
+                format!("{} free ", fmt_tokens(free)),
+                context_style(pal, pct_free),
+            ),
+            Span::styled(format!("· {pct_free}%"), Style::default().fg(pal.dim)),
+        ]),
+    ));
+
+    lines.push((
+        " Turns".to_string(),
+        Line::from(Span::styled(info.user_turns.to_string(), value_style)),
+    ));
+
+    // Two-column layout: labels flush left, values start at a fixed offset so
+    // everything reads as an aligned grid.
+    let label_width: u16 = 9; // " Context" == 8 chars + one trailing gap
+    let mut y = inner.y;
+    for (label, value) in &lines {
+        if y >= inner.y + inner.height {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(label.clone(), label_style)))
+                .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y, width: label_width.min(inner.width), height: 1 },
+        );
+        if inner.width > label_width {
+            frame.render_widget(
+                Paragraph::new(value.clone()).style(Style::default().bg(pal.bg)),
+                Rect {
+                    x: inner.x + label_width,
+                    y,
+                    width: inner.width - label_width,
+                    height: 1,
+                },
+            );
+        }
+        y += 1;
+    }
+
+    // Context bar sits under the row it labels, spanning the value column
+    // width. Skip if we've run out of vertical room.
+    let bar_row = inner.y + 2; // "Context" is the third row (0-indexed 2)
+    let bar_y = bar_row + 1;
+    if bar_y < inner.y + inner.height && inner.width > label_width + 2 {
+        let bar_area = Rect {
+            x: inner.x + label_width,
+            y: bar_y,
+            width: inner.width - label_width - 1,
+            height: 1,
+        };
+        render_context_bar(frame, bar_area, pal, pct_free);
+    }
+}
+
+/// Colour the "free" figure against the palette so the user reads the state
+/// at a glance: green when there's plenty of room, accent as it fills up,
+/// and the palette's `removed` red once we're inside the danger band where
+/// Claude is about to auto-compact.
+fn context_style(pal: &Palette, pct_free: u64) -> Style {
+    let colour = if pct_free >= 40 {
+        pal.added
+    } else if pct_free >= 15 {
+        pal.accent
+    } else {
+        pal.removed
+    };
+    Style::default().fg(colour).add_modifier(Modifier::BOLD)
+}
+
+/// A one-row horizontal progress bar showing the share of context still free.
+/// Filled cells use the same "how healthy" colour as the numeric readout so
+/// the two agree; empty cells use the palette's dim tone.
+fn render_context_bar(frame: &mut Frame, area: Rect, pal: &Palette, pct_free: u64) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let total = area.width as u64;
+    let filled = (total * pct_free / 100).min(total) as u16;
+    let empty = area.width - filled;
+
+    let filled_colour = if pct_free >= 40 {
+        pal.added
+    } else if pct_free >= 15 {
+        pal.accent
+    } else {
+        pal.removed
+    };
+
+    let mut spans: Vec<Span> = Vec::new();
+    if filled > 0 {
+        spans.push(Span::styled(
+            "█".repeat(filled as usize),
+            Style::default().fg(filled_colour),
+        ));
+    }
+    if empty > 0 {
+        spans.push(Span::styled(
+            "░".repeat(empty as usize),
+            Style::default().fg(pal.dim),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(pal.bg)),
+        area,
+    );
+}
+
+/// Format a token count for the Session subpanel: three digits max plus a
+/// unit suffix so it fits in a narrow value column. `1_234` → `1.2K`,
+/// `152_010` → `152K`.
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 10_000 {
+        // Show one decimal for the sub-10K band so 1_234 doesn't collapse to
+        // "1K" (loses too much precision at the low end).
+        return format!("{:.1}K", n as f64 / 1_000.0);
+    }
+    format!("{}K", n / 1_000)
+}
+
+/// The Usage subpanel: cumulative token usage across the whole conversation
+/// plus an estimated USD cost under the active model's public pricing.
+///
+/// - **Input** — fresh input tokens (`~$3-$15/Mtok` depending on family).
+/// - **Output** — model output tokens (the priciest bucket).
+/// - **Cached** — cache-read hits, the cheapest bucket, plus cache writes.
+/// - **Cost** — sum of every bucket times its per-token rate; always prefixed
+///   with `~` because it's an estimate, not a bill.
+///
+/// Costs are estimates only — the pricing constants live in `metrics.rs`
+/// with a date stamp, so update them when Anthropic revises the rate card.
+fn render_usage_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &WorkspaceState) {
+    let block = pane_block(
+        pal,
+        " Usage ",
+        false,
+        state.border_style.bordered(),
+        state.border_style.border_type(),
+    );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let Some(info) = state.session_info.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " no usage yet",
+                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
+            )))
+            .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        );
+        return;
+    };
+
+    let label_style = Style::default().fg(pal.dim);
+    let value_style = Style::default().fg(pal.fg);
+
+    let cost = metrics::estimated_cost(&info.totals, info.model.as_deref());
+    let cost_display = format!("~${cost:.2}");
+
+    // Combine cache_read + cache_write under a single "Cached" line — the
+    // subpanel is narrow and the distinction matters more to accountants
+    // than to a developer trying to gauge their bill.
+    let cached = info.totals.cache_read + info.totals.cache_write;
+
+    let rows: [(String, Line); 4] = [
+        (
+            " Input".to_string(),
+            Line::from(Span::styled(fmt_tokens(info.totals.input), value_style)),
+        ),
+        (
+            " Output".to_string(),
+            Line::from(Span::styled(fmt_tokens(info.totals.output), value_style)),
+        ),
+        (
+            " Cached".to_string(),
+            Line::from(Span::styled(fmt_tokens(cached), value_style)),
+        ),
+        (
+            " Cost".to_string(),
+            Line::from(Span::styled(
+                cost_display,
+                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+            )),
+        ),
+    ];
+
+    // Same two-column grid as the Session pane so the visual language stays
+    // consistent between adjacent info blocks.
+    let label_width: u16 = 9;
+    let mut y = inner.y;
+    for (label, value) in &rows {
+        if y >= inner.y + inner.height {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(label.clone(), label_style)))
+                .style(Style::default().bg(pal.bg)),
+            Rect { x: inner.x, y, width: label_width.min(inner.width), height: 1 },
+        );
+        if inner.width > label_width {
+            frame.render_widget(
+                Paragraph::new(value.clone()).style(Style::default().bg(pal.bg)),
+                Rect {
+                    x: inner.x + label_width,
+                    y,
+                    width: inner.width - label_width,
+                    height: 1,
+                },
+            );
+        }
+        y += 1;
     }
 }
 

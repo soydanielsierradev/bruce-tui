@@ -25,6 +25,12 @@ pub struct Config {
     /// Whether the Git panel is shown.
     #[serde(default = "default_true")]
     pub git_enabled: bool,
+    /// Whether the bottom Terminal pane is shown. The user can toggle it with
+    /// `Ctrl+T`; persisting the last choice keeps that decision across runs
+    /// instead of always defaulting to on. Defaults on so first-run users see
+    /// the pane and discover it exists.
+    #[serde(default = "default_true")]
+    pub terminal_enabled: bool,
     /// Unix-epoch seconds of the last update check (0 = never). Throttles the
     /// network check to roughly once a day.
     #[serde(default)]
@@ -67,6 +73,7 @@ impl Default for Config {
         Self {
             theme: Theme::Hacker,
             git_enabled: true,
+            terminal_enabled: true,
             last_update_check: 0,
             latest_seen: String::new(),
             sync_colors: true,
