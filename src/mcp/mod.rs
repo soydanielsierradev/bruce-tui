@@ -13,8 +13,9 @@
 //! PATH, garbled JSON) is treated as "empty" — the subpanel will just say
 //! "no MCPs configured".
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -56,9 +57,14 @@ pub fn read_project_mcp_json(project_path: &Path) -> Vec<String> {
 }
 
 /// How long we wait for `claude mcp list` to return before giving up. The CLI
-/// usually answers in well under a second; the cap stops a slow boot from
-/// holding the workspace open.
-const CLAUDE_MCP_TIMEOUT: Duration = Duration::from_secs(3);
+/// usually answers in well under a second, but a cold Node start plus health
+/// checks against many servers can push it past a few seconds — the previous
+/// 3 s cap fired often enough on real machines to make the subpanel blink
+/// between "populated" and "empty" as the periodic refresh timed out. Since
+/// this runs on a background thread and never blocks the UI, a generous
+/// timeout is free — 10 s covers realistic slow paths without letting a truly
+/// stuck CLI accumulate zombies.
+const CLAUDE_MCP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ask the `claude` CLI for every MCP server it sees from `project_path`
 /// (project-scoped + user-scoped). Empty vec if `claude` isn't on PATH, if it
@@ -103,6 +109,18 @@ pub fn list_via_claude(project_path: &Path) -> Vec<String> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_claude_list(&stdout)
+}
+
+/// Spawn `claude mcp list` on a background thread so workspace open never
+/// blocks waiting for the CLI. Returns a join handle that yields the parsed
+/// server list when the process completes (or an empty vec on timeout /
+/// failure — same semantics as [`list_via_claude`]).
+///
+/// The caller polls with `is_finished()` on the returned handle and joins it
+/// once ready. Consumers must own the [`PathBuf`] so the thread can move it
+/// without keeping a lifetime tied to the caller.
+pub fn spawn_list_via_claude(project_path: PathBuf) -> JoinHandle<Vec<String>> {
+    thread::spawn(move || list_via_claude(&project_path))
 }
 
 /// Parse the line-oriented output of `claude mcp list`.

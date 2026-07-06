@@ -212,6 +212,46 @@ white = \"#ffffff\"
         assert!(parse_alacritty_palette(&raw).is_none());
     }
 
+    /// Snapshot of the "aurora" (or similarly bright-blue) Omarchy theme with
+    /// the extra `[colors.cursor]` table that real Omarchy configs ship. Bruce
+    /// only cares about `primary/normal/bright`; the presence of unrelated
+    /// sections must not break the parse.
+    #[test]
+    fn parse_alacritty_palette_tolerates_extra_cursor_section() {
+        let raw = "\
+[colors]
+[colors.primary]
+background = \"#040400\"
+foreground = \"#e8e6cf\"
+
+[colors.normal]
+black   = \"#040400\"
+red     = \"#c55c43\"
+green   = \"#72a747\"
+yellow  = \"#a5a92f\"
+blue    = \"#368bd6\"
+magenta = \"#b568b5\"
+cyan    = \"#00b5b2\"
+white   = \"#e8e6cf\"
+
+[colors.bright]
+black   = \"#64655e\"
+red     = \"#f57d5c\"
+green   = \"#91d14a\"
+yellow  = \"#cad20f\"
+blue    = \"#57aeff\"
+magenta = \"#e286e8\"
+cyan    = \"#31deda\"
+white   = \"#f2efb5\"
+
+[colors.cursor]
+text   = \"#040400\"
+cursor = \"#e8e6cf\"
+";
+        let p = parse_alacritty_palette(raw).expect("parse");
+        assert_eq!(p.accent, Color::Rgb(0x36, 0x8b, 0xd6));
+    }
+
     #[test]
     fn parse_hex_accepts_only_seven_char_hash_prefixed_values() {
         assert_eq!(parse_hex("#7d99c0"), Some(Color::Rgb(0x7d, 0x99, 0xc0)));
