@@ -82,12 +82,16 @@ pub fn session_total_tokens(project_path: &Path, session_id: &str) -> Option<u64
     Some(parse_transcript(&path).total())
 }
 
-/// A snapshot of the live session state for the workspace Session subpanel:
-/// the model Claude is currently answering with, its speed tier, how much of
-/// the context window the last turn consumed, and how many user turns have
-/// been sent, plus cumulative token totals for the Usage subpanel. All fields
-/// are best-effort — `None` means the transcript doesn't have that datum yet
-/// (e.g. the model hasn't produced its first response).
+/// A snapshot of the live session state for the workspace Session pane, read
+/// out of Claude's transcript: which model is answering, its speed tier, how
+/// much context the last turn carried, how that figure has moved turn over
+/// turn, and the cumulative token totals.
+///
+/// This is the fallback source. When Bruce's status line shim is live,
+/// [`crate::statusline`] supplies the same ground truth first-hand — including
+/// the one thing the transcript can't tell us, the actual window size. All
+/// fields are best-effort: an empty or `None` value means the transcript
+/// doesn't carry that datum yet.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct SessionInfo {
     /// Raw model id from the last assistant entry (e.g. `claude-opus-4-7`).
@@ -100,11 +104,13 @@ pub struct SessionInfo {
     /// the cumulative session total, so it tracks the "how close am I to
     /// auto-compact?" question.
     pub last_context_tokens: u64,
-    /// Number of user turns recorded in the transcript.
-    pub user_turns: u64,
-    /// Cumulative token usage across every assistant turn — same numbers the
-    /// Usage subpanel shows. Computed in the same transcript walk so we
-    /// don't re-read the file for the Usage view.
+    /// Context size after each assistant turn, oldest first. Feeds the
+    /// "≈N turns to compact" projection — a single current value tells you
+    /// where you are, but the slope tells you when to stop.
+    pub context_series: Vec<u64>,
+    /// Cumulative token usage across every assistant turn, behind the Session
+    /// pane's `Tokens` row. Computed in the same transcript walk so the pane
+    /// never costs a second read of the file.
     pub totals: Metrics,
 }
 
@@ -118,10 +124,11 @@ pub fn read_session_info(project_path: &Path, session_id: &str) -> Option<Sessio
     Some(parse_session_info(&path))
 }
 
-/// Walk the transcript once and pull out everything the Session subpanel
-/// needs: the last assistant entry's model + speed + prompt-side token count,
-/// and the number of user turns. Pure — takes a path so tests can point at a
-/// fixture without a real Claude session on disk.
+/// Walk the transcript once and pull out everything the Session pane needs:
+/// the last assistant entry's model, speed and prompt-side token count, the
+/// per-turn context series behind the compact projection, and the cumulative
+/// totals. Pure — takes a path so tests can point at a fixture without a real
+/// Claude session on disk.
 pub fn parse_session_info(path: &Path) -> SessionInfo {
     let Ok(content) = fs::read_to_string(path) else {
         return SessionInfo::default();
@@ -135,10 +142,6 @@ pub fn parse_session_info(path: &Path) -> SessionInfo {
             continue;
         };
         let ty = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if ty == "user" {
-            info.user_turns += 1;
-            continue;
-        }
         if ty != "assistant" {
             continue;
         }
@@ -168,6 +171,10 @@ pub fn parse_session_info(path: &Path) -> SessionInfo {
             // all repeat the same usage block.
             if let Some(id) = message.get("id").and_then(|i| i.as_str()) {
                 if seen_ids.insert(id.to_string()) {
+                    // One sample per real turn, for the same reason: the
+                    // repeated lines would otherwise flatten the slope with
+                    // dozens of zero-delta points.
+                    info.context_series.push(info.last_context_tokens);
                     info.totals.input += field("input_tokens");
                     info.totals.output += field("output_tokens");
                     info.totals.cache_write += field("cache_creation_input_tokens");
@@ -257,23 +264,90 @@ pub fn estimated_cost(totals: &Metrics, model_id: Option<&str>) -> f64 {
         + per_mtok(totals.cache_read, p.cache_read_per_mtok)
 }
 
-/// Context-window cap in tokens for a given Claude model id.
+/// The standard Claude context window.
+pub const STANDARD_CONTEXT_CAP: u64 = 200_000;
+
+/// The extended window shipped by default on Opus 4.6+ for Max/Team/Enterprise
+/// plans, and on Fable 5 for everyone.
+pub const EXTENDED_CONTEXT_CAP: u64 = 1_000_000;
+
+/// Share of the window at which Claude Code triggers an auto-compact. Used to
+/// project how many turns are left, so the estimate lands where compaction
+/// actually happens rather than at a theoretical 100 %.
+pub const AUTO_COMPACT_AT: f64 = 0.92;
+
+/// Best-effort context window size when the status line sidecar isn't
+/// available — an un-installed shim, or a session that hasn't hit the API yet.
 ///
-/// Claude 4.x models (Opus, Sonnet, Haiku) all share the 200 K cap; Fable 5
-/// matches. Any unknown model id also defaults to 200 K — that's the current
-/// floor across the fleet, so guessing high is safer than guessing low
-/// (underestimating would make the "% free" bar sit at 0 forever). If the
-/// fleet ever drops below 200 K on some model, extend the match.
-pub fn context_cap(model_id: &str) -> u64 {
-    let id = model_id.to_ascii_lowercase();
-    if id.contains("opus")
-        || id.contains("sonnet")
-        || id.contains("haiku")
-        || id.contains("fable")
-    {
-        return 200_000;
+/// The window can't be derived from the model id: the same model runs at 200 K
+/// or 1 M depending on the user's plan and `CLAUDE_CODE_DISABLE_1M_CONTEXT`.
+/// What the transcript *does* prove is a floor — a session observed at 372 K
+/// tokens is definitionally not on a 200 K window. So the observed peak picks
+/// the tier. Guessing low is the dangerous direction: it pins the readout at
+/// "0 % free" and the user stops trusting it.
+///
+/// Prefer [`crate::statusline::StatusLine::context_window_size`] whenever it's
+/// there; this is the fallback, not the source of truth.
+pub fn context_cap_fallback(observed_tokens: u64) -> u64 {
+    if observed_tokens > STANDARD_CONTEXT_CAP {
+        return EXTENDED_CONTEXT_CAP;
     }
-    200_000
+    STANDARD_CONTEXT_CAP
+}
+
+/// Average per-turn context growth over the tail of a session, in tokens.
+///
+/// Only positive deltas count: a `/compact` or `/clear` drops the context
+/// sharply, and folding those in would cancel out real growth and report a
+/// flat or shrinking window. Returns `None` when there aren't two comparable
+/// turns yet, or when the tail only shrank.
+pub fn context_growth_per_turn(series: &[u64]) -> Option<u64> {
+    /// How many recent turns to average over. Short enough to react when a
+    /// session starts pulling big files in, long enough that one fat tool
+    /// result doesn't dominate the estimate.
+    const WINDOW: usize = 6;
+
+    let tail = &series[series.len().saturating_sub(WINDOW)..];
+    if tail.len() < 2 {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut counted = 0u64;
+    for pair in tail.windows(2) {
+        if pair[1] > pair[0] {
+            total += pair[1] - pair[0];
+            counted += 1;
+        }
+    }
+    if counted == 0 {
+        return None;
+    }
+    Some(total / counted)
+}
+
+/// How many more turns fit before auto-compact, given the current fill, the
+/// window size, and the recent per-turn growth.
+///
+/// `None` means the question doesn't apply yet (no growth measured, or an
+/// empty window). `Some(0)` means the threshold is already behind us.
+pub fn turns_to_compact(used: u64, cap: u64, growth_per_turn: u64) -> Option<u64> {
+    if cap == 0 || growth_per_turn == 0 {
+        return None;
+    }
+    let threshold = (cap as f64 * AUTO_COMPACT_AT) as u64;
+    Some(threshold.saturating_sub(used) / growth_per_turn)
+}
+
+/// Whether Bruce should show a dollar estimate at all.
+///
+/// Subscription users (Pro/Max) pay in rate-limit budget, not per token — a
+/// `~$4.20` readout there is the wrong currency and quietly misleads. An
+/// `ANTHROPIC_API_KEY` in the environment is the signal that tokens really do
+/// map to a bill.
+pub fn cost_applies() -> bool {
+    std::env::var("ANTHROPIC_API_KEY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// Friendly display for a Claude model id: `claude-opus-4-7` → `Opus 4.7`,
@@ -411,7 +485,7 @@ mod tests {
     /// user entries here — the last assistant is `m2` on Sonnet 4.6, so
     /// that's what survives.
     #[test]
-    fn parse_session_info_picks_last_assistant_and_counts_user_turns() {
+    fn parse_session_info_picks_the_last_assistant_turn() {
         let raw = concat!(
             r#"{"type":"user","message":{"role":"user"}}"#,
             "\n",
@@ -428,7 +502,6 @@ mod tests {
         assert_eq!(info.speed.as_deref(), Some("fast"));
         // 10 + 2000 + 150000 = 152010. Output (900) doesn't count.
         assert_eq!(info.last_context_tokens, 152_010);
-        assert_eq!(info.user_turns, 2);
     }
 
     /// Empty transcript file: `SessionInfo::default()`. Doesn't panic on
@@ -439,7 +512,6 @@ mod tests {
         f.write_all(b"").unwrap();
         let info = parse_session_info(&f.path);
         assert!(info.model.is_none());
-        assert_eq!(info.user_turns, 0);
     }
 
     #[test]
@@ -510,13 +582,48 @@ mod tests {
     }
 
     #[test]
-    fn context_cap_defaults_to_200k() {
-        // All current families return 200K; an unknown model also returns
-        // 200K rather than 0 (which would make the "free" bar sit at zero
-        // and misinform the user).
-        assert_eq!(context_cap("claude-opus-4-7"), 200_000);
-        assert_eq!(context_cap("claude-sonnet-4-6"), 200_000);
-        assert_eq!(context_cap("mystery-model-9000"), 200_000);
+    fn context_cap_fallback_starts_at_the_standard_window() {
+        assert_eq!(context_cap_fallback(0), STANDARD_CONTEXT_CAP);
+        assert_eq!(context_cap_fallback(150_000), STANDARD_CONTEXT_CAP);
+        assert_eq!(context_cap_fallback(STANDARD_CONTEXT_CAP), STANDARD_CONTEXT_CAP);
+    }
+
+    /// Regression: a real Opus 4.7 session in this very repo was observed at
+    /// 372,206 context tokens (and manually compacted at 372,967). The old
+    /// hardcoded 200 K cap clamped that to zero free, so the Session pane read
+    /// "0K free · 0%" in red for the rest of the session. Anything above the
+    /// standard window is proof of the extended one.
+    #[test]
+    fn context_cap_fallback_promotes_past_the_standard_window() {
+        assert_eq!(context_cap_fallback(372_206), EXTENDED_CONTEXT_CAP);
+        assert_eq!(context_cap_fallback(STANDARD_CONTEXT_CAP + 1), EXTENDED_CONTEXT_CAP);
+    }
+
+    #[test]
+    fn context_growth_averages_only_the_turns_that_grew() {
+        // +10K, +10K, then a compact drops it to 5K. The drop must not be
+        // averaged in, or the slope reads as flat and the projection lies.
+        let series = [10_000, 20_000, 30_000, 5_000];
+        assert_eq!(context_growth_per_turn(&series), Some(10_000));
+    }
+
+    #[test]
+    fn context_growth_needs_two_comparable_turns() {
+        assert_eq!(context_growth_per_turn(&[]), None);
+        assert_eq!(context_growth_per_turn(&[10_000]), None);
+        // Only shrank: nothing to extrapolate from.
+        assert_eq!(context_growth_per_turn(&[30_000, 10_000]), None);
+    }
+
+    #[test]
+    fn turns_to_compact_counts_down_to_the_auto_compact_threshold() {
+        // 92 % of 200K is 184K. With 100K used and 10K per turn: 8 turns left.
+        assert_eq!(turns_to_compact(100_000, 200_000, 10_000), Some(8));
+        // Already past the threshold: zero, not a negative or a panic.
+        assert_eq!(turns_to_compact(190_000, 200_000, 10_000), Some(0));
+        // No measurable growth or no window: the question doesn't apply.
+        assert_eq!(turns_to_compact(100_000, 200_000, 0), None);
+        assert_eq!(turns_to_compact(100_000, 0, 10_000), None);
     }
 
     /// The transcript folder name must match Claude's encoding exactly: every

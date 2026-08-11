@@ -41,6 +41,10 @@ src/pty/ — spawn y comunicación PTY (Claude + terminal inferior)
 src/skills/ — install/manage de skills (ledger en skills.json)
 src/update/ — chequeo de versión y auto-update por método de instalación
 src/config/ — preferencias persistentes en `config.json`
+src/statusline/ — shim del status line de Claude Code: `bruce statusline-sink`
+              recibe el payload JSON por stdin, lo parkea en
+              `<config>/bruce/statusline/<session-id>.json` y re-ejecuta el
+              comando original del usuario
 
 ## Sesiones
 JSON en ~/.config/bruce/sessions/<id>.json
@@ -184,6 +188,43 @@ el TOML no parsea).
       timeout/error, NO pisa el último resultado bueno. Regresión
       adjunta: `parse_alacritty_palette` tolera `[colors.cursor]`
       (config real de Omarchy trae esa sección). Total: 66 → 92 tests.
+- [x] Paso 22 (v0.19.0): contexto real + límites de suscripción.
+      **Fix del cap de contexto**: `context_cap()` devolvía 200_000 hardcodeado
+      para todo modelo. Evidencia del propio transcript de este repo:
+      `claude-opus-4-7` llegó a **372.206** tokens de contexto y un compact
+      manual registró `preTokens: 372967` — con el clamp `used.min(cap)` el
+      pane mostraba "0K free · 0%" en rojo para siempre. Claude Code shippea
+      1M de contexto por default en Opus 4.6+ (Max/Team/Enterprise) y en
+      Fable 5. Reemplazado por `context_cap_fallback(observed)`, que promueve
+      a `EXTENDED_CONTEXT_CAP` (1M) cuando lo observado supera
+      `STANDARD_CONTEXT_CAP` (200K) — el pico observado prueba un piso.
+      **Módulo `statusline/` nuevo**: Bruce se registra como el
+      `statusLine.command` de la sesión vía `claude --settings '<json>'`
+      (subcomando oculto `bruce statusline-sink`). Los CLI args ganan sobre
+      local/project/user settings y mueren con el proceso, así que **no se
+      escribe nada en el repo del usuario** ni hay cleanup que se pueda
+      perder en un crash. El sink parkea el payload en
+      `<config>/bruce/statusline/<id>.json` (write+rename atómico) y
+      re-ejecuta el `statusLine` original del usuario (guardado en
+      `delegate.json`, con guarda `is_bruce_shim` contra auto-delegación
+      recursiva). De ahí salen `context_window.context_window_size` (el cap
+      REAL), `rate_limits.five_hour` / `.seven_day` (`used_percentage` +
+      `resets_at`), `effort.level` y `fast_mode`. Ojo: JSON inválido en
+      `--settings` hace que `claude` no arranque — de ahí el test que
+      valida el payload.
+      **Session + Usage fusionados en un pane** (`SESSION_ROW_HEIGHT` 7+6 → 8,
+      cinco filas devueltas al file manager): Model (con badges de effort y
+      `fast`; cae a `speed` del transcript sin shim) · Context (`NNK free ·
+      MM%` + barra + **proyección `≈N turns`** vía
+      `context_growth_per_turn` / `turns_to_compact`, que promedia solo los
+      deltas positivos para que un `/compact` no aplane la pendiente) ·
+      **5h / Week** con barra y countdown al reset · Tokens en una línea
+      (`↑ ↓ ⚡`). **Cost solo si hay `ANTHROPIC_API_KEY`** (`cost_applies`):
+      en suscripción se paga en presupuesto de rate limit, no en dólares, así
+      que el `~$X.XX` era la moneda equivocada. Eliminadas las filas Speed y
+      Turns (y el campo `user_turns`) y `render_usage_pane`. `fmt_tokens`
+      ahora escala a `M` porque una ventana de 1M pone siete cifras en
+      pantalla. Total: 92 → 111 tests.
 
 ## Commits
 - Conventional commits SIEMPRE: `feat:`, `fix:`, `docs:`, `chore:`,
@@ -200,7 +241,7 @@ el TOML no parsea).
   hace minor).
 - Bumpear `version` en `Cargo.toml` **y** `Cargo.lock` EN EL MISMO commit
   del cambio (la versión se muestra en la welcome screen).
-  Versión actual: 0.18.0.
+  Versión actual: 0.19.0.
 
 ## Distribución
 Repo: https://github.com/soydanielsierradev/bruce-tui (rama `main`).

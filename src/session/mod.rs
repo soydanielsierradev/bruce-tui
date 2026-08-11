@@ -85,6 +85,10 @@ impl Session {
     /// so Bruce only forgets its own pointer to it. A missing file is not an
     /// error (already gone).
     pub fn delete(&self) -> Result<()> {
+        // Bruce's own status line cache for this session *is* ours to drop —
+        // otherwise the sidecar directory grows a stale file per deleted
+        // session forever.
+        crate::statusline::forget(&self.id);
         let path = sessions_dir()?.join(format!("{}.json", self.id));
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),

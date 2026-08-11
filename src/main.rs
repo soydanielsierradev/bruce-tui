@@ -15,6 +15,7 @@ mod panels;
 mod pty;
 mod session;
 mod skills;
+mod statusline;
 mod ui;
 mod update;
 
@@ -35,12 +36,21 @@ struct Cli {
 enum Command {
     /// Launch the TUI workspace.
     Tui,
+    /// Internal: receive a Claude Code status line payload on stdin.
+    ///
+    /// Hidden because it isn't for humans — Claude Code invokes it once per
+    /// status line render after Bruce installs itself as the `statusLine`
+    /// command. It parks the payload for the workspace to read and then
+    /// re-runs the user's own status line command, forwarding its output.
+    #[command(hide = true)]
+    StatuslineSink,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // No subcommand defaults to the TUI — running `bruce` just opens it.
     match cli.command {
+        Some(Command::StatuslineSink) => statusline::run_sink(),
         Some(Command::Tui) | None => {
             warn_if_claude_missing();
             app::run()

@@ -151,6 +151,12 @@ pub struct WorkspaceState {
     /// pulled from Claude's transcript for the Session subpanel. `None` until
     /// the transcript file exists — the pane then shows a placeholder.
     pub session_info: Option<metrics::SessionInfo>,
+    /// Latest payload Claude Code pushed to Bruce's status line shim: the real
+    /// context window size, the subscription rate-limit windows, and the
+    /// effort/fast-mode flags. `None` when the shim isn't installed or hasn't
+    /// fired yet, in which case the Session pane falls back to numbers derived
+    /// from the transcript.
+    pub statusline: Option<crate::statusline::StatusLine>,
     /// When the project-extras lists were last refreshed.
     last_extras_refresh: Instant,
     // ─────────────────────────────────────────────────────────────────────────
@@ -234,11 +240,13 @@ impl WorkspaceState {
         let cwd = session.project_path.clone();
         let git = git::load(&cwd);
 
-        // Pin the conversation to the session id so it can be resumed later.
-        let opts = SpawnOptions {
-            cwd: Some(cwd),
-            args: session.claude_args(resume),
-        };
+        // Pin the conversation to the session id so it can be resumed later,
+        // and route its status line through Bruce so the pane gets the real
+        // context window and rate-limit windows. The status line flags are
+        // scoped to this process — nothing is written to the user's project.
+        let mut args = session.claude_args(resume);
+        args.extend(crate::statusline::spawn_args());
+        let opts = SpawnOptions { cwd: Some(cwd), args };
 
         // Spawn the PTY with a placeholder size; the first render resizes it to
         // the real Claude-pane dimensions.
@@ -261,6 +269,7 @@ impl WorkspaceState {
         let active_skills_names =
             crate::skills::active_skill_names_in_project(&session.project_path);
         let session_info = metrics::read_session_info(&session.project_path, &session.id);
+        let session_id = session.id.clone();
 
         Self {
             session,
@@ -299,6 +308,7 @@ impl WorkspaceState {
             last_mcp_list_kick: Instant::now(),
             active_skills_names,
             session_info,
+            statusline: crate::statusline::read(&session_id),
             last_extras_refresh: Instant::now(),
         }
     }
@@ -371,6 +381,12 @@ impl WorkspaceState {
                 crate::skills::active_skill_names_in_project(&self.session.project_path);
             self.session_info =
                 metrics::read_session_info(&self.session.project_path, &self.session.id);
+            // Keep the last good payload if the sidecar isn't readable this
+            // round: the sink rewrites it via rename, and a transient miss
+            // shouldn't blank the context bar mid-conversation.
+            if let Some(latest) = crate::statusline::read(&self.session.id) {
+                self.statusline = Some(latest);
+            }
             self.last_extras_refresh = Instant::now();
         }
     }
@@ -1241,15 +1257,14 @@ fn render_file_manager_column(
     /// share, matching the "shrink Files a bit to un-squash the extras"
     /// intent.
     const EXTRAS_ROW_HEIGHT: u16 = 9;
-    /// Session pane needs an extra line for the context bar.
-    const SESSION_ROW_HEIGHT: u16 = 7;
-    /// Usage pane has 4 rows of content.
-    const USAGE_ROW_HEIGHT: u16 = 6;
+    /// Session pane: six content rows (model, context, bar, 5h, week, tokens)
+    /// plus the frame. Folding the old Usage pane in here bought back five
+    /// rows for the file manager while showing strictly more.
+    const SESSION_ROW_HEIGHT: u16 = 8;
     /// Threshold below which the whole extras stack collapses. Sum of the
-    /// three fixed rows plus a floor for the file manager (~6 rows). Under
-    /// this the panes stack too tight to read.
-    const EXTRAS_MIN_HEIGHT: u16 =
-        EXTRAS_ROW_HEIGHT + SESSION_ROW_HEIGHT + USAGE_ROW_HEIGHT + 6;
+    /// two fixed rows plus a floor for the file manager (~6 rows). Under this
+    /// the panes stack too tight to read.
+    const EXTRAS_MIN_HEIGHT: u16 = EXTRAS_ROW_HEIGHT + SESSION_ROW_HEIGHT + 6;
 
     if area.height < EXTRAS_MIN_HEIGHT {
         render_file_manager_pane(frame, area, pal, focused, state);
@@ -1260,13 +1275,11 @@ fn render_file_manager_column(
         Constraint::Fill(1),
         Constraint::Length(EXTRAS_ROW_HEIGHT),
         Constraint::Length(SESSION_ROW_HEIGHT),
-        Constraint::Length(USAGE_ROW_HEIGHT),
     ])
     .split(area);
     render_file_manager_pane(frame, rows[0], pal, focused, state);
     render_project_extras_pane(frame, rows[1], pal, state);
     render_session_pane(frame, rows[2], pal, state);
-    render_usage_pane(frame, rows[3], pal, state);
 }
 
 /// The bottom half of the right column: MCPs (left) and active skills (right),
@@ -1394,20 +1407,26 @@ fn render_extras_list(
     }
 }
 
-/// The Session subpanel: live snapshot of the Claude conversation running in
-/// the center pane. Four rows, all `label + value`, plus a context bar so the
-/// user can see at a glance how close the transcript is to auto-compact.
+/// The Session pane: one dense readout of everything that decides whether the
+/// user can keep going — what's answering, how much context is left, how much
+/// of the subscription budget is spent, and what the conversation cost.
 ///
-/// - **Model** — friendly family + version (`Opus 4.7`).
-/// - **Speed** — `Standard` / `Fast` from the last usage block.
-/// - **Context** — `NNK free · MM%` plus a proportional bar; `%` is the share
-///   of the model's context window still available (100 % right after
-///   `/clear`, ticks down toward 0 as the transcript grows).
-/// - **Turns** — user messages sent.
+/// - **Model** — friendly name, plus reasoning effort and a `fast` marker.
+/// - **Context** — tokens still free, the share of the window they represent,
+///   a proportional bar, and how many turns fit before auto-compact. The
+///   projection is the actionable half: a percentage says where you are, the
+///   turn count says when to wrap up.
+/// - **5h / Week** — the rolling subscription usage windows, each with a
+///   countdown to its reset. Present only for Claude.ai subscribers.
+/// - **Tokens** — cumulative input (`↑`), output (`↓`) and cached (`⚡`).
+/// - **Cost** — only when `ANTHROPIC_API_KEY` is set. Subscription users pay in
+///   rate-limit budget, so a dollar figure there would be the wrong currency.
 ///
-/// Placeholder text appears when the transcript hasn't been written yet
-/// (Claude hasn't produced its first response, or Bruce can't locate the
-/// transcript file).
+/// Window size, effort and the rate-limit windows come from Claude Code's own
+/// status line payload via [`crate::statusline`]. When that isn't available
+/// (shim not installed, or no API response yet) the pane falls back to the
+/// transcript and [`metrics::context_cap_fallback`], so it degrades instead of
+/// going blank.
 fn render_session_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &WorkspaceState) {
     let block = pane_block(
         pal,
@@ -1423,7 +1442,9 @@ fn render_session_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &Wor
         return;
     }
 
-    let Some(info) = state.session_info.as_ref() else {
+    let status = state.statusline.as_ref();
+    let info = state.session_info.as_ref();
+    if status.is_none() && info.is_none() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " waiting for first response…",
@@ -1433,58 +1454,61 @@ fn render_session_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &Wor
             Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
         );
         return;
-    };
+    }
 
+    // Width of the label column: the longest label (" Context") plus a gap.
+    const LABEL_WIDTH: u16 = 9;
     let label_style = Style::default().fg(pal.dim);
     let value_style = Style::default().fg(pal.fg);
+    let value_width = inner.width.saturating_sub(LABEL_WIDTH);
 
-    // Fixed-width label column so the values line up vertically, matching
-    // the "Model / Speed / Context / Turns" grid look in the mock.
-    let mut lines: Vec<(String, Line)> = Vec::new();
+    // Rows are collected first and painted after, because how many there are
+    // depends on what the payload actually carries — an API-key user has no
+    // rate-limit windows, a fresh session has no token totals.
+    let mut rows: Vec<(&str, Line)> = Vec::new();
 
-    let model_display = info
-        .model
-        .as_deref()
-        .map(metrics::model_display)
+    // ── Model ───────────────────────────────────────────────────────────────
+    // Claude Code's own display name wins: it's the label the user picked in
+    // `/model`, so it can't drift the way a locally-derived one would.
+    let model_name = status
+        .and_then(|s| s.model_display_name.clone())
+        .or_else(|| info.and_then(|i| i.model.as_deref().map(metrics::model_display)))
         .unwrap_or_else(|| "—".to_string());
-    lines.push((
-        " Model".to_string(),
-        Line::from(Span::styled(model_display, value_style)),
-    ));
+    let mut model_spans = vec![Span::styled(model_name, value_style)];
+    // Effort and fast mode ride along as suffix badges instead of taking rows
+    // of their own — they're one word each, and a full row for one word is
+    // space this pane doesn't have. Speed from the transcript is the fallback
+    // when the status line shim hasn't reported an effort level.
+    if let Some(effort) = status.and_then(|s| s.effort.as_deref()) {
+        model_spans.push(Span::styled(
+            format!(" · {effort}"),
+            Style::default().fg(pal.dim),
+        ));
+    } else if let Some(speed) = info.and_then(|i| i.speed.as_deref()) {
+        model_spans.push(Span::styled(
+            format!(" · {speed}"),
+            Style::default().fg(pal.dim),
+        ));
+    }
+    if status.map(|s| s.fast_mode).unwrap_or(false) {
+        model_spans.push(Span::styled(" · fast", Style::default().fg(pal.accent)));
+    }
+    rows.push((" Model", Line::from(model_spans)));
 
-    let speed_display = info
-        .speed
-        .as_deref()
-        .map(|s| {
-            let mut chars = s.chars();
-            match chars.next() {
-                Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .unwrap_or_else(|| "—".to_string());
-    lines.push((
-        " Speed".to_string(),
-        Line::from(Span::styled(speed_display, value_style)),
-    ));
-
-    // Context: how much of the window is still free. `used` may exceed the
-    // model's declared cap on very long transcripts because Claude expands
-    // caches; clamp so the display never shows a negative "free" figure.
-    let cap = info
-        .model
-        .as_deref()
-        .map(metrics::context_cap)
-        .unwrap_or(200_000);
-    let used = info.last_context_tokens.min(cap);
+    // ── Context ─────────────────────────────────────────────────────────────
+    let observed = info.map(|i| i.last_context_tokens).unwrap_or(0);
+    let cap = status
+        .and_then(|s| s.context_window_size)
+        .unwrap_or_else(|| metrics::context_cap_fallback(observed));
+    let used = status.and_then(|s| s.used_tokens).unwrap_or(observed).min(cap);
     let free = cap.saturating_sub(used);
     let pct_free = if cap == 0 {
         0
     } else {
         ((free as f64 / cap as f64) * 100.0).round() as u64
     };
-    lines.push((
-        " Context".to_string(),
+    rows.push((
+        " Context",
         Line::from(vec![
             Span::styled(
                 format!("{} free ", fmt_tokens(free)),
@@ -1494,218 +1518,211 @@ fn render_session_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &Wor
         ]),
     ));
 
-    lines.push((
-        " Turns".to_string(),
-        Line::from(Span::styled(info.user_turns.to_string(), value_style)),
-    ));
+    // Bar and turn projection share a row, the bar taking whatever the
+    // projection leaves — so a narrow pane degrades to just the bar rather
+    // than wrapping into a mess.
+    let projection = info
+        .and_then(|i| metrics::context_growth_per_turn(&i.context_series))
+        .and_then(|growth| metrics::turns_to_compact(used, cap, growth))
+        .map(|turns| format!(" ≈{turns} turns"));
+    let projection_width = projection
+        .as_ref()
+        .map(|p| p.chars().count() as u16)
+        .unwrap_or(0);
+    let mut bar_row = bar_spans(
+        value_width.saturating_sub(projection_width + 1),
+        pct_free as f64,
+        context_colour(pal, pct_free),
+        pal.dim,
+    );
+    if let Some(text) = projection {
+        bar_row.push(Span::styled(text, Style::default().fg(pal.dim)));
+    }
+    rows.push(("", Line::from(bar_row)));
 
-    // Two-column layout: labels flush left, values start at a fixed offset so
-    // everything reads as an aligned grid.
-    let label_width: u16 = 9; // " Context" == 8 chars + one trailing gap
-    let mut y = inner.y;
-    for (label, value) in &lines {
+    // ── Rate limits ─────────────────────────────────────────────────────────
+    // What a subscription actually spends. Absent for API-key users, and
+    // absent until the session's first API response.
+    let now = unix_now();
+    if let Some(window) = status.and_then(|s| s.five_hour) {
+        rows.push((" 5h", limit_line(pal, window, value_width, now)));
+    }
+    if let Some(window) = status.and_then(|s| s.seven_day) {
+        rows.push((" Week", limit_line(pal, window, value_width, now)));
+    }
+
+    // ── Tokens (and cost, when tokens map to a bill) ────────────────────────
+    if let Some(i) = info {
+        let cached = i.totals.cache_read + i.totals.cache_write;
+        rows.push((
+            " Tokens",
+            Line::from(vec![
+                Span::styled(format!("{}↑ ", fmt_tokens(i.totals.input)), value_style),
+                Span::styled(format!("{}↓ ", fmt_tokens(i.totals.output)), value_style),
+                Span::styled(
+                    format!("{}⚡", fmt_tokens(cached)),
+                    Style::default().fg(pal.dim),
+                ),
+            ]),
+        ));
+
+        if metrics::cost_applies() {
+            let cost = metrics::estimated_cost(&i.totals, i.model.as_deref());
+            rows.push((
+                " Cost",
+                Line::from(Span::styled(
+                    format!("~${cost:.2}"),
+                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                )),
+            ));
+        }
+    }
+
+    // ── Paint ───────────────────────────────────────────────────────────────
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let y = inner.y + i as u16;
         if y >= inner.y + inner.height {
             break;
         }
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(label.clone(), label_style)))
-                .style(Style::default().bg(pal.bg)),
-            Rect { x: inner.x, y, width: label_width.min(inner.width), height: 1 },
-        );
-        if inner.width > label_width {
+        if !label.is_empty() {
             frame.render_widget(
-                Paragraph::new(value.clone()).style(Style::default().bg(pal.bg)),
-                Rect {
-                    x: inner.x + label_width,
-                    y,
-                    width: inner.width - label_width,
-                    height: 1,
-                },
+                Paragraph::new(Line::from(Span::styled(*label, label_style)))
+                    .style(Style::default().bg(pal.bg)),
+                Rect { x: inner.x, y, width: LABEL_WIDTH.min(inner.width), height: 1 },
             );
         }
-        y += 1;
-    }
-
-    // Context bar sits under the row it labels, spanning the value column
-    // width. Skip if we've run out of vertical room.
-    let bar_row = inner.y + 2; // "Context" is the third row (0-indexed 2)
-    let bar_y = bar_row + 1;
-    if bar_y < inner.y + inner.height && inner.width > label_width + 2 {
-        let bar_area = Rect {
-            x: inner.x + label_width,
-            y: bar_y,
-            width: inner.width - label_width - 1,
-            height: 1,
-        };
-        render_context_bar(frame, bar_area, pal, pct_free);
+        if value_width > 0 {
+            frame.render_widget(
+                Paragraph::new(value.clone()).style(Style::default().bg(pal.bg)),
+                Rect { x: inner.x + LABEL_WIDTH, y, width: value_width, height: 1 },
+            );
+        }
     }
 }
 
-/// Colour the "free" figure against the palette so the user reads the state
-/// at a glance: green when there's plenty of room, accent as it fills up,
-/// and the palette's `removed` red once we're inside the danger band where
-/// Claude is about to auto-compact.
+/// Colour for a context readout: green while there's room, accent as it fills,
+/// and the palette's red once auto-compact is close.
+fn context_colour(pal: &Palette, pct_free: u64) -> Color {
+    if pct_free >= 40 {
+        pal.added
+    } else if pct_free >= 15 {
+        pal.accent
+    } else {
+        pal.removed
+    }
+}
+
+/// Same health scale as [`context_colour`], bolded for the numeric readout.
 fn context_style(pal: &Palette, pct_free: u64) -> Style {
-    let colour = if pct_free >= 40 {
-        pal.added
-    } else if pct_free >= 15 {
-        pal.accent
-    } else {
-        pal.removed
-    };
-    Style::default().fg(colour).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(context_colour(pal, pct_free))
+        .add_modifier(Modifier::BOLD)
 }
 
-/// A one-row horizontal progress bar showing the share of context still free.
-/// Filled cells use the same "how healthy" colour as the numeric readout so
-/// the two agree; empty cells use the palette's dim tone.
-fn render_context_bar(frame: &mut Frame, area: Rect, pal: &Palette, pct_free: u64) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let total = area.width as u64;
-    let filled = (total * pct_free / 100).min(total) as u16;
-    let empty = area.width - filled;
-
-    let filled_colour = if pct_free >= 40 {
-        pal.added
-    } else if pct_free >= 15 {
-        pal.accent
-    } else {
+/// Colour for a rate-limit readout. The sense is inverted from context: this
+/// percentage is what's already *spent*, so high is the bad end.
+fn limit_colour(pal: &Palette, pct_used: f64) -> Color {
+    if pct_used >= 85.0 {
         pal.removed
-    };
+    } else if pct_used >= 60.0 {
+        pal.renamed
+    } else {
+        pal.added
+    }
+}
 
-    let mut spans: Vec<Span> = Vec::new();
+/// One rate-limit row: proportional bar, percentage spent, and how long until
+/// the window rolls over.
+fn limit_line(
+    pal: &Palette,
+    window: crate::statusline::RateWindow,
+    width: u16,
+    now: i64,
+) -> Line<'static> {
+    let suffix = format!(
+        " {:.0}% · {}",
+        window.used_percentage,
+        fmt_countdown(window.resets_at - now)
+    );
+    let bar_width = width.saturating_sub(suffix.chars().count() as u16 + 1);
+    let mut spans = bar_spans(
+        bar_width,
+        window.used_percentage,
+        limit_colour(pal, window.used_percentage),
+        pal.dim,
+    );
+    spans.push(Span::styled(suffix, Style::default().fg(pal.dim)));
+    Line::from(spans)
+}
+
+/// Spans for a one-row proportional bar `width` cells wide, `pct` of them
+/// filled. Yields an empty vec when there's no room, so callers can splice the
+/// result into a line without a width check of their own.
+fn bar_spans(width: u16, pct: f64, fill: Color, empty: Color) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let filled = (((width as f64) * pct.clamp(0.0, 100.0) / 100.0).round() as u16).min(width);
+    let mut spans = Vec::new();
     if filled > 0 {
         spans.push(Span::styled(
             "█".repeat(filled as usize),
-            Style::default().fg(filled_colour),
+            Style::default().fg(fill),
         ));
     }
-    if empty > 0 {
+    if width > filled {
         spans.push(Span::styled(
-            "░".repeat(empty as usize),
-            Style::default().fg(pal.dim),
+            "░".repeat((width - filled) as usize),
+            Style::default().fg(empty),
         ));
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(pal.bg)),
-        area,
-    );
+    spans
 }
 
-/// Format a token count for the Session subpanel: three digits max plus a
-/// unit suffix so it fits in a narrow value column. `1_234` → `1.2K`,
-/// `152_010` → `152K`.
+/// Seconds since the Unix epoch; 0 if the system clock predates it.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Compact countdown to a rate-limit reset: `3d 4h`, `2h 14m`, `12m`, `now`.
+/// Deliberately terse — it shares a narrow row with a bar and a percentage.
+fn fmt_countdown(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let minutes = seconds / 60;
+    let hours = minutes / 60;
+    let days = hours / 24;
+    if days > 0 {
+        return format!("{days}d {}h", hours % 24);
+    }
+    if hours > 0 {
+        return format!("{hours}h {}m", minutes % 60);
+    }
+    format!("{minutes}m")
+}
+
+/// Format a token count for the Session pane: three digits max plus a unit
+/// suffix so it fits in a narrow value column. `1_234` → `1.2K`,
+/// `152_010` → `152K`, `1_200_000` → `1.2M`.
 fn fmt_tokens(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
     if n < 10_000 {
-        // Show one decimal for the sub-10K band so 1_234 doesn't collapse to
-        // "1K" (loses too much precision at the low end).
+        // One decimal in the sub-10K band so 1_234 doesn't collapse to "1K",
+        // which loses too much precision at the low end.
         return format!("{:.1}K", n as f64 / 1_000.0);
     }
-    format!("{}K", n / 1_000)
-}
-
-/// The Usage subpanel: cumulative token usage across the whole conversation
-/// plus an estimated USD cost under the active model's public pricing.
-///
-/// - **Input** — fresh input tokens (`~$3-$15/Mtok` depending on family).
-/// - **Output** — model output tokens (the priciest bucket).
-/// - **Cached** — cache-read hits, the cheapest bucket, plus cache writes.
-/// - **Cost** — sum of every bucket times its per-token rate; always prefixed
-///   with `~` because it's an estimate, not a bill.
-///
-/// Costs are estimates only — the pricing constants live in `metrics.rs`
-/// with a date stamp, so update them when Anthropic revises the rate card.
-fn render_usage_pane(frame: &mut Frame, area: Rect, pal: &Palette, state: &WorkspaceState) {
-    let block = pane_block(
-        pal,
-        " Usage ",
-        false,
-        state.border_style.bordered(),
-        state.border_style.border_type(),
-    );
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 || inner.width == 0 {
-        return;
+    if n < 1_000_000 {
+        return format!("{}K", n / 1_000);
     }
-
-    let Some(info) = state.session_info.as_ref() else {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " no usage yet",
-                Style::default().fg(pal.dim).add_modifier(Modifier::ITALIC),
-            )))
-            .style(Style::default().bg(pal.bg)),
-            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
-        );
-        return;
-    };
-
-    let label_style = Style::default().fg(pal.dim);
-    let value_style = Style::default().fg(pal.fg);
-
-    let cost = metrics::estimated_cost(&info.totals, info.model.as_deref());
-    let cost_display = format!("~${cost:.2}");
-
-    // Combine cache_read + cache_write under a single "Cached" line — the
-    // subpanel is narrow and the distinction matters more to accountants
-    // than to a developer trying to gauge their bill.
-    let cached = info.totals.cache_read + info.totals.cache_write;
-
-    let rows: [(String, Line); 4] = [
-        (
-            " Input".to_string(),
-            Line::from(Span::styled(fmt_tokens(info.totals.input), value_style)),
-        ),
-        (
-            " Output".to_string(),
-            Line::from(Span::styled(fmt_tokens(info.totals.output), value_style)),
-        ),
-        (
-            " Cached".to_string(),
-            Line::from(Span::styled(fmt_tokens(cached), value_style)),
-        ),
-        (
-            " Cost".to_string(),
-            Line::from(Span::styled(
-                cost_display,
-                Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
-            )),
-        ),
-    ];
-
-    // Same two-column grid as the Session pane so the visual language stays
-    // consistent between adjacent info blocks.
-    let label_width: u16 = 9;
-    let mut y = inner.y;
-    for (label, value) in &rows {
-        if y >= inner.y + inner.height {
-            break;
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(label.clone(), label_style)))
-                .style(Style::default().bg(pal.bg)),
-            Rect { x: inner.x, y, width: label_width.min(inner.width), height: 1 },
-        );
-        if inner.width > label_width {
-            frame.render_widget(
-                Paragraph::new(value.clone()).style(Style::default().bg(pal.bg)),
-                Rect {
-                    x: inner.x + label_width,
-                    y,
-                    width: inner.width - label_width,
-                    height: 1,
-                },
-            );
-        }
-        y += 1;
-    }
+    // Extended context windows put a million tokens on screen; "1000K" reads
+    // worse than "1.0M".
+    format!("{:.1}M", n as f64 / 1_000_000.0)
 }
 
 fn render_file_manager_pane(frame: &mut Frame, area: Rect, pal: &Palette, focused: bool, state: &WorkspaceState) {
@@ -2279,5 +2296,82 @@ mod encode_key_tests {
         // F-keys and similar aren't translated — caller can choose to ignore.
         assert_eq!(encode_key(&key(KeyCode::F(1)), false), None);
         assert_eq!(encode_key(&key(KeyCode::Null), false), None);
+    }
+}
+
+#[cfg(test)]
+mod session_pane_tests {
+    use super::*;
+    use crate::ui::theme::Theme;
+
+    fn pal() -> Palette {
+        Theme::Hacker.palette()
+    }
+
+    #[test]
+    fn fmt_tokens_scales_from_raw_to_millions() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_234), "1.2K");
+        assert_eq!(fmt_tokens(152_010), "152K");
+        // Extended windows put seven figures on screen; "1000K" reads worse.
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(1_400_000), "1.4M");
+    }
+
+    #[test]
+    fn fmt_countdown_picks_the_coarsest_useful_unit() {
+        assert_eq!(fmt_countdown(0), "now");
+        assert_eq!(fmt_countdown(-500), "now");
+        assert_eq!(fmt_countdown(12 * 60), "12m");
+        assert_eq!(fmt_countdown(2 * 3600 + 14 * 60), "2h 14m");
+        assert_eq!(fmt_countdown(3 * 86_400 + 4 * 3600), "3d 4h");
+    }
+
+    #[test]
+    fn bar_spans_fills_proportionally_and_never_overflows() {
+        let p = pal();
+        let render = |width: u16, pct: f64| -> String {
+            bar_spans(width, pct, p.added, p.dim)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(render(10, 0.0), "░░░░░░░░░░");
+        assert_eq!(render(10, 50.0), "█████░░░░░");
+        assert_eq!(render(10, 100.0), "██████████");
+        // Out-of-range percentages are clamped, not allowed to overrun the row.
+        assert_eq!(render(10, 250.0).chars().count(), 10);
+        assert_eq!(render(10, -20.0).chars().count(), 10);
+        // No room means no spans, so callers can splice unconditionally.
+        assert!(bar_spans(0, 50.0, p.added, p.dim).is_empty());
+    }
+
+    /// Context and rate limits read the percentage in opposite directions:
+    /// a high *free* context is healthy, a high *used* limit is not.
+    #[test]
+    fn context_and_limit_colours_move_in_opposite_directions() {
+        let p = pal();
+        assert_eq!(context_colour(&p, 80), p.added);
+        assert_eq!(context_colour(&p, 20), p.accent);
+        assert_eq!(context_colour(&p, 5), p.removed);
+
+        assert_eq!(limit_colour(&p, 10.0), p.added);
+        assert_eq!(limit_colour(&p, 70.0), p.renamed);
+        assert_eq!(limit_colour(&p, 95.0), p.removed);
+    }
+
+    #[test]
+    fn limit_line_keeps_the_percentage_and_reset_inside_the_row() {
+        let p = pal();
+        let window = crate::statusline::RateWindow {
+            used_percentage: 41.2,
+            resets_at: 1_000_000 + 2 * 3600,
+        };
+        let line = limit_line(&p, window, 30, 1_000_000);
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(text.ends_with(" 41% · 2h 0m"), "got {text:?}");
+        // The bar has to fit in what the suffix leaves, never wrap the row.
+        assert!(text.chars().count() <= 30, "row overflowed: {text:?}");
     }
 }
